@@ -1,0 +1,1 @@
+# Flatseek API - FastAPI wrapper for trigram inverted index

@@ -8,6 +8,7 @@ __pycache__/
 
 # Distribution / packaging
 .Python
+.claude
 build/
 develop-eggs/
 dist/
@@ -25,6 +26,10 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+vercel/
+vercel.json
+.DS_Store
+
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -133,7 +138,9 @@ celerybeat.pid
 
 # SageMath parsed files
 *.sage.py
-
+# Vercel demo only (api routes and sample data)
+/api/
+/data/
 # Environments
 .env
 .envrc
@@ -205,3 +212,4 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+.vercel

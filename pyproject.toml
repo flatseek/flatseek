@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flatseek"
+version = "0.1.0"
+description = "Scalable engine to ingest, process, and query large datasets—transactions, logs, events, and analytics—directly from flat files."
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+dependencies = [
+    "cryptography",
+    "orjson",
+    "zstandard",
+    "fastapi",
+    "uvicorn",
+    "pydantic",
+    "httpx",
+]
+
+authors = [
+  { name = "Judotens Budiarto", email = "judotens@flatseek.io" }
+]
+
+[project.urls]
+Homepage = "https://flatseek.io"
+Repository = "https://github.com/flatseek/flatseek"
+Issues = "https://github.com/flatseek/flatseek/issues"
+Documentation = "https://flatseek.io/docs"
+
+[project.scripts]
+flatseek = "flatseek.cli:main"
+flatseek-api = "flatseek.api_server:run"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio",
+    "httpx",
+]
+chat = [
+    "openai",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+python_files = ["test_*.py"]
+python_functions = "test_*"
