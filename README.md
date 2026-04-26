@@ -113,6 +113,9 @@ pip install flatseek
 git clone https://github.com/flatseek/flatseek.git
 cd flatseek
 pip install -e .
+
+# Clone Flatlens for the dashboard (required for flatseek serve)
+git clone https://github.com/flatseek/flatlens.git
 ```
 
 **Requirements:** Python >= 3.10
