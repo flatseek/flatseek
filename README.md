@@ -14,6 +14,9 @@
 **Demo:** [flatlens.demo.flatseek.io](https://flatlens.demo.flatseek.io)
 &nbsp;&middot;&nbsp;
 **Docs:** [flatseek.io/docs](https://flatseek.io/docs)
+&nbsp;&middot;&nbsp;
+**Benchmark:** [flatbench](https://github.com/flatseek/flatbench/)
+
 </div>
 
 ---
@@ -34,6 +37,22 @@ Most teams don't actually need a 24/7 search cluster. They have CSVs of customer
 
 ---
 
+## Performance Benchmarks
+
+Full benchmark suite: [`flatbench/`](https://github.com/flatseek/flatbench) — compares flatseek vs Elasticsearch on 100K-row article schema with verified correctness.
+
+### Highlights (100K rows, article schema)
+
+| Operation | flatseek | Elasticsearch | Winner |
+|-----------|----------|---------------|--------|
+| **Build index** | 155,965 ms / 641 rows/s | 17,100 ms / 5,848 rows/s | ES (9x faster) |
+| **Search p50** | 2.31 ms | 7.60 ms | flatseek (3x faster) |
+| **Range query** | 42.9 ms | 45.3 ms | flatseek |
+| **Aggregation** | 300–700 ms | 5–50 ms | ES |
+
+See [`flatbench/README.md`](https://github.com/flatseek/flatbench/blob/main/README.md) for full latest results including wildcard search, per-query breakdown, and correctness verification.
+
+---
 
 ## Quick Start
 
@@ -404,22 +423,6 @@ The Flatseek API still runs on your own host; Vercel hosts the static dashboard 
 
 ---
 
-## Performance Benchmarks
-
-Full benchmark suite: [`flatbench/`](https://github.com/flatseek/flatbench) — compares flatseek vs Elasticsearch on 100K-row article schema with verified correctness.
-
-### Highlights (100K rows, article schema)
-
-| Operation | flatseek | Elasticsearch | Winner |
-|-----------|----------|---------------|--------|
-| **Build index** | 155,965 ms / 641 rows/s | 17,100 ms / 5,848 rows/s | ES (9x faster) |
-| **Search p50** | 2.31 ms | 7.60 ms | flatseek (3x faster) |
-| **Range query** | 42.9 ms | 45.3 ms | flatseek |
-| **Aggregation** | 300–700 ms | 5–50 ms | ES |
-
-See [`flatbench/README.md`](https://github.com/flatseek/flatbench/blob/main/README.md) for full results including wildcard search, per-query breakdown, and correctness verification.
-
----
 
 ## Contributing
 
