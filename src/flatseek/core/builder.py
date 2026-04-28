@@ -601,13 +601,21 @@ def tokenize(value):
         _add(local)
         _add(domain)
 
-    digits = _DIGITS_RE.sub("", v)
-    if len(digits) >= 4:
-        _add(digits)
-        for n in (4, 6, 8):
-            if len(digits) > n:
-                _add(digits[-n:])   # suffixes: last 4/6/8 digits
-                _add(digits[:n])    # prefixes: first 4/6/8 digits
+    # Digit suffixes/prefixes — only run when value actually contains digits.
+    # Otherwise _DIGITS_RE.sub allocates a new empty string per token-free row.
+    has_digit = False
+    for c in v:
+        if '0' <= c <= '9':
+            has_digit = True
+            break
+    if has_digit:
+        digits = _DIGITS_RE.sub("", v)
+        if len(digits) >= 4:
+            _add(digits)
+            for n in (4, 6, 8):
+                if len(digits) > n:
+                    _add(digits[-n:])   # suffixes: last 4/6/8 digits
+                    _add(digits[:n])    # prefixes: first 4/6/8 digits
 
     return result
 
@@ -717,6 +725,16 @@ class IndexBuilder:
         self._pending_terms = defaultdict(lambda: _array("I"))
         self._rows_since_checkpoint = 0   # rows since last terms+docs flush + checkpoint save
         self._rows_processed = 0          # cumulative rows processed in current file
+
+        # Hot-path cache: col_key → (col_prefix, col_tg_prefix) bytes-stable strings.
+        # Avoids re-concatenating "name:" / "name:~" on every cell of every row.
+        # 1.4M re-concats per 100K rows × 14 cols on the blockchain dataset; this
+        # collapses them to one concat per column for the lifetime of the build.
+        self._col_prefix_cache: dict = {}
+        # Per-build tokenize memoization for short repeating cell values
+        # (status, country, level, type, lang ...).  Bounded by skipping values
+        # longer than 64 chars at insertion time.
+        self._tokenize_cache: dict = {}
 
         # Per-worker byte-level resume: expose the active _ByteRangeReader so the
         # checkpoint callback can record the exact file position after each chunk.
@@ -835,7 +853,20 @@ class IndexBuilder:
 
     def _index_value(self, doc_id, col_key, value, sem_type):
         """Add tokens (and trigrams if applicable) for a single value to pending_terms."""
-        tokens = tokenize(value)
+        # Per-build memoization: short repeated values (status, country, level...)
+        # tokenize identically every row. Caching the token list cuts ~3M tokenize
+        # calls down to a few hundred on long builds. Keyed by raw value to keep
+        # collisions zero (case-sensitive columns coexist).
+        tcache = self._tokenize_cache
+        cached = tcache.get(value)
+        if cached is None:
+            tokens = tokenize(value)
+            # Cache only short-ish values — long unique strings (signatures, urls)
+            # rarely repeat and would just bloat the cache.
+            if len(value) <= 64:
+                tcache[value] = tokens
+        else:
+            tokens = cached
         want_trigrams = sem_type in _TRIGRAM_TYPES
         pt = self._pending_terms
 
@@ -843,10 +874,14 @@ class IndexBuilder:
         # tokenize() drops it (min-length filter ≥ 2 cuts single-char codes like
         # gender "L"→"l", "P"→"p"). This guarantees gender:L / gender:f etc. work.
         vl_exact = value.strip().lower()
-        # Precompute col_prefix once — avoids f-string allocation per token/trigram.
-        # "name:" prefix shared across exact_col_term, per-token col_term, and col_tg_prefix.
-        col_prefix   = col_key + ":"
-        col_tg_prefix = col_prefix + "~"
+        # Cached per-column prefix strings — built once, reused for every cell.
+        cached = self._col_prefix_cache.get(col_key)
+        if cached is None:
+            col_prefix   = col_key + ":"
+            col_tg_prefix = col_prefix + "~"
+            self._col_prefix_cache[col_key] = (col_prefix, col_tg_prefix)
+        else:
+            col_prefix, col_tg_prefix = cached
         exact_col_term = col_prefix + vl_exact
         if vl_exact:
             pt[exact_col_term].append(doc_id)
@@ -1165,6 +1200,8 @@ class IndexBuilder:
                     merged = new_data
             else:
                 merged = new_data
+            # Collapse expanded fields (arrays, nested) before writing to doc store
+            merged = {doc_id: _collapse_record(rec) for doc_id, rec in merged.items()}
             raw = _doc_dumps(merged)
             compressed = _compress_doc(raw)
             tmp = path + f".{os.getpid()}.tmp"
@@ -2240,33 +2277,44 @@ def _json_val_to_str(v):
     Handles:
     - None → ""
     - dict/list → json.dumps
-    - string that looks like JSON (single-quoted or malformed JSON) → parse and re-dumps
+    - string that looks like JSON/Python-literal array/object → parse and re-dumps
     - plain string/number/bool → str(value)
+
+    Fast path: a string only triggers parser attempts when its first char is
+    `[` or `{`. The vast majority of CSV cell values are plain hex/text/numbers
+    where no parsing is needed — the previous unconditional `ast.literal_eval`
+    fallback compiled an AST per cell (~1.3M `compile` calls on a 100K-row
+    blockchain CSV) and dominated build time.
     """
     if v is None:
         return ""
-    if isinstance(v, (dict, list)):
+    t = type(v)
+    if t is dict or t is list:
         return json.dumps(v, ensure_ascii=False)
-    if isinstance(v, str):
-        # If it doesn't start with " (valid JSON string marker), try parsing
-        # This catches Python-style single-quoted strings: '["api","cdn"]'
-        if not v.startswith('"'):
-            try:
-                import ast
-                parsed = ast.literal_eval(v)
-                if isinstance(parsed, (dict, list)):
-                    return json.dumps(parsed, ensure_ascii=False)
-            except (ValueError, SyntaxError, TypeError):
-                pass
-            # Also try standard JSON parse for malformed JSON
-            try:
-                parsed = json.loads(v)
-                if isinstance(parsed, (dict, list)):
-                    return json.dumps(parsed, ensure_ascii=False)
-            except (json.JSONDecodeError, TypeError):
-                pass
+    if t is not str:
+        return str(v)
+    # String fast path: skip parser attempts unless the value looks structured.
+    if not v or v[0] not in ('[', '{'):
         return v
-    return str(v)
+    # Looks structured — try strict JSON first (fast C parser, no compile).
+    try:
+        parsed = json.loads(v)
+        if isinstance(parsed, (dict, list)):
+            return json.dumps(parsed, ensure_ascii=False)
+    except (ValueError, TypeError):
+        pass
+    # Fall back to Python-literal only when single-quote syntax is present
+    # (e.g. "['api','cdn']" written by str(list)).  Avoids the compile step
+    # for malformed JSON that has no chance of being a Python literal either.
+    if "'" in v:
+        try:
+            import ast
+            parsed = ast.literal_eval(v)
+            if isinstance(parsed, (dict, list)):
+                return json.dumps(parsed, ensure_ascii=False)
+        except (ValueError, SyntaxError, TypeError):
+            pass
+    return v
 
 
 def _expand_record(obj, prefix="", sep="."):
@@ -2274,38 +2322,189 @@ def _expand_record(obj, prefix="", sep="."):
 
     {"tags": ["api","cdn"], "address": {"city": "NYC"}}
         ↓
-    {"tags[0]": "api", "tags[1]": "cdn", "address.city": "NYC"}
+    {"tags": '["api","cdn"]', "tags[0]": "api", "tags[1]": "cdn", "address.city": "NYC"}
+
+    - Simple arrays stored as full JSON string for clean display (tags: ["api","cdn"])
+    - Each element also expanded for search (tags[0], tags[1] etc.)
+    - Nested arrays/dicts expanded recursively for deep field search
 
     Handles both JSON arrays and Python-style single-quoted arrays.
     """
     result = {}
     for key, val in obj.items():
-        if not isinstance(key, str):
+        if type(key) is not str:
             key = str(key)
         full_key = f"{prefix}{key}" if prefix else key
-        # Convert through _json_val_to_str first
-        str_val = _json_val_to_str(val)
-        # Try parsing as JSON to see if it should be expanded
-        try:
-            parsed = json.loads(str_val)
-        except (json.JSONDecodeError, TypeError):
-            parsed = str_val  # not JSON, keep as string
+        # Dispatch by input type — avoids the str-roundtrip + json.loads probe
+        # that previously ran on every cell (the dominant cost on text-heavy CSVs).
+        t = type(val)
+        if t is dict:
+            parsed = val
+        elif t is list:
+            parsed = val
+        elif val is None:
+            result[full_key] = ""
+            continue
+        elif t is str:
+            # Only attempt to parse strings that look structured.
+            if val and val[0] in ('[', '{'):
+                try:
+                    parsed = json.loads(val)
+                except (ValueError, TypeError):
+                    parsed = None
+                    if "'" in val:
+                        try:
+                            import ast
+                            parsed = ast.literal_eval(val)
+                        except (ValueError, SyntaxError, TypeError):
+                            parsed = None
+                if not isinstance(parsed, (dict, list)):
+                    # Not actually structured — store as plain string and skip recursion
+                    result[full_key] = val
+                    continue
+            else:
+                result[full_key] = val
+                continue
+        else:
+            result[full_key] = str(val)
+            continue
+
+        # `parsed` is now a dict or list. Recurse / expand.
         if isinstance(parsed, dict):
             result.update(_expand_record(parsed, full_key + sep, sep))
-        elif isinstance(parsed, list):
+        else:  # list
+            result[full_key] = json.dumps(parsed, ensure_ascii=False)
             for i, item in enumerate(parsed):
                 arr_key = f"{full_key}[{i}]"
-                item_str = _json_val_to_str(item)
-                try:
-                    item_parsed = json.loads(item_str)
-                except (json.JSONDecodeError, TypeError):
-                    item_parsed = item_str
-                if isinstance(item_parsed, dict):
-                    result.update(_expand_record(item_parsed, arr_key + sep, sep))
+                if type(item) is dict:
+                    result.update(_expand_record(item, arr_key + sep, sep))
+                elif type(item) is list:
+                    result[arr_key] = json.dumps(item, ensure_ascii=False)
                 else:
-                    result[arr_key] = item_str
+                    result[arr_key] = "" if item is None else str(item)
+    return result
+
+
+def _collapse_record(expanded_record, sep="."):
+    """Reverse _expand_record: collapse dot-notation and array-index notation
+    back into nested dicts and arrays.
+
+    {"tags": '["api","cdn"]', "tags[0]": "api", "tags[1]": "cdn",
+     "address.city": "NYC", "address": '{"city":"NYC"}'}
+        ↓
+    {"tags": ["api", "cdn"], "address": {"city": "NYC"}}
+
+    Only collapses fields that were expanded by _expand_record. All other
+    fields (primitives, already-clean nested) pass through unchanged.
+    """
+    import re as _re
+
+    result = {}
+    # Track keys that were expanded (array indices and dot-notation) to skip in final pass
+    expanded_keys = set()  # keys like "tags[0]", "address.city" that should not appear in result
+
+    # First pass: identify all array-indexed keys (tags[0], tags[1], etc.)
+    # and reconstruct arrays from their parent JSON string
+    array_index_keys = sorted(
+        k for k in expanded_record.keys()
+        if _re.match(r"^(.+)\[(\d+)\]$", k)
+    )
+    expanded_arrays = set()  # parent keys that are arrays (e.g., "tags")
+
+    for key in array_index_keys:
+        m = _re.match(r"^(.+)\[(\d+)\]$", key)
+        assert m
+        parent = m.group(1)
+        idx = int(m.group(2))
+        expanded_keys.add(key)
+
+        # Find the actual array parent key (e.g., "info.metadata.a.tags" for key "info.metadata.a.tags[0]")
+        # parent="info.metadata.a", but actual array key="info.metadata.a.tags"
+        actual_parent = None
+        arr = None
+        for try_parent in [parent, key.rsplit('[', 1)[0]]:
+            if try_parent in expanded_record:
+                try:
+                    arr = json.loads(expanded_record[try_parent])
+                    if isinstance(arr, list):
+                        actual_parent = try_parent
+                        break
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+        if actual_parent is None:
+            continue
+
+        if actual_parent not in expanded_arrays:
+            expanded_arrays.add(actual_parent)
+            result[actual_parent] = [None] * len(arr)
+        if actual_parent in result and idx < len(result[actual_parent]):
+            val = expanded_record[key]
+            try:
+                parsed = json.loads(val)
+                if isinstance(parsed, (dict, list)):
+                    val = parsed
+            except (json.JSONDecodeError, TypeError):
+                pass
+            result[actual_parent][idx] = val
+
+    # Second pass: handle dot-notation nested keys (address.city, info.metadata.a.value, etc.)
+    # Skip keys that are array indices (items[0].name) - handled in first pass
+    dot_keys = sorted(
+        k for k in expanded_record.keys()
+        if sep in k and k not in expanded_arrays and not _re.match(r"^(.+)\[(\d+)\]$", k)
+    )
+    for key in dot_keys:
+        expanded_keys.add(key)
+        parts = key.split(sep)  # split on ALL separators for deep paths
+        if len(parts) < 2:
+            continue
+        # Build nested structure: walk the path, creating dicts as needed
+        d = result
+        for i in range(len(parts) - 1):
+            part = parts[i]
+            if part not in d:
+                d[part] = {}
+            # If intermediate parent key exists in expanded_record as JSON, merge its structure
+            parent_key = sep.join(parts[:i+1])
+            if parent_key in expanded_record:
+                try:
+                    parent_val = json.loads(expanded_record[parent_key])
+                    if isinstance(parent_val, dict) and isinstance(d[part], dict):
+                        for k, v in parent_val.items():
+                            if k not in d[part]:
+                                d[part][k] = v
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            # If d[part] is already a non-dict (string from a previous shorter path),
+            # we can't continue nesting — stop here and fall back to storing as-is
+            if not isinstance(d[part], dict):
+                break
+            d = d[part]
         else:
-            result[full_key] = str_val
+            # Only set the value if we completed the full path without breaking
+            d[parts[-1]] = expanded_record[key]
+            continue
+        # Fallback: if we broke out of the loop, store as top-level flat key
+        result[key] = expanded_record[key]
+
+    # Third pass: add all other keys that weren't part of expansion
+    for key, val in expanded_record.items():
+        if key in expanded_keys:
+            continue
+        if key in expanded_arrays:
+            continue
+        # Skip keys that match array index pattern (items[0], etc.) - these are expanded elements
+        if _re.match(r"^(.+)\[(\d+)\]$", key):
+            continue
+        if sep in key:
+            parts = key.split(sep, 1)
+            parent = parts[0]
+            if parent in expanded_arrays:
+                continue
+        if key not in result:
+            result[key] = expanded_record[key]
+
     return result
 
 

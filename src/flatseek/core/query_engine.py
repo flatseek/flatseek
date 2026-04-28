@@ -197,6 +197,111 @@ def _discover_index_dirs(root):
     return subs
 
 
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+# Module-level: array-index suffix `tags[0]`. Compiled once.
+_ARRAY_IDX_RE = re.compile(r"^(.+?)\[(\d+)\]$")
+
+# Module-level cache of pre-parsed field paths.  Keyed by the flat dot-path,
+# value is either:
+#   • the literal `_PLAIN`  — `field` is a top-level key, no walking needed
+#   • a tuple of segments    — `(("profile", None), ("location", None), ("city", None))`
+#                              `(("info", None), ("metadata", None), ("a", None), ("tags", 0))`
+# Aggregation and range/wildcard hot paths consult this cache instead of
+# re-splitting + re-regex'ing on every doc.
+_PLAIN = object()
+_PATH_CACHE: dict = {}
+
+
+def _parse_field_path(field):
+    """Pre-parse a dot-path key into a tuple of (key, array_idx_or_None) segs.
+
+    Returns `_PLAIN` for a plain top-level key, otherwise the segment tuple.
+    """
+    cached = _PATH_CACHE.get(field, None)
+    if cached is not None:
+        return cached
+    if not field or ("." not in field and "[" not in field):
+        _PATH_CACHE[field] = _PLAIN
+        return _PLAIN
+    out = []
+    for part in field.split("."):
+        m = _ARRAY_IDX_RE.match(part)
+        if m:
+            out.append((m.group(1), int(m.group(2))))
+        else:
+            out.append((part, None))
+    parsed = tuple(out)
+    _PATH_CACHE[field] = parsed
+    return parsed
+
+
+def _walk_path(doc, parsed):
+    """Walk a pre-parsed segment tuple through a (possibly stringified-JSON) doc.
+
+    Optimized: avoids json.loads for strings that clearly aren't JSON objects/arrays.
+    """
+    cur = doc
+    for key, idx in parsed:
+        if isinstance(cur, dict):
+            cur = cur.get(key)
+        elif isinstance(cur, str):
+            # Fast path: only attempt JSON parse for strings that look like JSON.
+            # This skips ~90% of intermediate string values (plain text, numbers, etc.)
+            if not cur or cur[0] not in ('{', '['):
+                return None
+            try:
+                obj = json.loads(cur.replace("'", '"'))
+                cur = obj.get(key) if isinstance(obj, dict) else None
+            except Exception:
+                return None
+        else:
+            return None
+        if cur is None:
+            return None
+        if idx is not None:
+            if isinstance(cur, list):
+                cur = cur[idx] if 0 <= idx < len(cur) else None
+            elif isinstance(cur, str):
+                if not cur or cur[0] not in ('{', '['):
+                    return None
+                try:
+                    arr = json.loads(cur.replace("'", '"'))
+                    cur = arr[idx] if (isinstance(arr, list) and 0 <= idx < len(arr)) else None
+                except Exception:
+                    return None
+            else:
+                return None
+            if cur is None:
+                return None
+    return cur
+
+
+def _get_nested_value(doc, field):
+    """Read a (possibly dot-pathed, array-indexed) field from a doc.
+
+    The doc store keeps fields in their collapsed/nested form (see
+    `_collapse_record` in builder).  Query-time keys are flat dot-paths
+    (e.g. `info.metadata.a.value`) because the trigram index is keyed that way.
+    This walks the doc using the flat-path key so range queries and
+    aggregations can find scalars inside nested objects without re-flattening
+    the doc store.
+
+    Pre-parsing is cached in `_PATH_CACHE`; per-call overhead for repeated
+    field names is one dict lookup.
+    """
+    if doc is None or not field:
+        return None
+    # Fast path — direct stored key (top-level column, array container).
+    direct = doc.get(field)
+    if direct is not None:
+        return direct
+    parsed = _parse_field_path(field)
+    if parsed is _PLAIN:
+        return None
+    return _walk_path(doc, parsed)
+
+
 # ─── QueryEngine ──────────────────────────────────────────────────────────────
 
 class QueryEngine:
@@ -403,7 +508,7 @@ class QueryEngine:
             for cs in sorted(by_chunk):
                 chunk = load_chunk(cs)
                 for doc_id in by_chunk[cs]:
-                    val = chunk.get(doc_id, {}).get(column, "")
+                    val = _get_nested_value(chunk.get(doc_id, {}), column) or ""
                     if val and rx_search(str(val).lower()):
                         verified.append(doc_id)
         else:
@@ -1203,7 +1308,7 @@ class QueryEngine:
                     chunk = load_chunk(cs)
                     for doc_id in by_chunk[cs]:
                         row = chunk.get(doc_id, {})
-                        fval = row.get(field)
+                        fval = _get_nested_value(row, field)
                         if fval is not None:
                             try:
                                 fval_num = float(fval)
@@ -1239,7 +1344,7 @@ class QueryEngine:
                         chunk = load_chunk(cs)
                         for doc_id in by_chunk[cs]:
                             row = chunk.get(doc_id, {})
-                            fval = row.get(field)
+                            fval = _get_nested_value(row, field)
                             if fval is not None:
                                 try:
                                     fval_num = float(fval)
@@ -1411,10 +1516,7 @@ class QueryEngine:
 
         def _to_number(val):
             try:
-                s = str(val)
-                if len(s) >= 4:
-                    return int(s[:4])
-                return float(s)
+                return float(str(val))
             except Exception:
                 return None
 
@@ -1428,21 +1530,37 @@ class QueryEngine:
                 for cs, chunk in eng._iter_chunks():
                     yield cs, chunk
 
+        # Pre-resolve every agg field's parsed path once.  This is the hot-path
+        # win for terms aggregations: 50K+ regex+split calls collapse to one
+        # parse per distinct field.
+        agg_field_paths = {f: _parse_field_path(f) for f in agg_fields.values()}
+        # Cache item lists in stable order (avoids dict-iteration overhead per doc).
+        agg_items = [(t, f, agg_field_paths[f]) for t, f in agg_fields.items()]
+
+        # Hoist hot frees into locals.
+        _walk = _walk_path
+        _PLAIN_LOCAL = _PLAIN
+
         for chunk_start, chunk in _iter_chunks_for_agg(self):
             chunk_len = len(chunk)
             total_docs += chunk_len
             chunks_since_mem_check += 1
 
-            for doc_id in sorted(chunk.keys()):
-                doc = chunk[doc_id]
+            # No sort: terms/stats/avg are commutative; ordering doesn't affect
+            # the result and saves O(N log N) per chunk on big indices.
+            for doc_id, doc in chunk.items():
                 # Filter by query
                 if matching_ids is not None and doc_id not in matching_ids:
                     continue
 
-                for agg_type, field in agg_fields.items():
+                for agg_type, field, ppath in agg_items:
                     val = doc.get(field)
                     if val is None:
-                        continue
+                        if ppath is _PLAIN_LOCAL:
+                            continue
+                        val = _walk(doc, ppath)
+                        if val is None:
+                            continue
 
                     if agg_type == "terms":
                         if not terms_truncated:
