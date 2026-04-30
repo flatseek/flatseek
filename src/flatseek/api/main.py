@@ -9,6 +9,15 @@ import shutil
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+# ── Version from pyproject.toml ──────────────────────────────────────────────
+_PYPROJECT_TOML = os.path.join(os.path.dirname(__file__), "..", "..", "..", "pyproject.toml")
+try:
+    import tomllib
+    with open(_PYPROJECT_TOML, "rb") as _f:
+        API_VERSION = tomllib.load(_f)["project"]["version"]
+except Exception:
+    API_VERSION = "0.0.0"
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -28,7 +37,7 @@ def create_app():
             title="Flatseek API",
             description="Trigram inverted index API — search, aggregate, and index your data. "
                         "Supports Solana blockchain txs, aviation ADS-B, AdTech campaigns, DevOps logs, and more.",
-            version="0.1.0",
+            version=API_VERSION,
             terms_of_service="https://flatseek.io/terms",
             contact={"name": "Flatseek", "url": "https://flatseek.io"},
         )
@@ -221,7 +230,7 @@ async def root():
     """Root endpoint — API name and version."""
     return {
         "name": "Flatseek API",
-        "version": "0.1.0",
+        "version": API_VERSION,
         "description": "Trigram inverted index API",
     }
 

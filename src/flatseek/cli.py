@@ -6,6 +6,7 @@ Workflow:
   flatseek serve               # Start API + flatlens dashboard (on current dir)
   flatseek search ./data "..."  # Search from CLI
   flatseek stats ./data        # Show index stats
+  flatseek generate            # Generate dummy dataset
 
 API:   http://localhost:8000
 Docs:  http://localhost:8000/docs
@@ -24,6 +25,16 @@ import sys
 import os
 import csv
 import argparse
+
+# ── Version from pyproject.toml ──────────────────────────────────────────────
+# __file__ is flatseek/src/flatseek/cli.py → up 2 levels to flatseek/ → sibling pyproject.toml
+_PYPROJECT_TOML = os.path.join(os.path.dirname(__file__), "..", "..", "pyproject.toml")
+try:
+    import tomllib
+    with open(_PYPROJECT_TOML, "rb") as _f:
+        __version__ = tomllib.load(_f)["project"]["version"]
+except Exception:
+    __version__ = "0.0.0"
 
 
 def _parse_columns(columns_str):
@@ -1475,10 +1486,104 @@ def cmd_compress(args):
     print("Note: run 'build' again before 'compress' if you add new data.")
 
 
+def _find_flatlens():
+    """Return path to flatlens directory or None."""
+    candidates = [
+        os.environ.get("FLATSEEK_FLATLENS_DIR", ""),
+        os.environ.get("FLATLENS_DIR", ""),
+        os.path.join(os.path.expanduser("~"), ".local", "share", "flatlens"),
+        "/opt/flatlens",
+    ]
+    # Dev: sibling repo at ../../flatlens relative to flatseek repo root
+    _flatseek_pkg = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _flatseek_repo = os.path.dirname(_flatseek_pkg)
+    candidates.insert(0, os.path.normpath(os.path.join(_flatseek_repo, "..", "..", "flatlens")))
+
+    for p in candidates:
+        if p and os.path.isdir(p) and os.path.isfile(os.path.join(p, "index.html")):
+            return p
+    return None
+
+
+def _auto_install_flatlens(install_dir):
+    """Try to auto-install flatlens to install_dir. Returns True on success."""
+    import subprocess
+    import tempfile, tarfile, zipfile
+
+    parent = os.path.dirname(install_dir)
+    os.makedirs(parent, exist_ok=True)
+
+    # Try git clone first
+    try:
+        print(f"Trying git clone ...")
+        subprocess.run(["git", "clone", "https://github.com/flatseek/flatlens.git", install_dir],
+                       check=True, capture_output=True, text=True)
+        print("flatlens installed via git clone.")
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass  # git not available or failed — try curl
+
+    # Try curl + GitHub API for latest release zipball
+    print("git not available — trying curl + GitHub release ...")
+    try:
+        # Get latest release JSON
+        result = subprocess.run(
+            ["curl", "-sL", "--max-time", "30",
+             "https://api.github.com/repos/flatseek/flatlens/releases/latest"],
+            capture_output=True, text=True, check=True
+        )
+        import json
+        release = json.loads(result.stdout)
+        zipball_url = release.get("zipball_url")
+        if not zipball_url:
+            raise ValueError("No zipball_url in release response")
+
+        tag = release.get("tag_name", "latest")
+        print(f"Downloading {tag} release ...")
+
+        # Download zipball to temp file
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        subprocess.run(
+            ["curl", "-sL", "--max-time", "60", "-o", tmp_path, zipball_url],
+            check=True
+        )
+
+        # Extract zipball (github wraps repo-name around contents)
+        with zipfile.ZipFile(tmp_path, "r") as z:
+            z.extractall(parent)
+        os.unlink(tmp_path)
+
+        # Rename extracted directory to flatlens
+        # The zipball extracts to e.g. flatseek-flatlens-<tag>
+        extracted = None
+        for entry in os.listdir(parent):
+            if entry.startswith("flatseek-flatlens-"):
+                extracted = os.path.join(parent, entry)
+                break
+
+        if extracted and extracted != install_dir:
+            if os.path.exists(install_dir):
+                shutil.rmtree(install_dir, ignore_errors=True)
+            os.rename(extracted, install_dir)
+
+        print(f"flatlens installed via curl (release: {tag}).")
+        return True
+
+    except subprocess.CalledProcessError as e:
+        print(f"curl failed: {e}")
+    except (json.JSONDecodeError, ValueError, zipfile.BadZipFile) as e:
+        print(f"Failed to parse release or extract: {e}")
+    except FileNotFoundError:
+        print("curl not found — please install git or curl, or set FLATLENS_DIR manually.")
+
+    return False
+
+
 def cmd_serve(args):
     """Start the API server with flatlens dashboard, serving data from current directory."""
     import uvicorn, webbrowser
-    from flatseek.api.main import app
 
     import os as _os
     data_dir = os.path.abspath(args.data_dir) if args.data_dir else os.getcwd()
@@ -1491,6 +1596,27 @@ def cmd_serve(args):
     host = args.host
     port = args.port
     reload = not args.no_reload
+
+    # Check if flatlens is available; offer auto-install if not
+    flatlens_dir = _find_flatlens()
+    if not flatlens_dir and not args.flatlens_dir:
+        _install_dir = os.path.join(os.path.expanduser("~"), ".local", "share", "flatlens")
+        print("flatlens dashboard not found.")
+        print(f"  Auto-install to: {_install_dir}")
+        try:
+            ans = input("  Install flatlens now? [Y/n] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            ans = "n"
+
+        if ans in ("", "y", "yes"):
+            if _auto_install_flatlens(_install_dir):
+                flatlens_dir = _install_dir
+                _os.environ["FLATSEEK_FLATLENS_DIR"] = _install_dir
+            else:
+                print("Dashboard will not be available. Starting API only...")
+        else:
+            print("Skipping flatlens install. Dashboard will not be available.")
 
     print(f"Starting Flatseek API + Dashboard on {host}:{port}")
     print(f"Data directory: {data_dir}")
@@ -1563,10 +1689,22 @@ def cmd_dashboard(args):
                 flatlens_dir = p
                 break
         if not flatlens_dir:
-            print("Error: flatlens directory not found.")
-            print("  Set FLATLENS_DIR env var or install to ~/.local/share/flatlens")
-            print("  Or use --flatlens-dir to specify the path")
-            sys.exit(1)
+            _install_dir = os.path.join(os.path.expanduser("~"), ".local", "share", "flatlens")
+            print("flatlens dashboard not found.")
+            print(f"  Auto-install to: {_install_dir}")
+            try:
+                ans = input("  Install flatlens now? [Y/n] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                ans = "n"
+
+            if ans in ("", "y", "yes"):
+                if not _auto_install_flatlens(_install_dir):
+                    sys.exit(1)
+                flatlens_dir = _install_dir
+            else:
+                print("Aborted.")
+                sys.exit(1)
 
     # Inject API base into flatlens js/api.js
     import tempfile, shutil, re
@@ -1607,12 +1745,36 @@ def cmd_dashboard(args):
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def cmd_generate(args):
+    """Generate dummy dataset for benchmarking."""
+    import importlib.util
+
+    # __file__ is flatseek/src/flatseek/cli.py → up 3 levels to project root → flatbench/src/flatbench/generators
+    flatbench_path = os.path.join(os.path.dirname(__file__), "..", "..", "..", "flatbench", "src", "flatbench")
+    gen_path = os.path.join(flatbench_path, "generators", "__init__.py")
+    if not os.path.exists(gen_path):
+        sys.exit("Error: flatbench generators not found. Is flatbench sibling to flatseek?")
+
+    spec = importlib.util.spec_from_file_location("flatbench_generators", gen_path)
+    gen_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gen_mod)
+
+    gen_mod.generate_dataset(
+        schema=args.schema,
+        rows=args.rows,
+        output_path=args.output,
+        format=args.format,
+        seed=args.seed,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="flatseek",
         description="Flatseek CLI — Disk-first serverless search indexer and query engine.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    parser.add_argument("--version", action="version", version=f"flatseek {__version__}")
     sub = parser.add_subparsers(dest="command")
 
     # classify
@@ -1662,6 +1824,22 @@ def main():
                         "buffers ≥ 512 KB to disk every 10 s. Recommended when you have "
                         "abundant free RAM (≥ 8 GB) and want maximum indexing speed. "
                         "Finalize writes all remaining buffers at the end.")
+
+    # generate
+    _gen_help = "Generate dummy dataset for benchmarking (standard, ecommerce, logs, nested, sparse, article, adsb, campaign, devops, sosmed, blockchain)"
+    p = sub.add_parser("generate", help=_gen_help)
+    p.add_argument("-o", "--output", required=True, help="Output file path (CSV or JSONL)")
+    p.add_argument("-r", "--rows", type=int, default=100000,
+                   help="Number of rows to generate (default: 100,000)")
+    p.add_argument("-s", "--schema", default="standard",
+                   choices=["standard", "ecommerce", "logs", "nested", "sparse",
+                            "article", "adsb", "campaign", "devops", "sosmed", "blockchain"],
+                   help="Dataset schema (default: standard)")
+    p.add_argument("-f", "--format", default="csv",
+                   choices=["csv", "jsonl"],
+                   help="Output format (default: csv)")
+    p.add_argument("--seed", type=int, default=None,
+                   help="Random seed for reproducibility")
 
     # plan
     p = sub.add_parser("plan", help="Generate a build plan for parallel/distributed indexing")
@@ -1817,6 +1995,8 @@ def main():
         cmd_dedup(args)
     elif args.command == "plan":
         cmd_plan(args)
+    elif args.command == "generate":
+        cmd_generate(args)
     else:
         parser.print_help()
 

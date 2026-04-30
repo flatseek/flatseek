@@ -159,10 +159,12 @@ async def search(
 
     try:
         start = time.perf_counter()
-        query = body.get('query', '*') if body else "*"
-        if q:
+        # Priority: body.query > body.q > URL query param q > "*"
+        query = body.get('query') if body else None
+        if query is None and body:
+            query = body.get('q')
+        if q and query is None:
             query = q
-
         if not query:
             query = "*"
 
