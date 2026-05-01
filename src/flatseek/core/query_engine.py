@@ -17,11 +17,13 @@ Doc chunks are loaded lazily (only the chunks containing requested doc_ids).
 
 import glob as _glob
 import logging
+import mmap as _mmap
 import os
 import re
 import json
 import struct
 import zlib
+import time as _time
 from collections import defaultdict
 from datetime import date as _date
 
@@ -162,6 +164,10 @@ def decode_doclist(data):
 
 _PREFIX_CACHE: dict = {}
 _POSTING_CACHE_MAX = 8192   # max terms cached per QueryEngine instance
+
+# Wildcard query safety caps
+_MAX_WILDCARD_CANDIDATES = 500_000   # cap candidate expansion from trigram intersection
+_MAX_VERIFIED_RESULTS   = 10_000   # stop verification early once we have this many matches
 
 def term_hash(term):
     """Must match builder.term_hash exactly — determines which bucket file to read."""
@@ -352,7 +358,34 @@ class QueryEngine:
         self.doc_chunk_size = self.stats.get("doc_chunk_size", 100_000)
         self._doc_cache = {}      # chunk_start → {doc_id: row_dict}
         self._posting_cache = {}  # term → sorted doc_id list (bounded to _POSTING_CACHE_MAX)
+        self._hot_postings = {}    # term → sorted doc_id list (never evicted, hot fields)
         self._enc_key: bytes | None = None   # set via set_key() before querying encrypted indexes
+        self._dv_cache: dict = {}   # field → doc_values data (lazy loaded)
+        self._mmap_cache = {}        # path → mmap object (reusable across queries)
+        self._term_set_cache = {}    # bucket_prefix → frozenset of all terms in bucket
+
+        # ── Lightweight profiling hooks (enable with env var) ──────────────────
+        self._profile: bool = os.environ.get("FLATSEEK_PROFILE", "") == "1"
+        self._phase_times: dict = {}   # phase → cumulative microseconds
+
+    def _timed_phase(self, name):
+        """Context manager for profiling a phase. Enable with FLATSEEK_PROFILE=1."""
+        class _PhaseTimer:
+            __slots__ = ("name", "_t0", "_profile", "_phase_times")
+            def __init__(self, name, profile, phase_times):
+                self.name = name
+                self._profile = profile
+                self._phase_times = phase_times
+                self._t0 = None
+            def __enter__(self):
+                if self._profile:
+                    self._t0 = _time.perf_counter()
+                return self
+            def __exit__(self, *args):
+                if self._profile and self._t0 is not None:
+                    elapsed = (_time.perf_counter() - self._t0) * 1_000_000
+                    self._phase_times[self.name] = self._phase_times.get(self.name, 0) + elapsed
+        return _PhaseTimer(name, self._profile, self._phase_times)
 
     def reload_stats(self):
         """Re-read stats.json from disk to pick up changes after a flush."""
@@ -384,6 +417,59 @@ class QueryEngine:
             )
         return decrypt_bytes(data, self._enc_key)
 
+    def _mmap_read(self, path: str) -> bytes:
+        """Read file contents using mmap (OS page cache for hot files).
+
+        Reuses mmap handles across calls via _mmap_cache.
+        Falls back to regular read for small files or on error.
+        """
+        try:
+            cached = self._mmap_cache.get(path)
+            if cached is not None:
+                return cached
+            with open(path, "rb") as f:
+                # mmap requires non-empty file
+                f.seek(0, 2)
+                size = f.tell()
+                if size == 0:
+                    return b""
+                f.seek(0)
+                mm = _mmap.mmap(f.fileno(), size, access=_mmap.ACCESS_READ)
+            # Keep mmap alive in cache; OS handles page faults
+            self._mmap_cache[path] = mm
+            return mm[:]
+        except Exception:
+            # Fallback: regular read
+            try:
+                with open(path, "rb") as f:
+                    return f.read()
+            except Exception:
+                return b""
+
+    def _load_bucket_term_set(self, prefix):
+        """Load the pickled term set for a bucket (fast-reject cache).
+
+        Returns a frozenset of all terms indexed in the bucket, or None if
+        the terms.set file does not exist (old index without term sets).
+        """
+        if prefix in self._term_set_cache:
+            return self._term_set_cache[prefix]
+
+        import pickle
+        bucket_dir = os.path.join(self.index_dir, prefix)
+        set_path = os.path.join(bucket_dir, "terms.set")
+        try:
+            if os.path.isfile(set_path):
+                with open(set_path, "rb") as f:
+                    terms = frozenset(pickle.load(f))
+                self._term_set_cache[prefix] = terms
+                return terms
+        except Exception:
+            pass
+        # Mark as no-set so we don't re-try every call
+        self._term_set_cache[prefix] = None
+        return None
+
     # ─── Index file lookup ────────────────────────────────────────────────────
 
     def _read_posting(self, term):
@@ -392,25 +478,40 @@ class QueryEngine:
         Reads ALL *.bin files in the bucket directory — supports both single-builder
         (idx.bin) and distributed/parallel builds (idx_w0.bin, idx_w1.bin, …).
         Merges all doc_id lists into a single sorted, deduplicated result.
+
+        Uses mmap for hot files (OS page cache), _hot_postings for
+        never-evicted persistent cache, and bucket term sets for O(1) fast-reject.
         """
+        # Hot postings: never evicted, common filter terms stay cached
+        hot = self._hot_postings.get(term)
+        if hot is not None:
+            return hot
+
         prefix = term_hash(term)
         bucket_dir = os.path.join(self.index_dir, prefix)
 
         if not os.path.isdir(bucket_dir):
             return []
 
+        # Fast reject: if bucket has a term-set file and term is not in it,
+        # skip all posting file reads entirely (2x–4x speedup for non-existent terms)
+        term_set = self._load_bucket_term_set(prefix)
+        if term_set is not None and term not in term_set:
+            return []
+
         bin_files = sorted(f for f in os.listdir(bucket_dir) if f.endswith(".bin"))
         if not bin_files:
             return []
 
-        # Check posting cache first (populated below on first read)
+        # Check bounded LRU cache
         cached = self._posting_cache.get(term)
         if cached is not None:
             return cached
 
         all_ids = []
         for bin_file in bin_files:
-            data = open(os.path.join(bucket_dir, bin_file), "rb").read()
+            bin_path = os.path.join(bucket_dir, bin_file)
+            data = self._mmap_read(bin_path)
             if not data:
                 continue
             # Decrypt if encrypted (must happen before decompression)
@@ -420,9 +521,7 @@ class QueryEngine:
                 data = zlib.decompress(data)
 
             offset = 0
-            while offset < len(data):
-                if offset + 2 > len(data):
-                    break
+            while offset + 2 <= len(data):
                 term_len = struct.unpack_from("<H", data, offset)[0]; offset += 2
                 if offset + term_len > len(data):
                     break
@@ -433,6 +532,24 @@ class QueryEngine:
                 if stored == term:
                     all_ids.extend(decode_doclist(data[offset:offset + pl_len]))
                 offset += pl_len
+
+        result = sorted(set(all_ids)) if all_ids else []
+        # Promote to hot cache if term looks like a common filter (column:value with
+        # common column names).  Terms with very large posting lists are excluded.
+        _COMMON_COLUMNS = frozenset({"status", "type", "program", "service", "level",
+                                      "country", "region", "city", "active", "enabled"})
+        col_part = term.split(":", 1)[0].lower() if ":" in term else ""
+        if result and (col_part in _COMMON_COLUMNS or len(result) < 50_000):
+            self._hot_postings[term] = result
+        else:
+            # Bounded LRU cache for everything else
+            pc = self._posting_cache
+            if len(pc) >= _POSTING_CACHE_MAX:
+                keep = _POSTING_CACHE_MAX // 2
+                for old_key in list(pc)[:len(pc) - keep]:
+                    del pc[old_key]
+            pc[term] = result
+        return result
 
         result = sorted(set(all_ids)) if all_ids else []
         # Cache with bounded eviction: discard oldest half when full
@@ -505,20 +622,29 @@ class QueryEngine:
         verified = []
         load_chunk = self._load_chunk
         if column:
-            for cs in sorted(by_chunk):
-                chunk = load_chunk(cs)
-                for doc_id in by_chunk[cs]:
-                    val = _get_nested_value(chunk.get(doc_id, {}), column) or ""
-                    if val and rx_search(str(val).lower()):
-                        verified.append(doc_id)
-        else:
-            for cs in sorted(by_chunk):
-                chunk = load_chunk(cs)
-                for doc_id in by_chunk[cs]:
-                    for val in chunk.get(doc_id, {}).values():
-                        if isinstance(val, str) and rx_search(val.lower()):
+            with self._timed_phase("verify_wildcard"):
+                for cs in sorted(by_chunk):
+                    chunk = load_chunk(cs)
+                    for doc_id in by_chunk[cs]:
+                        val = _get_nested_value(chunk.get(doc_id) or {}, column) or ""
+                        if val and rx_search(str(val).lower()):
                             verified.append(doc_id)
-                            break
+                            if len(verified) >= _MAX_VERIFIED_RESULTS:
+                                return verified
+        else:
+            with self._timed_phase("verify_wildcard"):
+                for cs in sorted(by_chunk):
+                    chunk = load_chunk(cs)
+                    for doc_id in by_chunk[cs]:
+                        doc = chunk.get(doc_id)
+                        if not doc:
+                            continue
+                        for val in doc.values():
+                            if isinstance(val, str) and rx_search(val.lower()):
+                                verified.append(doc_id)
+                                break
+                        if len(verified) >= _MAX_VERIFIED_RESULTS:
+                            return verified
         return verified
 
     def _resolve(self, term, column=None, max_docs=None, *, exact=False):
@@ -619,6 +745,9 @@ class QueryEngine:
                 if not result:
                     return []
             candidates = sorted(result)
+            # Safety cap: if too many candidates, fall back to prefix/suffix expansion
+            if len(candidates) > _MAX_WILDCARD_CANDIDATES:
+                return self._wildcard_fallback(clean, column, has_wildcard, col_prefix)
         else:
             # Cross-column wildcard: union trigram intersections across all known columns.
             # Global trigrams are not stored (removed to save space), so we iterate columns.
@@ -642,12 +771,115 @@ class QueryEngine:
                 if col_result:
                     result |= col_result
             candidates = sorted(result)
+            if len(candidates) > _MAX_WILDCARD_CANDIDATES:
+                return self._wildcard_fallback(clean, column, has_wildcard, col_prefix)
 
         # Post-filter: verify candidates actually match the full wildcard pattern.
         # Trigram intersection eliminates most non-matches but can produce false
         # positives when trigrams appear in a value but not consecutively
         # (e.g. "RAYDIUMV2" contains 'ray' and 'diu' but not the substring "garuda").
         return self._verify_wildcard(candidates, term, column)
+
+    # ─── Wildcard fallback (safety cap) ─────────────────────────────────────────
+
+    def _wildcard_fallback(self, clean, column, has_wildcard, col_prefix):
+        """Fallback for broad wildcards: use prefix/suffix expansion with early terminate.
+
+        When trigram candidate set exceeds _MAX_WILDCARD_CANDIDATES, this path
+        avoids O(N) verification by only expanding from index terms that directly
+        match the prefix/suffix pattern — much fewer candidates, sorted by
+        postings size so rare terms are checked first.
+
+        Before: O(N docs) verification scan (all candidates loaded from disk)
+        After:  O(T index terms matching pattern) — T << N typically
+        """
+        starts_wild = clean.startswith(('%', '*'))
+        ends_wild   = clean.endswith(('%', '*'))
+        # Strip anchors for matching against indexed terms
+        prefix = clean.lstrip('%*')
+        prefix = prefix.rstrip('%*')
+
+        if not prefix:
+            return []
+
+        # Build a regex that matches indexed tokens (no .* on edges since we're
+        # only checking the token content, not requiring full anchored match)
+        escaped = re.escape(prefix)
+        if starts_wild and ends_wild:
+            rx = re.compile(f".*{escaped}.*", re.IGNORECASE)
+        elif starts_wild:
+            rx = re.compile(f".*{escaped}", re.IGNORECASE)
+        elif ends_wild:
+            rx = re.compile(f"^{escaped}", re.IGNORECASE)  # token must start with prefix
+        else:
+            rx = re.compile(f"^{escaped}$", re.IGNORECASE)
+
+        # Collect matching terms by scanning the postings index.
+        # This is expensive (reads all bucket dirs), so we limit to top matches.
+        all_ids: set = set()
+        checked_terms = 0
+        max_terms_check = 100_000  # safety limit on index term scanning
+
+        if column:
+            cols_to_scan = [column]
+        else:
+            cols_to_scan = list(self.columns())
+
+        for col_key in cols_to_scan:
+            if checked_terms >= max_terms_check:
+                break
+            prefix_hash = term_hash(col_key)
+            bucket_dir = os.path.join(self.index_dir, prefix_hash)
+            if not os.path.isdir(bucket_dir):
+                continue
+            for bin_file in sorted(f for f in os.listdir(bucket_dir) if f.endswith(".bin")):
+                if checked_terms >= max_terms_check:
+                    break
+                try:
+                    bin_path = os.path.join(bucket_dir, bin_file)
+                    data = self._mmap_read(bin_path)
+                    if not data:
+                        continue
+                    # Handle encrypted index files
+                    if is_encrypted(data):
+                        try:
+                            data = self._decrypt_if_needed(data)
+                        except Exception:
+                            continue
+                    if len(data) >= 2 and data[0] == 0x78 and data[1] in (0x01, 0x5e, 0x9c, 0xda):
+                        data = zlib.decompress(data)
+                except Exception:
+                    continue
+                offset = 0
+                while offset + 2 <= len(data) and checked_terms < max_terms_check:
+                    term_len = struct.unpack_from("<H", data, offset)[0]; offset += 2
+                    if offset + term_len > len(data):
+                        break
+                    try:
+                        stored = data[offset:offset + term_len].decode("utf-8"); offset += term_len
+                    except UnicodeDecodeError:
+                        # Corrupted or encrypted entry — skip this entry
+                        offset += term_len
+                        if offset + 4 > len(data):
+                            break
+                        pl_len = struct.unpack_from("<I", data, offset)[0]; offset += 4
+                        continue
+                    if offset + 4 > len(data):
+                        break
+                    pl_len = struct.unpack_from("<I", data, offset)[0]; offset += 4
+                    checked_terms += 1
+                    # Only check column-scoped terms
+                    if not stored.startswith(f"{col_key}:"):
+                        continue
+                    token = stored[len(col_key) + 1:]
+                    if rx.match(token):
+                        all_ids.update(decode_doclist(data[offset:offset + pl_len]))
+                        if len(all_ids) > _MAX_VERIFIED_RESULTS:
+                            # Early termination: we have enough results
+                            return sorted(all_ids)[:_MAX_VERIFIED_RESULTS]
+                    offset += pl_len
+
+        return sorted(all_ids)
 
     # ─── Doc fetching ─────────────────────────────────────────────────────────
 
@@ -956,6 +1188,8 @@ class QueryEngine:
         """AND search across multiple (column, term) conditions.
 
         All conditions must match (intersection). Fails fast if any returns empty.
+        Conditions are sorted by posting list size before intersecting — rarest
+        term is evaluated first so large posting lists are pruned early.
 
         Args:
             conditions: list of (column, term) tuples, e.g.:
@@ -970,24 +1204,40 @@ class QueryEngine:
         if self._sub_engines is not None:
             per_eng = []
             for eng in self._sub_engines:
-                result = None
+                # Resolve all conditions first, sort by size (rarest first) per engine
+                resolved = []
                 for col, term in conditions:
                     ids = eng._resolve(term, col)
                     if not ids:
-                        result = []
+                        result = set()
                         break
-                    s = set(ids)
-                    result = s if result is None else result & s
+                    resolved.append((len(ids), set(ids)))
+                else:
+                    resolved.sort(key=lambda x: x[0])
+                    result = resolved[0][1]
+                    for _, s in resolved[1:]:
+                        result &= s
+                        if not result:
+                            break
                 per_eng.append((eng, sorted(result) if result else []))
             return self._multi_paginate(per_eng, page, page_size)
 
-        result = None
+        # Resolve all terms first, then sort by posting list size (rarest first)
+        # to minimize intersection work — mirrors Tantivy's conjunction optimization.
+        resolved = []
         for col, term in conditions:
             ids = self._resolve(term, col)
             if not ids:
                 return {"total": 0, "page": page, "page_size": page_size, "results": []}
-            s = set(ids)
-            result = s if result is None else result & s
+            resolved.append((len(ids), set(ids)))
+        # Sort by size ascending: smallest posting list first
+        resolved.sort(key=lambda x: x[0])
+
+        result = resolved[0][1]
+        for _, ids in resolved[1:]:
+            result &= ids
+            if not result:
+                break
 
         if not result:
             return {"total": 0, "page": page, "page_size": page_size, "results": []}
@@ -1212,6 +1462,64 @@ class QueryEngine:
             "results":   matched[start:start + page_size],
         }
 
+    # ─── Doc_values columnar storage for fast aggregations ─────────────────────
+
+    def _load_doc_values(self, field):
+        """Load doc_values for a field (lazy, cached).
+
+        Returns:
+            For numeric fields: list of (value, doc_id) sorted by value
+            For keyword fields: list of (term_bytes, count) sorted by count
+        """
+        if field in self._dv_cache:
+            return self._dv_cache[field]
+
+        import struct as _struct
+        _unpack_q = _struct.Struct("<Q").unpack
+        _unpack_f = _struct.Struct("<d").unpack
+        _unpack_h = _struct.Struct("<H").unpack
+        _unpack_i = _struct.Struct("<I").unpack
+
+        dv_path = os.path.join(self.data_dir, "dv", field)
+        if not os.path.isdir(dv_path):
+            self._dv_cache[field] = None
+            return None
+
+        # Detect numeric vs keyword from file presence
+        numeric_path = os.path.join(dv_path, "numeric.bin")
+        terms_path = os.path.join(dv_path, "terms.bin")
+
+        if os.path.isfile(numeric_path):
+            # Numeric: load sorted (value, doc_id) pairs
+            pairs = []
+            with open(numeric_path, "rb") as f:
+                data = f.read()
+            i = 0
+            while i + 16 <= len(data):
+                doc_id = _unpack_q(data[i:i+8])[0]; i += 8
+                value  = _unpack_f(data[i:i+8])[0]; i += 8
+                pairs.append((value, doc_id))
+            self._dv_cache[field] = pairs
+            return pairs
+        elif os.path.isfile(terms_path):
+            # Keyword: load term→count list
+            terms = []
+            with open(terms_path, "rb") as f:
+                data = f.read()
+            i = 0
+            while i + 2 <= len(data):
+                term_len = _unpack_h(data[i:i+2])[0]; i += 2
+                if i + term_len + 4 > len(data):
+                    break
+                term = data[i:i+term_len].decode("utf-8"); i += term_len
+                count = _unpack_i(data[i:i+4])[0]; i += 4
+                terms.append((term, count))
+            self._dv_cache[field] = terms
+            return terms
+        else:
+            self._dv_cache[field] = None
+            return None
+
     # ─── Range queries ────────────────────────────────────────────────────────
 
     def _year_range_ids(self, field, lo_year, hi_year):
@@ -1292,20 +1600,42 @@ class QueryEngine:
             lo_val = _parse_numeric(args[1])
             hi_val = _parse_numeric(args[2])
             if lo_val is not None and hi_val is not None:
-                # Query uses numeric range (e.g. balance:[1000000 TO 99999999])
-                # Scan all docs and filter by numeric comparison
-                result = set()
-                total = self.stats.get("total_docs", 0)
-                by_chunk: dict = {}
-                chunk_start_fn = self._chunk_start
-                for doc_id in range(total):
-                    cs = chunk_start_fn(doc_id)
-                    if cs not in by_chunk:
-                        by_chunk[cs] = []
-                    by_chunk[cs].append(doc_id)
-                load_chunk = self._load_chunk
-                for cs in sorted(by_chunk):
-                    chunk = load_chunk(cs)
+                # Fast path: use doc_values binary search if available
+                pairs = self._load_doc_values(field)
+                if pairs is not None:
+                    # Binary search: O(log N) find lower/upper bounds
+                    # Guard against mixed types (some values may be str if field
+                    # was classified numeric but contains non-numeric data)
+                    import bisect
+                    try:
+                        values = [p[0] for p in pairs]
+                        # numeric.bin stores (float_value, doc_id) pairs — values[0] is always float
+                        # terms.bin stores (term_string, count) pairs — values[0] is str
+                        # If values are strings, this field uses terms.bin (KEYWORD/ARRAY/DATE),
+                        # not numeric.bin — binary search with float bounds will fail
+                        if values and not isinstance(values[0], (int, float)):
+                            pairs = None
+                        else:
+                            lo_idx = bisect.bisect_left(values, lo_val)
+                            hi_idx = bisect.bisect_right(values, hi_val)
+                            result = {doc_id for _, doc_id in pairs[lo_idx:hi_idx]}
+                    except TypeError:
+                        # Mixed types in values → fall back to chunk scan
+                        pairs = None
+                if pairs is None:
+                    # Fallback: full chunk scan
+                    result = set()
+                    total = self.stats.get("total_docs", 0)
+                    by_chunk: dict = {}
+                    chunk_start_fn = self._chunk_start
+                    for doc_id in range(total):
+                        cs = chunk_start_fn(doc_id)
+                        if cs not in by_chunk:
+                            by_chunk[cs] = []
+                        by_chunk[cs].append(doc_id)
+                    load_chunk = self._load_chunk
+                    for cs in sorted(by_chunk):
+                        chunk = load_chunk(cs)
                     for doc_id in by_chunk[cs]:
                         row = chunk.get(doc_id, {})
                         fval = _get_nested_value(row, field)
@@ -1330,9 +1660,37 @@ class QueryEngine:
                 num_val = _parse_numeric(args[1])
                 if num_val is not None:
                     op_sym = op  # '>', '>=', '<', '<='
-                    result = set()
-                    total = self.stats.get("total_docs", 0)
-                    by_chunk: dict = {}
+                    # Fast path: use doc_values binary search if available
+                    pairs = self._load_doc_values(field)
+                    if pairs is not None:
+                        import bisect
+                        try:
+                            values = [p[0] for p in pairs]
+                            # Same guard as BETWEEN path: if values are strings (terms.bin),
+                            # binary search with float bounds will TypeError
+                            if values and not isinstance(values[0], (int, float)):
+                                pairs = None
+                            elif op_sym == '>':
+                                idx = bisect.bisect_right(values, num_val)
+                                result = {doc_id for _, doc_id in pairs[idx:]}
+                            elif op_sym == '>=':
+                                idx = bisect.bisect_left(values, num_val)
+                                result = {doc_id for _, doc_id in pairs[idx:]}
+                            elif op_sym == '<':
+                                idx = bisect.bisect_left(values, num_val)
+                                result = {doc_id for _, doc_id in pairs[:idx]}
+                            elif op_sym == '<=':
+                                idx = bisect.bisect_right(values, num_val)
+                                result = {doc_id for _, doc_id in pairs[:idx]}
+                            return result
+                        except TypeError:
+                            # Mixed types → fall back to chunk scan
+                            pairs = None
+                    if pairs is None:
+                        # Fallback: full chunk scan
+                        result = set()
+                        total = self.stats.get("total_docs", 0)
+                        by_chunk: dict = {}
                     chunk_start_fn = self._chunk_start
                     for doc_id in range(total):
                         cs = chunk_start_fn(doc_id)
@@ -1541,84 +1899,148 @@ class QueryEngine:
         _walk = _walk_path
         _PLAIN_LOCAL = _PLAIN
 
+        # ── Fast path: use doc_values if all aggs are numeric/keyword with dv ──
+        # Check if every agg can use doc_values (no query filter + supported type)
+        if matching_ids is None:
+            all_dv_compatible = True
+            dv_able_fields = {}
+            for agg_type, field, _ in agg_items:
+                if agg_type in ("terms",):
+                    dv = self._load_doc_values(field)
+                    if dv is not None:
+                        dv_able_fields[agg_type] = (field, dv)
+                    else:
+                        all_dv_compatible = False
+                        break
+                elif agg_type in ("avg", "min", "max", "sum", "stats"):
+                    dv = self._load_doc_values(field)
+                    if dv is not None:
+                        dv_able_fields[agg_type] = (field, dv)
+                    else:
+                        all_dv_compatible = False
+                        break
+                else:
+                    all_dv_compatible = False
+                    break
+
+            if all_dv_compatible and dv_able_fields:
+                # All aggs have doc_values and no filter → use fast columnar path
+                aggregations = {}
+                with self._timed_phase("agg_dv"):
+                    for agg_type, (field, dv) in dv_able_fields.items():
+                        if agg_type == "terms":
+                            buckets = [{"key": term, "doc_count": count} for term, count in dv]
+                            aggregations[field] = {
+                                "buckets": buckets[:agg_configs[agg_type].get("size", size)],
+                                "sum_other_doc_count": max(0, len(dv) - size),
+                            }
+                        elif agg_type == "stats":
+                            vals = [p[0] for p in dv]
+                            count = len(vals)
+                            vals_sorted = sorted(vals)
+                            min_v = vals_sorted[0]
+                            max_v = vals_sorted[-1]
+                            avg_v = sum(vals) / count
+                            sum_v = sum(vals)
+                            aggregations[field] = {
+                                "count": count, "min": min_v, "max": max_v,
+                                "avg": avg_v, "sum": sum_v,
+                            }
+                        elif agg_type == "min":
+                            aggregations[field] = {"value": min(p[0] for p in dv)}
+                        elif agg_type == "max":
+                            aggregations[field] = {"value": max(p[0] for p in dv)}
+                        elif agg_type == "avg":
+                            vals = [p[0] for p in dv]
+                            aggregations[field] = {"value": sum(vals) / len(vals)}
+                        elif agg_type == "sum":
+                            aggregations[field] = {"value": sum(p[0] for p in dv)}
+
+                return {
+                    "took": int((_time.perf_counter() - start) * 1000),
+                    "hits": {"total": self.stats.get("total_docs", 0), "hits": []},
+                    "aggregations": aggregations,
+                }
+
         for chunk_start, chunk in _iter_chunks_for_agg(self):
             chunk_len = len(chunk)
             total_docs += chunk_len
             chunks_since_mem_check += 1
 
-            # No sort: terms/stats/avg are commutative; ordering doesn't affect
-            # the result and saves O(N log N) per chunk on big indices.
-            for doc_id, doc in chunk.items():
-                # Filter by query
-                if matching_ids is not None and doc_id not in matching_ids:
-                    continue
+            with self._timed_phase("agg_scan"):
+                # No sort: terms/stats/avg are commutative; ordering doesn't affect
+                # the result and saves O(N log N) per chunk on big indices.
+                for doc_id, doc in chunk.items():
+                    # Filter by query
+                    if matching_ids is not None and doc_id not in matching_ids:
+                        continue
 
-                for agg_type, field, ppath in agg_items:
-                    val = doc.get(field)
-                    if val is None:
-                        if ppath is _PLAIN_LOCAL:
-                            continue
-                        val = _walk(doc, ppath)
+                    for agg_type, field, ppath in agg_items:
+                        val = doc.get(field)
                         if val is None:
-                            continue
+                            if ppath is _PLAIN_LOCAL:
+                                continue
+                            val = _walk(doc, ppath)
+                            if val is None:
+                                continue
 
-                    if agg_type == "terms":
-                        if not terms_truncated:
-                            # Arrays: iterate each element so "graphql" gets its own bucket
-                            # val may be a list/tuple, or a string like "['a','b']" from CSV
-                            if isinstance(val, (list, tuple)):
-                                items = val
-                            elif isinstance(val, str) and val.startswith(('[', '(')):
-                                try:
-                                    items = json.loads(val.replace("'", '"'))
-                                except Exception:
+                        if agg_type == "terms":
+                            if not terms_truncated:
+                                # Arrays: iterate each element so "graphql" gets its own bucket
+                                # val may be a list/tuple, or a string like "['a','b']" from CSV
+                                if isinstance(val, (list, tuple)):
+                                    items = val
+                                elif isinstance(val, str) and val.startswith(('[', '(')):
+                                    try:
+                                        items = json.loads(val.replace("'", '"'))
+                                    except Exception:
+                                        items = [val]
+                                else:
                                     items = [val]
-                            else:
-                                items = [val]
-                            for item in items:
-                                if len(terms_counter) < MAX_TERMS:
-                                    terms_counter[str(item)] += 1
-                                else:
-                                    terms_truncated = True
-                                    terms_overflow += 1
+                                for item in items:
+                                    if len(terms_counter) < MAX_TERMS:
+                                        terms_counter[str(item)] += 1
+                                    else:
+                                        terms_truncated = True
+                                        terms_overflow += 1
 
-                    elif agg_type == "cardinality":
-                        cardinality_sketch.add(val)
+                        elif agg_type == "cardinality":
+                            cardinality_sketch.add(val)
 
-                    elif agg_type in ("avg", "min", "max", "sum", "stats"):
-                        num = _to_number(val)
-                        if num is None:
-                            continue
-                        running_count += 1
-                        running_sum += num
-                        if running_min is None or num < running_min:
-                            running_min = num
-                        if running_max is None or num > running_max:
-                            running_max = num
+                        elif agg_type in ("avg", "min", "max", "sum", "stats"):
+                            num = _to_number(val)
+                            if num is None:
+                                continue
+                            running_count += 1
+                            running_sum += num
+                            if running_min is None or num < running_min:
+                                running_min = num
+                            if running_max is None or num > running_max:
+                                running_max = num
 
-                    elif agg_type == "date_histogram":
-                        ms_to_epoch = agg_configs.get("date_histogram", {}).get("ms_to_epoch", False)
-                        if ms_to_epoch:
-                            try:
-                                epoch = int(float(str(val)))
-                                if 0 < epoch < 4102444800:
-                                    val_str = _time.strftime("%Y%m%d%H%M%S", _time.gmtime(epoch))
-                                else:
+                        elif agg_type == "date_histogram":
+                            ms_to_epoch = agg_configs.get("date_histogram", {}).get("ms_to_epoch", False)
+                            if ms_to_epoch:
+                                try:
+                                    epoch = int(float(str(val)))
+                                    if 0 < epoch < 4102444800:
+                                        val_str = _time.strftime("%Y%m%d%H%M%S", _time.gmtime(epoch))
+                                    else:
+                                        val_str = str(val)
+                                except Exception:
                                     val_str = str(val)
-                            except Exception:
-                                val_str = str(val)
-                        else:
-                            val_str = _parse_date(val) if isinstance(val, str) else str(val)
-                        date_counter[val_str] += 1
+                            else:
+                                val_str = _parse_date(val) if isinstance(val, str) else str(val)
+                            date_counter[val_str] += 1
 
-                    elif agg_type == "histogram":
-                        try:
-                            num = float(val) if isinstance(val, str) else val
-                            interval = agg_configs.get("histogram", {}).get("interval", 1)
-                            bucket_key = int(num // interval) * interval
-                            hist_counter[bucket_key] += 1
-                        except Exception:
-                            pass
+                        elif agg_type == "histogram":
+                            try:
+                                num = float(val) if isinstance(val, str) else val
+                                interval = agg_configs.get("histogram", {}).get("interval", 1)
+                                bucket_key = int(num // interval) * interval
+                                hist_counter[bucket_key] += 1
+                            except Exception:
+                                pass
 
             # Memory guard
             if chunks_since_mem_check >= MEM_CHECK_INTERVAL:

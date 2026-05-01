@@ -440,4 +440,4 @@ def Elasticsearch(hosts=None, **kwargs) -> Flatseek:
 
 __all__ = ["Flatseek", "Response", "CountResponse", "AggsResponse",
            "Elasticsearch", "__version__"]
-__version__ = "0.1.0"
+__version__ = "0.1.2"
