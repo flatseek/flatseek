@@ -96,10 +96,11 @@ See [docs/](docs/) for full details.
 | [Quick Start](docs/quickstart.md) | Install, index, query — in 5 minutes |
 | [Indexing](docs/indexing.md) | Formats, column types, parallel builds, encrypt |
 | [Query Language](docs/query-language.md) | Full syntax reference |
-| [Aggregation](docs/aggregation.md) | Aggregation types and examples |
 | [CLI Reference](docs/cli.md) | All CLI commands |
 | [REST API](docs/api.md) | API endpoints |
-| [Architecture](docs/architecture.md) | How Flatseek stores and queries data |
+| [Schemas](docs/schemas.md) | Supported Column Types |
+| [Architecture](docs/architecture.md) | A structural and behavioral map of the Flatseek codebase |
+| [Internals](docs/internals.md) | Deep technical breakdown |
 
 ---
 

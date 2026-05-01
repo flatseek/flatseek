@@ -4,14 +4,14 @@
 
 | Guide | Description |
 |-------|-------------|
-| [Quick Start](quickstart.md) | Install, index, query — in 5 minutes |
-| [Indexing](indexing.md) | Formats, column types, parallel builds, encrypt |
-| [Query Language](query-language.md) | Full syntax reference |
-| [Aggregation](aggregation.md) | Aggregation types and examples |
-| [CLI Reference](cli.md) | All CLI commands |
-| [REST API](api.md) | API endpoints |
-| [Architecture](architecture.md) | How Flatseek works |
-| [Benchmark](benchmark.md) | Performance vs Elasticsearch, Tantivy, Typesense, Whoosh, Zincsearch |
+| [Quick Start](docs/quickstart.md) | Install, index, query — in 5 minutes |
+| [Indexing](docs/indexing.md) | Formats, column types, parallel builds, encrypt |
+| [Query Language](docs/query-language.md) | Full syntax reference |
+| [CLI Reference](docs/cli.md) | All CLI commands |
+| [REST API](docs/api.md) | API endpoints |
+| [Schemas](docs/schemas.md) | Supported Column Types |
+| [Architecture](docs/architecture.md) | A structural and behavioral map of the Flatseek codebase |
+| [Internals](docs/internals.md) | Deep technical breakdown |
 
 ## Other
 
