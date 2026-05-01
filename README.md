@@ -50,7 +50,7 @@
 | Range query hits | 501,011 (exact) | 505,044 |
 | Build 500K rows | 216s | 113s |
 
-Full comparison (tantivy, typesense, whoosh, zincsearch): [docs/benchmarks.md](/docs/benchmarks.md) or
+Full comparison (tantivy, typesense, whoosh, zincsearch): [docs/benchmark.md](/docs/benchmark.md) or
 [bench.flatseek.io](https://bench.flatseek.io)
 
 ---
