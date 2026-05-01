@@ -23,6 +23,8 @@
 &nbsp;&middot;&nbsp;
 **Docs:** [flatseek.io/docs](https://flatseek.io/docs)
 &nbsp;&middot;&nbsp;
+**Dashboard:** [flatlens](https://github.com/flatseek/flatlens/)
+&nbsp;&middot;&nbsp;
 **Benchmark:** [flatbench](https://github.com/flatseek/flatbench/)
 
 </div>
@@ -48,7 +50,8 @@
 | Range query hits | 501,011 (exact) | 505,044 |
 | Build 500K rows | 216s | 113s |
 
-Full comparison (tantivy, typesense, whoosh, zincsearch): [bench.flatseek.io](https://bench.flatseek.io)
+Full comparison (tantivy, typesense, whoosh, zincsearch): [docs/benchmarks.md](/docs/benchmarks.md) or
+[bench.flatseek.io](https://bench.flatseek.io)
 
 ---
 
@@ -119,7 +122,7 @@ Includes API server + Flatlens dashboard (http://localhost:8000/dashboard).
 pip install flatseek
 ```
 
-CLI only. For Flatlens dashboard: `git clone https://github.com/flatseek/flatlens`
+CLI only. For [Flatlens dashboard](https://github.com/flatseek/flatlens): `git clone https://github.com/flatseek/flatlens`
 
 ### From source
 
