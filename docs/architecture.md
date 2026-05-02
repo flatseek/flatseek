@@ -31,7 +31,7 @@ flatseek/                          # Project root
 │   ├── internals.md              # Deep teardown (indexing, storage, query, agg)
 │   └── architecture.md           # This document
 ├── src/flatseek/
-│   ├── __init__.py               # Version only (`__version__ = "0.1.2"`)
+│   ├── __init__.py               # Version only (`__version__ = "0.1.3"`)
 │   ├── cli.py                    # Entry point: build, serve, chat, stats, inspect
 │   ├── client.py                 # Dual-mode client: API (httpx) vs direct (QueryEngine)
 │   ├── core/

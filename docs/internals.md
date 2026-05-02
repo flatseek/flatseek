@@ -3,7 +3,7 @@
 **Purpose**: Deep technical teardown — how the engine actually works under the hood. Storage formats, algorithms, data structures, performance characteristics.
 **Companion**: [`architecture.md`](architecture.html) — project structure and module map.
 
-**Version**: 0.1.2 | **Last updated**: 2026-05-01
+**Version**: 0.1.3 | **Last updated**: 2026-05-02
 
 ---
 

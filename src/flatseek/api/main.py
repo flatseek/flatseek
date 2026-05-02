@@ -16,7 +16,7 @@ try:
     with open(_PYPROJECT_TOML, "rb") as _f:
         API_VERSION = tomllib.load(_f)["project"]["version"]
 except Exception:
-    API_VERSION = "0.0.0"
+    API_VERSION = "0.1.3"
 
 # Configure logging
 logging.basicConfig(
@@ -150,11 +150,10 @@ def _copy_and_patch(flatlens_dir, api_base):
     if os.path.exists(api_js):
         with open(api_js, "r", encoding="utf-8") as f:
             content = f.read()
-        content = re.sub(
-            r"const API_BASE\s*=\s*['\"][^'\"]*['\"]",
-            f"const API_BASE = '{api_base}'",
-            content,
-        )
+        # The api.js uses an IIFE pattern where API_BASE resolves via:
+        #   window.API_BASE > ?api= param > '__FLATLENS_API_URL__' fallback
+        # Replace the placeholder string directly so the fallback uses the right port.
+        content = content.replace("__FLATLENS_API_URL__", api_base)
         with open(api_js, "w", encoding="utf-8") as f:
             f.write(content)
 
@@ -194,6 +193,28 @@ def attach_dashboard(app, api_base):
     logger.info(f"Flatlens dashboard mounted at /dashboard (API_BASE={api_base})")
 
 
+def _lazy_attach_dashboard(app, api_base):
+    """Attach dashboard on first access to /dashboard, not at import time.
+
+    copytree of flatlens (~7MB, 15 subdirs) during module import causes
+    startup to hang for several seconds.  Defer to first request instead.
+    """
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.requests import Request
+
+    _attached = False
+
+    class _DashboardAttachMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            nonlocal _attached
+            if request.url.path.startswith("/dashboard") and not _attached:
+                _attached = True
+                attach_dashboard(app, api_base)
+            return await call_next(request)
+
+    app.add_middleware(_DashboardAttachMiddleware)
+
+
 # ─── App setup ──────────────────────────────────────────────────────────
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -208,7 +229,9 @@ _api_base = os.environ.get("FLATSEEK_API_BASE", "")
 if not _api_base:
     _api_base = f"http://localhost:{os.environ.get('FLATSEEK_PORT', '8000')}"
 
-attach_dashboard(app, _api_base)
+# Attach lazily on first /dashboard request — avoids copytree hang at import
+_lazy_attach_dashboard(app, _api_base)
+
 # Also add a redirect from /dashboard → /dashboard/ (without trailing slash)
 from starlette.responses import RedirectResponse
 @app.get("/dashboard", include_in_schema=False)

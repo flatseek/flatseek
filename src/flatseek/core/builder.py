@@ -54,8 +54,6 @@ except ImportError:
     def _doc_loads(data: bytes) -> dict:
         return json.loads(data)
 
-print("Latest nih!!")
-
 # ─── Compressed source file helpers ──────────────────────────────────────────
 #
 # Supported transparent compression wrappers for source data files.
@@ -2299,20 +2297,16 @@ class IndexBuilder:
                 _known.add(_dir_path)
             _prefix: str
             _buf: bytearray
-            _pending_small = []  # (prefix_rel, buf) for batch write
+            _pending_small: list = []  # kept for API compatibility, not used
             _written = 0
-
-            _prefix_dir = os.path.join(_dir_path, _prefix_rel)
-            _prefix_created = False
 
             for _i, _prefix in enumerate(sorted(batch_prefixes)):
                 _buf = self._buffers.get(_prefix)
                 if not _buf:
                     continue
                 _prefix_rel = _prefix[3:]  # "xx/yy" → "yy"
-                if _prefix_dir != os.path.join(_dir_path, _prefix_rel):
-                    _prefix_dir = os.path.join(_dir_path, _prefix_rel)
-                    _prefix_created = False
+                _prefix_dir = os.path.join(_dir_path, _prefix_rel)
+                _prefix_created = False
                 _file_path = os.path.join(_prefix_dir, self._idx_filename)
 
                 # Write buffer to disk

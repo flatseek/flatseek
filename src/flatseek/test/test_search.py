@@ -491,7 +491,7 @@ class TestDateRange:
 
     @pytest.mark.parametrize("query,expected", [
         ("created_at:[20260101 TO 20260131]", 10),
-        ("created_at:[20260201 TO 20260228]", 10),
+        ("created_at:[20260201 TO 20260229]", 10),
         ("created_at:[20260301 TO 20260331]", 10),
     ])
     def test_date_range(self, search_index, query, expected):

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flatseek"
-version = "0.1.2"
+version = "0.1.3"
 description = "Scalable engine to ingest, process, and query large datasets—transactions, logs, events, and analytics—directly from flat files."
 readme = "README.md"
 license = {text = "Apache-2.0"}

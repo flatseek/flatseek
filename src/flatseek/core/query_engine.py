@@ -551,16 +551,6 @@ class QueryEngine:
             pc[term] = result
         return result
 
-        result = sorted(set(all_ids)) if all_ids else []
-        # Cache with bounded eviction: discard oldest half when full
-        pc = self._posting_cache
-        if len(pc) >= _POSTING_CACHE_MAX:
-            keep = _POSTING_CACHE_MAX // 2
-            for old_key in list(pc)[:len(pc) - keep]:
-                del pc[old_key]
-        pc[term] = result
-        return result
-
     # ─── Term parsing ─────────────────────────────────────────────────────────
 
     @staticmethod

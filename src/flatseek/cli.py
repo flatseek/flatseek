@@ -34,7 +34,7 @@ try:
     with open(_PYPROJECT_TOML, "rb") as _f:
         __version__ = tomllib.load(_f)["project"]["version"]
 except Exception:
-    __version__ = "0.0.0"
+    __version__ = "0.1.3"
 
 
 def _parse_columns(columns_str):
