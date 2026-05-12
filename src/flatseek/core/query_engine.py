@@ -27,6 +27,8 @@ import time as _time
 from collections import defaultdict
 from datetime import date as _date
 
+from flatseek.core.storage import StorageAdapter, create_storage_adapter
+
 try:
     import orjson as _orjson
     def _doc_loads(data: bytes) -> dict:
@@ -125,19 +127,29 @@ def is_encrypted(data: bytes) -> bool:
     return data[:len(_ENC_MAGIC)] == _ENC_MAGIC
 
 
-def load_encryption_key(index_dir: str, passphrase: str) -> bytes:
+def load_encryption_key(index_dir: str | None, passphrase: str, meta: dict | None = None) -> bytes:
     """Load salt from encryption.json (inside index_dir) and derive key from passphrase.
+
+    Args:
+        index_dir: Directory containing encryption.json (not needed if meta is provided).
+        passphrase: The passphrase to derive the key from.
+        meta: Optional pre-loaded encryption metadata dict (contains 'salt' key).
+              If provided, index_dir is ignored.
 
     Raises FileNotFoundError if encryption.json is missing (index not encrypted).
     """
-    enc_path = os.path.join(index_dir, "encryption.json")
-    if not os.path.isfile(enc_path):
-        raise FileNotFoundError(
-            f"No encryption.json found in {index_dir}. "
-            "Index is not encrypted, or the file was deleted."
-        )
-    with open(enc_path) as f:
-        meta = json.load(f)
+    if meta is None:
+        if index_dir is None:
+            raise FileNotFoundError("Must provide either index_dir or meta")
+        enc_path = os.path.join(index_dir, "encryption.json")
+        if not os.path.isfile(enc_path):
+            raise FileNotFoundError(
+                f"No encryption.json found in {index_dir}. "
+                "Index is not encrypted, or the file was deleted."
+            )
+        with open(enc_path) as f:
+            meta = json.load(f)
+
     salt = bytes.fromhex(meta["salt"])
     return derive_key(passphrase, salt)
 
@@ -311,49 +323,98 @@ def _get_nested_value(doc, field):
 # ─── QueryEngine ──────────────────────────────────────────────────────────────
 
 class QueryEngine:
-    def __init__(self, data_dir):
-        self.data_dir = os.path.abspath(data_dir)
+    def __init__(self, data_dir, storage: StorageAdapter | None = None):
+        self.data_dir = os.path.abspath(data_dir) if not isinstance(data_dir, str) or not data_dir.startswith(("http://", "https://", "hf://")) else data_dir
+        self.storage = storage or create_storage_adapter()
 
-        dirs = _discover_index_dirs(self.data_dir)
-        if not dirs:
-            raise FileNotFoundError(
-                f"No index found in {data_dir}. Run: flatseek build <csv_dir>")
+        # Check if we're using URL storage adapter
+        from flatseek.core.storage import URLStorageAdapter
+        is_url_storage = isinstance(self.storage, URLStorageAdapter)
 
-        if len(dirs) == 1 and dirs[0] == self.data_dir:
-            # ── Single-index mode (unchanged behaviour) ───────────────────────
+        if is_url_storage:
+            # URL storage: data_dir is the index name, storage handles URL resolution
+            # data_dir can be:
+            #   - "adsb" (single index in root folder of a multi-index repo)
+            #   - "adsb" when base_url is root folder with multiple indexes
+            #   - "parent/adsb" for nested index paths
+            index_name = data_dir  # data_dir is the index name/label
+
+            # Check if this is a direct index pattern (URL is a single index repo)
+            # For direct index: storage.index_name == data_dir and files are at root level
+            # For multi-index: files are in subdirs like adsb/stats.json
+            from flatseek.core.storage import URLStorageAdapter
+            storage_index_name = self.storage.index_name if isinstance(self.storage, URLStorageAdapter) else None
+            is_direct_index = storage_index_name is not None and storage_index_name == index_name
+
+            if is_direct_index:
+                # Direct index: files are at root level (stats.json, index/, docs/)
+                self.index_dir = "index"
+                self.docs_dir = "docs"
+                stats_path = "stats.json"
+            else:
+                # Multi-index folder or root-index: files are at index_name level
+                self.index_dir = self.storage.join(index_name, "index")
+                self.docs_dir = self.storage.join(index_name, "docs")
+                stats_path = self.storage.join(index_name, "stats.json")
+
+                # If stats.json doesn't exist at index_name level, try base_path level
+                # This handles case where base_url points directly to an index folder
+                if not self.storage.exists(stats_path):
+                    if self.storage.base_path:
+                        alt_stats = self.storage.join(self.storage.base_path, "stats.json")
+                        if self.storage.exists(alt_stats):
+                            stats_path = alt_stats
+                            self.index_dir = self.storage.join(self.storage.base_path, "index")
+                            self.docs_dir = self.storage.join(self.storage.base_path, "docs")
+
+            if not self.storage.exists(stats_path):
+                raise FileNotFoundError(
+                    f"No index found at {self.storage.base_url}/{index_name}. "
+                    f"Check that base_path is correct and stats.json exists.")
+
+            self.stats = json.loads(self.storage.read_bytes(stats_path))
             self._sub_engines = None
-            self.index_dir = os.path.join(self.data_dir, "index")
-            self.docs_dir  = os.path.join(self.data_dir, "docs")
-            stats_path = os.path.join(self.data_dir, "stats.json")
-            if not os.path.exists(stats_path):
+            dirs = []
+        else:
+            dirs = _discover_index_dirs(self.data_dir)
+            if not dirs:
                 raise FileNotFoundError(
                     f"No index found in {data_dir}. Run: flatseek build <csv_dir>")
-            with open(stats_path) as f:
-                self.stats = json.load(f)
-        else:
-            # ── Multi-index mode: root contains per-file sub-indexes ──────────
-            self._sub_engines = [QueryEngine(d) for d in dirs]
-            self.index_dir = None
-            self.docs_dir  = None
-            # Merge stats for summary display
-            merged_cols: dict = {}
-            total_docs = total_entries = 0
-            idx_mb = doc_mb = 0.0
-            for eng in self._sub_engines:
-                s = eng.stats
-                total_docs    += s.get("total_docs", 0)
-                total_entries += s.get("total_entries", 0)
-                idx_mb        += s.get("index_size_mb", 0)
-                doc_mb        += s.get("docs_size_mb", 0)
-                merged_cols.update(s.get("columns", {}))
-            self.stats = {
-                "total_docs":    total_docs,
-                "total_entries": total_entries,
-                "index_size_mb": round(idx_mb, 1),
-                "docs_size_mb":  round(doc_mb, 1),
-                "total_size_mb": round(idx_mb + doc_mb, 1),
-                "columns":       merged_cols,
-            }
+
+            if len(dirs) == 1 and dirs[0] == self.data_dir:
+                # ── Single-index mode (unchanged behaviour) ───────────────────────
+                self._sub_engines = None
+                self.index_dir = os.path.join(self.data_dir, "index")
+                self.docs_dir  = os.path.join(self.data_dir, "docs")
+                stats_path = os.path.join(self.data_dir, "stats.json")
+                if not os.path.exists(stats_path) and not self.storage.exists(stats_path):
+                    raise FileNotFoundError(
+                        f"No index found in {data_dir}. Run: flatseek build <csv_dir>")
+                self.stats = json.loads(self.storage.read_bytes(stats_path))
+            else:
+                # ── Multi-index mode: root contains per-file sub-indexes ──────────
+                self._sub_engines = [QueryEngine(d, storage) for d in dirs]
+                self.index_dir = None
+                self.docs_dir  = None
+                # Merge stats for summary display
+                merged_cols: dict = {}
+                total_docs = total_entries = 0
+                idx_mb = doc_mb = 0.0
+                for eng in self._sub_engines:
+                    s = eng.stats
+                    total_docs    += s.get("total_docs", 0)
+                    total_entries += s.get("total_entries", 0)
+                    idx_mb        += s.get("index_size_mb", 0)
+                    doc_mb        += s.get("docs_size_mb", 0)
+                    merged_cols.update(s.get("columns", {}))
+                self.stats = {
+                    "total_docs":    total_docs,
+                    "total_entries": total_entries,
+                    "index_size_mb": round(idx_mb, 1),
+                    "docs_size_mb":  round(doc_mb, 1),
+                    "total_size_mb": round(idx_mb + doc_mb, 1),
+                    "columns":       merged_cols,
+                }
 
         self.doc_chunk_size = self.stats.get("doc_chunk_size", 100_000)
         self._doc_cache = {}      # chunk_start → {doc_id: row_dict}
@@ -391,9 +452,8 @@ class QueryEngine:
         """Re-read stats.json from disk to pick up changes after a flush."""
         import json
         stats_path = os.path.join(self.data_dir, "stats.json")
-        if os.path.exists(stats_path):
-            with open(stats_path) as f:
-                self.stats = json.load(f)
+        if self.storage.exists(stats_path):
+            self.stats = json.loads(self.storage.read_bytes(stats_path))
 
     def set_key(self, key: bytes):
         """Supply the decryption key for an encrypted index.
@@ -417,34 +477,32 @@ class QueryEngine:
             )
         return decrypt_bytes(data, self._enc_key)
 
-    def _mmap_read(self, path: str) -> bytes:
-        """Read file contents using mmap (OS page cache for hot files).
+    def _mmap_read(self, rel_path: str) -> bytes:
+        """Read file contents via storage adapter.
 
-        Reuses mmap handles across calls via _mmap_cache.
-        Falls back to regular read for small files or on error.
+        For local: uses mmap when possible (OS page cache for hot files).
+        For remote (S3, Vercel Blob): falls back to direct read.
         """
         try:
-            cached = self._mmap_cache.get(path)
-            if cached is not None:
-                return cached
-            with open(path, "rb") as f:
-                # mmap requires non-empty file
-                f.seek(0, 2)
-                size = f.tell()
+            # For local storage, try mmap for hot file performance
+            # For remote storage (S3, Blob), mmap doesn't apply, use read_bytes
+            from flatseek.core.storage import LocalStorageAdapter
+            if isinstance(self.storage, LocalStorageAdapter):
+                path = self.storage._resolve(rel_path)
+                cached = self._mmap_cache.get(path)
+                if cached is not None:
+                    return cached
+                size = os.path.getsize(path)
                 if size == 0:
                     return b""
-                f.seek(0)
-                mm = _mmap.mmap(f.fileno(), size, access=_mmap.ACCESS_READ)
-            # Keep mmap alive in cache; OS handles page faults
-            self._mmap_cache[path] = mm
-            return mm[:]
-        except Exception:
-            # Fallback: regular read
-            try:
                 with open(path, "rb") as f:
-                    return f.read()
-            except Exception:
-                return b""
+                    mm = _mmap.mmap(f.fileno(), size, access=_mmap.ACCESS_READ)
+                self._mmap_cache[path] = mm
+                return mm[:]
+        except Exception:
+            pass
+        # Universal fallback: use storage adapter (works for all backends)
+        return self.storage.read_bytes(rel_path)
 
     def _load_bucket_term_set(self, prefix):
         """Load the pickled term set for a bucket (fast-reject cache).
@@ -459,9 +517,9 @@ class QueryEngine:
         bucket_dir = os.path.join(self.index_dir, prefix)
         set_path = os.path.join(bucket_dir, "terms.set")
         try:
-            if os.path.isfile(set_path):
-                with open(set_path, "rb") as f:
-                    terms = frozenset(pickle.load(f))
+            if self.storage.exists(set_path):
+                data = self.storage.read_bytes(set_path)
+                terms = frozenset(pickle.loads(data))
                 self._term_set_cache[prefix] = terms
                 return terms
         except Exception:
@@ -490,8 +548,10 @@ class QueryEngine:
         prefix = term_hash(term)
         bucket_dir = os.path.join(self.index_dir, prefix)
 
-        if not os.path.isdir(bucket_dir):
-            return []
+        from flatseek.core.storage import LocalStorageAdapter
+        if isinstance(self.storage, LocalStorageAdapter):
+            if not self.storage.exists(bucket_dir) and not os.path.isdir(bucket_dir):
+                return []
 
         # Fast reject: if bucket has a term-set file and term is not in it,
         # skip all posting file reads entirely (2x–4x speedup for non-existent terms)
@@ -499,7 +559,34 @@ class QueryEngine:
         if term_set is not None and term not in term_set:
             return []
 
-        bin_files = sorted(f for f in os.listdir(bucket_dir) if f.endswith(".bin"))
+        # Use storage adapter for listing if remote, otherwise fall back to os.listdir
+        from flatseek.core.storage import LocalStorageAdapter, URLStorageAdapter
+        if isinstance(self.storage, LocalStorageAdapter):
+            bin_files = sorted(f for f in os.listdir(bucket_dir) if f.endswith(".bin"))
+        elif isinstance(self.storage, URLStorageAdapter):
+            # URL mode optimization: skip listdir entirely.
+            # We already know bucket_dir from term_hash, so directly check
+            # the known bin file patterns. This avoids an HTTP Tree API call
+            # that lists all files when we only need a few specific ones.
+            bin_files = []
+            for pattern in ("idx_w0.bin", "idx_w1.bin", "idx_w2.bin", "idx_w3.bin",
+                           "idx.bin", "idx_w4.bin", "idx_w5.bin", "idx_w6.bin",
+                           "idx_w7.bin"):
+                if self.storage.exists(os.path.join(bucket_dir, pattern)):
+                    bin_files.append(pattern)
+        else:
+            bin_files = sorted(f for f in self.storage.listdir(bucket_dir) if f.endswith(".bin"))
+
+        # For non-URL storage, listdir may return empty too (e.g. empty bucket dir)
+        # Check known patterns as fallback only for non-URL adapters
+        if not bin_files and not isinstance(self.storage, URLStorageAdapter):
+            for pattern in ("idx_w0.bin", "idx_w1.bin", "idx_w2.bin", "idx_w3.bin",
+                           "idx.bin", "idx_w4.bin", "idx_w5.bin", "idx_w6.bin",
+                           "idx_w7.bin"):
+                bin_path = os.path.join(bucket_dir, pattern)
+                if self.storage.exists(bin_path):
+                    bin_files.append(pattern)
+
         if not bin_files:
             return []
 
@@ -820,9 +907,28 @@ class QueryEngine:
                 break
             prefix_hash = term_hash(col_key)
             bucket_dir = os.path.join(self.index_dir, prefix_hash)
-            if not os.path.isdir(bucket_dir):
-                continue
-            for bin_file in sorted(f for f in os.listdir(bucket_dir) if f.endswith(".bin")):
+            from flatseek.core.storage import LocalStorageAdapter
+            if isinstance(self.storage, LocalStorageAdapter):
+                if not self.storage.exists(bucket_dir) and not os.path.isdir(bucket_dir):
+                    continue
+            else:
+                if not self.storage.exists(bucket_dir):
+                    continue
+            # Use storage adapter for listing if remote
+            from flatseek.core.storage import LocalStorageAdapter
+            if isinstance(self.storage, LocalStorageAdapter):
+                bin_files = sorted(f for f in os.listdir(bucket_dir) if f.endswith(".bin"))
+            #else:
+            #    bin_files = sorted(f for f in self.storage.listdir(bucket_dir) if f.endswith(".bin"))
+
+            # For URL storage, try common file patterns directly if listdir returns empty
+            if not bin_files:
+                for pattern in ["idx.bin", "idx_w0.bin", "idx_w1.bin", "idx_w2.bin", "idx_w3.bin"]:
+                    bin_path = os.path.join(bucket_dir, pattern)
+                    if self.storage.exists(bin_path):
+                        bin_files.append(pattern)
+
+            for bin_file in bin_files:
                 if checked_terms >= max_terms_check:
                     break
                 try:
@@ -876,23 +982,69 @@ class QueryEngine:
     def _chunk_start(self, doc_id):
         return (doc_id // self.doc_chunk_size) * self.doc_chunk_size
 
+    def _list_docs_recursive(self, prefix: str = "") -> list[str]:
+        """Recursively list all doc files under docs_dir for remote storage.
+
+        S3/Blob don't have glob, so we implement recursive listing via
+        listdir with pagination. For URL storage, we try common patterns
+        directly since listdir may return empty.
+        """
+        results = []
+        to_visit = [prefix] if prefix else [""]
+        while to_visit:
+            current = to_visit.pop(0)
+            entries = self.storage.listdir(current)
+            for entry in entries:
+                full_path = self.storage.join(current, entry) if current else entry
+                # Check if it's a file (ends with .zlib)
+                if full_path.endswith(".zlib"):
+                    results.append(full_path)
+                else:
+                    # It's a directory, add to visit queue
+                    to_visit.append(full_path)
+
+        # For URL storage (HuggingFace, GitHub), listdir returns empty.
+        # Try common doc chunk patterns directly.
+        if not results:
+            from flatseek.core.storage import URLStorageAdapter
+            if isinstance(self.storage, URLStorageAdapter):
+                # Try standard 2-level hex path pattern: docs/{aa}/{bb}/docs_{N:010d}.zlib
+                # Chunk size is typically 100000, check first few chunks
+                for chunk_start in range(0, 1000000, self.doc_chunk_size):
+                    aa = f"{(chunk_start // 256 // 256) & 0xFF:02x}"
+                    bb = f"{(chunk_start // 256) % 256:02x}"
+                    doc_path = f"{self.docs_dir}/{aa}/{bb}/docs_{chunk_start:010d}.zlib"
+                    if self.storage.exists(doc_path):
+                        results.append(doc_path)
+                    # Also try flat pattern for backwards compat
+                    flat_path = f"{self.docs_dir}/docs_{chunk_start:010d}.zlib"
+                    if self.storage.exists(flat_path):
+                        results.append(flat_path)
+
+        return results
+
     def _iter_chunks(self):
         """Yield (chunk_start, chunk_dict) for every chunk file in docs_dir.
 
         Uses glob to find files regardless of naming scheme — handles both
         sequential (docs_0000000000.zlib) and sparse/gapped chunk numbering.
         """
+        from flatseek.core.storage import LocalStorageAdapter
 
-        # Glob all .zlib files under docs_dir
-        pattern = os.path.join(self.docs_dir, "**", "*.zlib")
-        files = _glob.glob(pattern, recursive=True)
-        if not files:
-            # Fallback: try sequential chunk numbering (chunks_0000000000.zlib, etc.)
-            pattern2 = os.path.join(self.docs_dir, "chunks_*.zlib")
-            files = _glob.glob(pattern2)
+        # For local storage, use fast glob. For remote, use storage.listdir
+        if isinstance(self.storage, LocalStorageAdapter):
+            pattern = os.path.join(self.docs_dir, "**", "*.zlib")
+            files = _glob.glob(pattern, recursive=True)
+            if not files:
+                pattern2 = os.path.join(self.docs_dir, "chunks_*.zlib")
+                files = _glob.glob(pattern2)
+        else:
+            # Remote storage: recursive listdir
+            files = self._list_docs_recursive()
+
         if not files:
             logger = logging.getLogger(__name__)
-            logger.warning(f"_iter_chunks: no .zlib files found in {self.docs_dir}, pattern={pattern}")
+            logger.warning(f"_iter_chunks: no .zlib files found in {self.docs_dir}")
             return
 
         def chunk_key(path):
@@ -913,8 +1065,7 @@ class QueryEngine:
                     if not m:
                         continue
                 chunk_start = int(m.group(1))
-                with open(path, "rb") as f:
-                    blob = f.read()
+                blob = self.storage.read_bytes(path)
                 blob = self._decrypt_if_needed(blob)
                 raw = _decompress_doc(blob)
                 chunk = {int(k): v for k, v in _doc_loads(raw).items()}
@@ -986,14 +1137,13 @@ class QueryEngine:
 
         # Try new 2-level path first, fall back to old flat path (backward compat)
         path = self._doc_path(start)
-        if not os.path.isfile(path):
+        if not self.storage.exists(path):
             path = os.path.join(self.docs_dir, f"docs_{start:010d}.zlib")
-        if not os.path.isfile(path):
+        if not self.storage.exists(path):
             return {}
 
         try:
-            with open(path, "rb") as f:
-                blob = f.read()
+            blob = self.storage.read_bytes(path)
             blob = self._decrypt_if_needed(blob)   # no-op if not encrypted
             raw  = _decompress_doc(blob)
             chunk = {int(k): v for k, v in _doc_loads(raw).items()}
@@ -1471,19 +1621,24 @@ class QueryEngine:
         _unpack_i = _struct.Struct("<I").unpack
 
         dv_path = os.path.join(self.data_dir, "dv", field)
-        if not os.path.isdir(dv_path):
-            self._dv_cache[field] = None
-            return None
+        from flatseek.core.storage import LocalStorageAdapter
+        if isinstance(self.storage, LocalStorageAdapter):
+            if not self.storage.exists(dv_path) and not os.path.isdir(dv_path):
+                self._dv_cache[field] = None
+                return None
+        else:
+            if not self.storage.exists(dv_path):
+                self._dv_cache[field] = None
+                return None
 
         # Detect numeric vs keyword from file presence
         numeric_path = os.path.join(dv_path, "numeric.bin")
         terms_path = os.path.join(dv_path, "terms.bin")
 
-        if os.path.isfile(numeric_path):
+        if self.storage.exists(numeric_path):
             # Numeric: load sorted (value, doc_id) pairs
             pairs = []
-            with open(numeric_path, "rb") as f:
-                data = f.read()
+            data = self.storage.read_bytes(numeric_path)
             i = 0
             while i + 16 <= len(data):
                 doc_id = _unpack_q(data[i:i+8])[0]; i += 8
@@ -1491,11 +1646,10 @@ class QueryEngine:
                 pairs.append((value, doc_id))
             self._dv_cache[field] = pairs
             return pairs
-        elif os.path.isfile(terms_path):
+        elif self.storage.exists(terms_path):
             # Keyword: load term→count list
             terms = []
-            with open(terms_path, "rb") as f:
-                data = f.read()
+            data = self.storage.read_bytes(terms_path)
             i = 0
             while i + 2 <= len(data):
                 term_len = _unpack_h(data[i:i+2])[0]; i += 2

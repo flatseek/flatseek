@@ -111,6 +111,7 @@ class _MockFastAPI:
 
 _dashboard_attached = False
 _dashboard_temp_dir = None  # holds patched flatlens dir if we rewrite API_BASE
+_patched_api_base = None  # tracks which api_base the patched dir is for
 
 
 def _find_flatlens():
@@ -137,14 +138,34 @@ def _find_flatlens():
 def _copy_and_patch(flatlens_dir, api_base):
     """Copy flatlens to temp dir with API_BASE rewrite + logo href patch.
 
-    Always copies to a temp dir so we never modify the original flatlens source.
+    Caches patched result by (flatlens_dir, api_base) to avoid re-copying on
+    repeated starts with the same configuration.
     """
-    global _dashboard_temp_dir
+    import time
+    t0 = time.perf_counter()
+    global _dashboard_temp_dir, _patched_api_base
+
+    # Check if we already have a patched copy for this api_base
+    if _dashboard_temp_dir and _patched_api_base == api_base:
+        t1 = time.perf_counter()
+        logger.debug(f"_copy_and_patch: cache hit ({t1-t0:.3f}s)")
+        return _dashboard_temp_dir
+
+    # Clean up old temp dir if api_base changed
     if _dashboard_temp_dir:
         shutil.rmtree(_dashboard_temp_dir, ignore_errors=True)
 
     dest = tempfile.mkdtemp(prefix="flatlens_patched_")
-    shutil.copytree(flatlens_dir, dest, dirs_exist_ok=True)
+    t_mkdtemp = time.perf_counter()
+    logger.debug(f"_copy_and_patch: mkdtemp ({t_mkdtemp-t0:.3f}s)")
+
+    # Ignore .git, node_modules, and artc (flatlens data index, not needed for dashboard)
+    def _ignore_git_and_node_modules(dir, files):
+        return {'.git', 'node_modules', '.gitignore', '.DS_Store', 'artc'}
+
+    shutil.copytree(flatlens_dir, dest, dirs_exist_ok=True, ignore=_ignore_git_and_node_modules)
+    t_copytree = time.perf_counter()
+    logger.debug(f"_copy_and_patch: copytree ({t_copytree-t_mkdtemp:.3f}s, total {t_copytree-t0:.3f}s)")
 
     api_js = os.path.join(dest, "js", "api.js")
     if os.path.exists(api_js):
@@ -170,11 +191,16 @@ def _copy_and_patch(flatlens_dir, api_base):
             f.write(content)
 
     _dashboard_temp_dir = dest
+    _patched_api_base = api_base
+    t_total = time.perf_counter()
+    logger.debug(f"_copy_and_patch: total ({t_total-t0:.3f}s)")
     return dest
 
 
 def attach_dashboard(app, api_base):
     """Mount flatlens dashboard at /dashboard with correct API_BASE."""
+    import time
+    t0 = time.perf_counter()
     global _dashboard_attached
     if _dashboard_attached:
         return
@@ -187,10 +213,13 @@ def attach_dashboard(app, api_base):
 
     # Always copy to temp and patch — never touch the original
     patched_dir = _copy_and_patch(flatlens_dir, api_base)
+    t_patch = time.perf_counter()
+    logger.debug(f"attach_dashboard: _copy_and_patch done ({t_patch-t0:.3f}s)")
 
     app.mount("/dashboard", StaticFiles(directory=patched_dir, html=True), name="flatlens")
     _dashboard_attached = True
-    logger.info(f"Flatlens dashboard mounted at /dashboard (API_BASE={api_base})")
+    t_mount = time.perf_counter()
+    logger.info(f"Flatlens dashboard mounted at /dashboard (API_BASE={api_base}, total {t_mount-t0:.3f}s)")
 
 
 def _lazy_attach_dashboard(app, api_base):
@@ -220,7 +249,7 @@ def _lazy_attach_dashboard(app, api_base):
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from flatseek.api.deps import get_index_manager, IndexManager
-from fastapi import Depends
+from fastapi import Depends, Query
 
 app = create_app()
 
@@ -259,9 +288,9 @@ async def root():
 
 
 @app.get("/_cluster/health", response_model=ClusterHealth)
-async def cluster_health(manager: IndexManager = Depends(get_index_manager)):
+async def cluster_health(bucket: str | None = Query(None), manager: IndexManager = Depends(get_index_manager)):
     """Cluster health (single node). Returns all indices and their count."""
-    indices = manager.list_indices()
+    indices = manager.list_indices(bucket_url=bucket)
     return {
         "status": "green",
         "number_of_indices": len(indices),
@@ -271,9 +300,9 @@ async def cluster_health(manager: IndexManager = Depends(get_index_manager)):
 
 
 @app.get("/_indices", response_model=IndicesList)
-async def list_indices(manager: IndexManager = Depends(get_index_manager)):
+async def list_indices(bucket: str | None = Query(None), manager: IndexManager = Depends(get_index_manager)):
     """List all available indices in the cluster."""
-    indices = manager.list_indices()
+    indices = manager.list_indices(bucket_url=bucket)
     return {
         "indices": indices,
         "count": len(indices),

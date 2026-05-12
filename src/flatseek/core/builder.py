@@ -39,6 +39,8 @@ from datetime import datetime
 from functools import lru_cache
 from itertools import islice
 
+from flatseek.core.storage import StorageAdapter, create_storage_adapter
+
 # orjson is 3-5x faster than stdlib json for doc store serialisation.
 # Used only for doc chunk encode/decode (hot path). Config files still use
 # stdlib json so they remain human-readable and indent-formatted.
@@ -670,7 +672,8 @@ def _doc_fingerprint(doc, dedup_fields=None):
 class IndexBuilder:
     def __init__(self, output_dir, column_map=None, start_doc_id=0, dataset=None,
                  checkpoint_cb=None, delimiter=",", columns=None, worker_id=None,
-                 dedup_fields=None, doc_id_end=None, daemon=False):
+                 dedup_fields=None, doc_id_end=None, daemon=False,
+                 storage: StorageAdapter | None = None):
         """
         Args:
             output_dir:    where to write index/, docs/, stats.json
@@ -696,10 +699,13 @@ class IndexBuilder:
                            indexing hot-loop is never blocked by disk I/O.  Finalize()
                            flushes everything remaining.  Requires enough free RAM to hold
                            all accumulated buffers between lazy-writer cycles.
+            storage:       Storage adapter for remote backends (S3, Vercel Blob).
+                           Defaults to LocalStorageAdapter.
         """
         self.output_dir = output_dir
         self.index_dir = os.path.join(output_dir, "index")
         self.docs_dir = os.path.join(output_dir, "docs")
+        self.storage = storage or create_storage_adapter()
         self.column_map = column_map or {}
         self.dataset = dataset  # injected as _dataset on every doc
         self.delimiter = delimiter
@@ -1171,20 +1177,20 @@ class IndexBuilder:
 
         idx_mb  = round(self._idx_bytes_flushed / 1024**2, 1)
         doc_mb  = round(self._doc_bytes_flushed / 1024**2, 1)
-        with open(stats_path, "w") as f:
-            json.dump({
-                "total_docs":    self.doc_counter,
-                "rows_indexed":  self.total_docs,
-                "total_entries": prev_entries + self._total_entries,
-                "_prev_entries": prev_entries,  # baseline so finalize() doesn't double-count
-                "doc_chunk_size": DOC_CHUNK_SIZE,
-                "index_files":   0,   # accurate after finalize()
-                "index_size_mb": idx_mb,
-                "docs_size_mb":  doc_mb,
-                "total_size_mb": round(idx_mb + doc_mb, 1),
-                "columns": {**prev_cols, **self.columns_seen},
-                "_partial": True,     # marker; removed by finalize()
-            }, f, indent=2)
+        stats_data = json.dumps({
+            "total_docs":    self.doc_counter,
+            "rows_indexed":  self.total_docs,
+            "total_entries": prev_entries + self._total_entries,
+            "_prev_entries": prev_entries,  # baseline so finalize() doesn't double-count
+            "doc_chunk_size": DOC_CHUNK_SIZE,
+            "index_files":   0,   # accurate after finalize()
+            "index_size_mb": idx_mb,
+            "docs_size_mb":  doc_mb,
+            "total_size_mb": round(idx_mb + doc_mb, 1),
+            "columns": {**prev_cols, **self.columns_seen},
+            "_partial": True,     # marker; removed by finalize()
+        }, indent=2)
+        self.storage.write_bytes(stats_path, stats_data.encode())
 
     def _chunk_start(self, doc_id):
         return (doc_id // DOC_CHUNK_SIZE) * DOC_CHUNK_SIZE
@@ -1208,12 +1214,11 @@ class IndexBuilder:
 
         for chunk_start, new_data in by_chunk.items():
             path = self._doc_path(chunk_start)
-            os.makedirs(os.path.dirname(path), exist_ok=True)
+            self.storage.mkdir(os.path.dirname(path))
             # Merge with existing chunk — needed when incremental builds share a chunk
-            if os.path.isfile(path):
+            if self.storage.exists(path):
                 try:
-                    with open(path, "rb") as f:
-                        existing = _doc_loads(_decompress_doc(f.read()))
+                    existing = _doc_loads(_decompress_doc(self.storage.read_bytes(path)))
                     existing.update(new_data)
                     merged = existing
                 except (zlib.error, Exception) as _e:
@@ -1225,10 +1230,7 @@ class IndexBuilder:
             merged = {doc_id: _collapse_record(rec) for doc_id, rec in merged.items()}
             raw = _doc_dumps(merged)
             compressed = _compress_doc(raw)
-            tmp = path + f".{os.getpid()}.tmp"
-            with open(tmp, "wb") as f:
-                f.write(compressed)
-            os.replace(tmp, path)
+            self.storage.write_bytes(path, compressed)
             self._doc_bytes_flushed += len(compressed)
 
         self.total_docs += len(ids)
@@ -1342,7 +1344,7 @@ class IndexBuilder:
         if not self._buffers:
             return
         wal_dir = os.path.join(self.output_dir, "_wal")
-        os.makedirs(wal_dir, exist_ok=True)
+        self.storage.mkdir(wal_dir)
         # Unique name: worker id + checkpoint counter
         base = os.path.splitext(self._idx_filename)[0]  # e.g. "idx_w3"
         wal_path = os.path.join(
@@ -1350,12 +1352,13 @@ class IndexBuilder:
         )
         # Write sequentially: one file, all prefixes concatenated
         _pack_header = struct.Struct("<5sI").pack
-        with open(wal_path, "wb") as f:
-            for prefix, buf in self._buffers.items():
-                if not buf:
-                    continue
-                f.write(_pack_header(prefix.encode(), len(buf)))
-                f.write(buf)
+        buf = io.BytesIO()
+        for prefix, buf_data in self._buffers.items():
+            if not buf_data:
+                continue
+            buf.write(_pack_header(prefix.encode(), len(buf_data)))
+            buf.write(buf_data)
+        self.storage.write_bytes(wal_path, buf.getvalue())
         self._pressure_wal_paths.append(wal_path)
         # Keep dict structure (all 65K keys) but reset contents.
         # Avoids freeing + re-allocating 65K bytearray objects on next checkpoint,
@@ -1496,12 +1499,11 @@ class IndexBuilder:
                 path = self._doc_path(chunk_start)
                 doc_dir = os.path.dirname(path)
                 if doc_dir not in self._known_dirs:
-                    os.makedirs(doc_dir, exist_ok=True)
+                    self.storage.mkdir(doc_dir)
                     self._known_dirs.add(doc_dir)
-                if os.path.isfile(path):
+                if self.storage.exists(path):
                     try:
-                        with open(path, "rb") as f:
-                            existing = _doc_loads(_decompress_doc(f.read()))
+                        existing = _doc_loads(_decompress_doc(self.storage.read_bytes(path)))
                         existing.update(new_data)
                         merged = existing
                     except (zlib.error, Exception) as _e:
@@ -1511,10 +1513,7 @@ class IndexBuilder:
                     merged = new_data
                 raw = _doc_dumps(merged)
                 compressed = _compress_doc(raw)
-                tmp = path + f".{os.getpid()}.tmp"
-                with open(tmp, "wb") as f:
-                    f.write(compressed)
-                os.replace(tmp, path)
+                self.storage.write_bytes(path, compressed)
                 self._doc_bytes_flushed += len(compressed)
             self.total_docs += len(ids)
 
@@ -1556,19 +1555,19 @@ class IndexBuilder:
 
         n_raw = len(buf)   # capture before clear(); used to update the running counter
 
-        if prefix in self._compressed_prefixes:
-            # Compressed prefix: write new immutable segment file (no recompression).
-            # Each checkpoint creates idx_seg{counter:04d}.bin — final merge happens
-            # at the end in _finalize_merge_segments().  This eliminates the O(N²)
-            # read+decompress+recompress cycle that dominates finalize time on S3.
+        # For remote storage, always use segment files (append doesn't work)
+        from flatseek.core.storage import LocalStorageAdapter
+        use_segments = not isinstance(self.storage, LocalStorageAdapter)
+
+        if prefix in self._compressed_prefixes or use_segments:
+            # Compressed prefix or remote storage: write new immutable segment file.
             if dir_path not in self._known_dirs:
-                os.makedirs(dir_path, exist_ok=True)
+                self.storage.mkdir(dir_path)
                 self._known_dirs.add(dir_path)
             seg_num = self._seg_counters.get(prefix, 0) + 1
             self._seg_counters[prefix] = seg_num
             seg_path = os.path.join(dir_path, f"idx_seg{seg_num:04d}.bin")
-            with open(seg_path, "wb") as f:
-                f.write(buf)
+            self.storage.write_bytes(seg_path, bytes(buf))
             buf.clear()
             self._idx_bytes_flushed += n_raw
             return
@@ -1582,16 +1581,14 @@ class IndexBuilder:
             except OSError:
                 pass
             if existing_size >= SEGMENT_SWITCH_SIZE:
-                # Switch to segment files — avoids ever-growing append that would
-                # eventually require recompression at finalize.
+                # Switch to segment files
                 if dir_path not in self._known_dirs:
-                    os.makedirs(dir_path, exist_ok=True)
+                    self.storage.mkdir(dir_path)
                     self._known_dirs.add(dir_path)
                 seg_num = self._seg_counters.get(prefix, 0) + 1
                 self._seg_counters[prefix] = seg_num
                 seg_path = os.path.join(dir_path, f"idx_seg{seg_num:04d}.bin")
-                with open(seg_path, "wb") as f:
-                    f.write(buf)
+                self.storage.write_bytes(seg_path, bytes(buf))
                 buf.clear()
                 self._idx_bytes_flushed += n_raw
                 return
@@ -1603,12 +1600,11 @@ class IndexBuilder:
 
         # First time seeing this prefix — create dir if needed, check compression.
         if dir_path not in self._known_dirs:
-            os.makedirs(dir_path, exist_ok=True)
+            self.storage.mkdir(dir_path)
             self._known_dirs.add(dir_path)
 
         if os.path.isfile(path):
-            # File exists but compression status unknown yet — check magic once,
-            # then cache so we never open this file twice again for this prefix.
+            # File exists but compression status unknown yet — check magic once
             with open(path, "rb") as f:
                 magic = f.read(2)
             if len(magic) >= 2 and magic[0] == 0x78 and magic[1] in (0x01, 0x5e, 0x9c, 0xda):
@@ -1617,8 +1613,7 @@ class IndexBuilder:
                 seg_num = self._seg_counters.get(prefix, 0) + 1
                 self._seg_counters[prefix] = seg_num
                 seg_path = os.path.join(dir_path, f"idx_seg{seg_num:04d}.bin")
-                with open(seg_path, "wb") as f:
-                    f.write(buf)
+                self.storage.write_bytes(seg_path, bytes(buf))
                 buf.clear()
                 self._idx_bytes_flushed += n_raw
                 return
@@ -1692,17 +1687,19 @@ class IndexBuilder:
 
         n_raw = len(buf)   # capture before clear()
 
+        from flatseek.core.storage import LocalStorageAdapter
+        use_segments = not isinstance(self.storage, LocalStorageAdapter)
+
         try:
-            if prefix in self._compressed_prefixes:
-                # Compressed prefix: write new immutable segment (no recompression).
+            if prefix in self._compressed_prefixes or use_segments:
+                # Compressed prefix or remote storage: write new immutable segment.
                 if dir_path not in self._known_dirs:
-                    os.makedirs(dir_path, exist_ok=True)
+                    self.storage.mkdir(dir_path)
                     self._known_dirs.add(dir_path)
                 seg_num = self._seg_counters.get(prefix, 0) + 1
                 self._seg_counters[prefix] = seg_num
                 seg_path = os.path.join(dir_path, f"idx_seg{seg_num:04d}.bin")
-                with open(seg_path, "wb") as f:
-                    f.write(buf)
+                self.storage.write_bytes(seg_path, bytes(buf))
                 buf.clear()
                 self._idx_bytes_flushed += n_raw
                 return
@@ -1717,13 +1714,12 @@ class IndexBuilder:
                     pass
                 if existing_size >= SEGMENT_SWITCH_SIZE:
                     if dir_path not in self._known_dirs:
-                        os.makedirs(dir_path, exist_ok=True)
+                        self.storage.mkdir(dir_path)
                         self._known_dirs.add(dir_path)
                     seg_num = self._seg_counters.get(prefix, 0) + 1
                     self._seg_counters[prefix] = seg_num
                     seg_path = os.path.join(dir_path, f"idx_seg{seg_num:04d}.bin")
-                    with open(seg_path, "wb") as f:
-                        f.write(buf)
+                    self.storage.write_bytes(seg_path, bytes(buf))
                     buf.clear()
                     self._idx_bytes_flushed += n_raw
                     return
@@ -1734,7 +1730,7 @@ class IndexBuilder:
                 return
 
             if dir_path not in self._known_dirs:
-                os.makedirs(dir_path, exist_ok=True)
+                self.storage.mkdir(dir_path)
                 self._known_dirs.add(dir_path)
 
             if os.path.isfile(path):
@@ -1747,8 +1743,7 @@ class IndexBuilder:
                     seg_num = self._seg_counters.get(prefix, 0) + 1
                     self._seg_counters[prefix] = seg_num
                     seg_path = os.path.join(dir_path, f"idx_seg{seg_num:04d}.bin")
-                    with open(seg_path, "wb") as f:
-                        f.write(buf)
+                    self.storage.write_bytes(seg_path, bytes(buf))
                     buf.clear()
                     self._idx_bytes_flushed += n_raw
                     return
@@ -3505,7 +3500,7 @@ def _auto_classify(files, csv_base, col_map_file, delimiter=",", columns=None, t
 
 def build(csv_src, output_dir, column_map_path=None, dataset=None, delimiter=",",
           columns=None, type_overrides=None, worker_id=None, plan_path=None,
-          estimate=False, dedup_fields=None, daemon=False):
+          estimate=False, dedup_fields=None, daemon=False, storage=None):
     """Build index from csv_src, which may be a single file or a directory.
 
     Distributed / parallel mode:
@@ -3717,7 +3712,7 @@ def build(csv_src, output_dir, column_map_path=None, dataset=None, delimiter=","
     builder = IndexBuilder(output_dir, column_map, start_doc_id=start_doc_id, dataset=dataset,
                           delimiter=delimiter, columns=columns, worker_id=worker_id,
                           dedup_fields=dedup_fields, doc_id_end=doc_id_end_override,
-                          daemon=daemon)
+                          daemon=daemon, storage=storage)
     builder._estimate_enabled = estimate and not _is_worker
     total_new = 0
 

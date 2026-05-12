@@ -656,3 +656,96 @@ class TestAggregations:
         # Only active docs counted — Jakarta active = 3 (Alice, Fitri, Judotens)
         jakarta = next((b for b in buckets if b["key"] == "Jakarta"), None)
         assert jakarta and jakarta["doc_count"] == 3
+
+
+# ─── HuggingFace Bucket URL Tests ────────────────────────────────────────────
+
+class TestHuggingFaceBucketURL:
+    """Test HuggingFace bucket URL support (/buckets/ owner/repo path)."""
+
+    def test_bucket_url_resolve_path(self):
+        """URLStorageAdapter uses /resolve/{index_name} for bucket repos, not /resolve/main."""
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+        from flatseek.core.storage import URLStorageAdapter
+
+        # Bucket URL → should append /resolve (NOT /resolve/main)
+        adapter = URLStorageAdapter(
+            url="https://huggingface.co/buckets/flatseek/flatdata",
+            base_path="",
+            cache_enabled=True,
+        )
+        assert adapter.base_url == "https://huggingface.co/buckets/flatseek/flatdata/resolve"
+        # /resolve/{index_name} means base_url ends with /resolve, index name goes in rel_path
+
+    def test_dataset_url_resolve_path(self):
+        """URLStorageAdapter uses /resolve/main for dataset repos."""
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+        from flatseek.core.storage import URLStorageAdapter
+
+        # Dataset URL → should append /resolve/main
+        adapter = URLStorageAdapter(
+            url="https://huggingface.co/datasets/flatseek/sample-articles",
+            base_path="",
+            cache_enabled=True,
+        )
+        assert adapter.base_url == "https://huggingface.co/datasets/flatseek/sample-articles/resolve/main"
+
+    @pytest.mark.network
+    def test_list_indices_from_bucket(self):
+        """_list_url_indices discovers index names from HuggingFace bucket web UI HTML."""
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+        from flatseek.api.deps import IndexManager
+        from flatseek.core.storage import URLStorageAdapter
+
+        # Create manager and use _list_url_indices directly with URLStorageAdapter
+        storage = URLStorageAdapter(
+            url="https://huggingface.co/buckets/flatseek/flatdata",
+            base_path="",
+            cache_enabled=True,
+        )
+
+        manager = IndexManager()
+        indices = manager._list_url_indices(storage)
+
+        # Bucket should list adsb, article, sosmed, standard
+        assert "adsb" in indices
+        assert "article" in indices
+        assert "sosmed" in indices
+        assert "standard" in indices
+
+    @pytest.mark.network
+    def test_search_via_api_with_bucket_param(self):
+        """Search endpoint accepts ?bucket=<url> to query HuggingFace buckets."""
+        from fastapi.testclient import TestClient
+        from flatseek.api.main import app
+
+        client = TestClient(app, raise_server_exceptions=False)
+
+        # Search adsb index in the flatseek/flatdata bucket
+        # Without bucket param → 404 (no such local index)
+        r_no_bucket = client.get("/adsb/_search?q=*")
+        assert r_no_bucket.status_code == 404
+
+        # With bucket param → should hit remote (200 or 403 if encrypted)
+        bucket = "https://huggingface.co/buckets/flatseek/flatdata"
+        r_with_bucket = client.get(f"/adsb/_search?q=*&bucket={bucket}")
+        # adsb is not encrypted, so should return 200 with search results
+        assert r_with_bucket.status_code == 200
+        data = r_with_bucket.json()
+        assert data["hits"]["total"] > 0
+
+    @pytest.mark.network
+    def test_bucket_indices_endpoint(self):
+        """_indices?bucket= returns index list from HuggingFace bucket."""
+        from fastapi.testclient import TestClient
+        from flatseek.api.main import app
+
+        client = TestClient(app, raise_server_exceptions=False)
+
+        bucket = "https://huggingface.co/buckets/flatseek/flatdata"
+        r = client.get(f"/_indices?bucket={bucket}")
+        assert r.status_code == 200
+        data = r.json()
+        assert "adsb" in data["indices"]
+        assert "article" in data["indices"]
+        assert "standard" in data["indices"]

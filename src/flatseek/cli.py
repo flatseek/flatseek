@@ -34,7 +34,7 @@ try:
     with open(_PYPROJECT_TOML, "rb") as _f:
         __version__ = tomllib.load(_f)["project"]["version"]
 except Exception:
-    __version__ = "0.1.3"
+    __version__ = "0.1.4"
 
 
 def _parse_columns(columns_str):
@@ -647,12 +647,25 @@ def _update_manifest_after_parallel(output_dir, plan_data):
 
 def cmd_build(args):
     from flatseek.core.builder import build
+    from flatseek.core.storage import StorageConfig, create_storage_adapter
     csv_src = os.path.abspath(args.csv_dir)
     output_dir = os.path.abspath(args.output)
     map_path = args.map
     plan_path = args.plan
     worker_id = args.worker_id
     n_workers = getattr(args, "workers", 1)
+
+    # Build storage adapter from CLI args or environment
+    storage = None
+    if getattr(args, "storage_backend", None):
+        config = StorageConfig(
+            backend=args.storage_backend,
+            bucket=getattr(args, "storage_bucket", "") or "",
+            region=getattr(args, "storage_region", "") or "",
+            endpoint_url=getattr(args, "storage_endpoint", "") or "",
+            base_path=getattr(args, "storage_base_path", "") or "",
+        )
+        storage = create_storage_adapter(config)
 
     # --workers N without an explicit plan: auto-plan + auto-spawn
     if n_workers > 1 and not plan_path:
@@ -681,7 +694,8 @@ def cmd_build(args):
           worker_id=worker_id, plan_path=plan_path,
           estimate=getattr(args, "estimate", False),
           dedup_fields=dedup_fields,
-          daemon=getattr(args, "daemon", False))
+          daemon=getattr(args, "daemon", False),
+          storage=storage)
 
 
 def cmd_plan(args):
@@ -709,7 +723,21 @@ def _apply_passphrase(qe, args):
 
 def cmd_search(args):
     from flatseek.core.query_engine import QueryEngine
-    qe = QueryEngine(args.data_dir)
+    from flatseek.core.storage import StorageConfig, create_storage_adapter
+
+    storage = None
+    if getattr(args, "storage_backend", None):
+        config = StorageConfig(
+            backend=args.storage_backend,
+            bucket=getattr(args, "storage_bucket", "") or "",
+            region=getattr(args, "storage_region", "") or "",
+            endpoint_url=getattr(args, "storage_endpoint", "") or "",
+            base_path=getattr(args, "storage_base_path", "") or "",
+            url=getattr(args, "storage_url", "") or "",
+        )
+        storage = create_storage_adapter(config)
+
+    qe = QueryEngine(args.data_dir, storage=storage)
     _apply_passphrase(qe, args)
 
     # Build Lucene query string from args.
@@ -1593,6 +1621,20 @@ def cmd_serve(args):
     if args.flatlens_dir:
         _os.environ["FLATSEEK_FLATLENS_DIR"] = os.path.abspath(args.flatlens_dir)
 
+    # Storage configuration for remote indexes
+    if args.storage_backend:
+        _os.environ["FLATSEEK_STORAGE_BACKEND"] = args.storage_backend
+    if args.storage_url:
+        _os.environ["FLATSEEK_STORAGE_URL"] = args.storage_url
+    if args.storage_bucket:
+        _os.environ["FLATSEEK_BUCKET"] = args.storage_bucket
+    if args.storage_region:
+        _os.environ["FLATSEEK_S3_REGION"] = args.storage_region
+    if args.storage_endpoint:
+        _os.environ["FLATSEEK_S3_ENDPOINT"] = args.storage_endpoint
+    if args.storage_base_path:
+        _os.environ["FLATSEEK_BASE_PATH"] = args.storage_base_path
+
     host = args.host
     port = args.port
     reload = not args.no_reload
@@ -1625,8 +1667,22 @@ def cmd_serve(args):
     if args.flatlens_dir:
         print(f"Flatlens:   {os.path.abspath(args.flatlens_dir)}")
     print()
-    print(f"Opening dashboard in browser...")
-    webbrowser.open(f"http://localhost:{port}/dashboard")
+    print(f"Starting server... (dashboard will open automatically)")
+    print()
+
+    # Start uvicorn first, then open browser in background thread
+    # webbrowser.open() is blocking and would delay server startup
+    import threading
+    browser_url = f"http://localhost:{port}/dashboard"
+
+    def open_browser():
+        import time
+        time.sleep(1.5)  # Wait for server to be ready
+        webbrowser.open(browser_url)
+
+    browser_thread = threading.Thread(target=open_browser, daemon=True)
+    browser_thread.start()
+
     print(f"Press Ctrl+C to stop")
 
     uvicorn.run(
@@ -1646,6 +1702,20 @@ def cmd_api(args):
     _os.environ["FLATSEEK_DATA_DIR"] = data_dir
     _os.environ["FLATSEEK_PORT"] = str(args.port)
     # Do NOT set FLATSEEK_API_BASE — dashboard should not be attached
+
+    # Storage configuration for remote indexes
+    if args.storage_backend:
+        _os.environ["FLATSEEK_STORAGE_BACKEND"] = args.storage_backend
+    if args.storage_url:
+        _os.environ["FLATSEEK_STORAGE_URL"] = args.storage_url
+    if args.storage_bucket:
+        _os.environ["FLATSEEK_BUCKET"] = args.storage_bucket
+    if args.storage_region:
+        _os.environ["FLATSEEK_S3_REGION"] = args.storage_region
+    if args.storage_endpoint:
+        _os.environ["FLATSEEK_S3_ENDPOINT"] = args.storage_endpoint
+    if args.storage_base_path:
+        _os.environ["FLATSEEK_BASE_PATH"] = args.storage_base_path
 
     host = args.host
     port = args.port
@@ -1824,6 +1894,22 @@ def main():
                         "buffers ≥ 512 KB to disk every 10 s. Recommended when you have "
                         "abundant free RAM (≥ 8 GB) and want maximum indexing speed. "
                         "Finalize writes all remaining buffers at the end.")
+    p.add_argument("--storage-backend", default=None, choices=["local", "s3", "vercel-blob", "url"],
+                   dest="storage_backend",
+                   help="Storage backend: local (default), s3, vercel-blob, or url (github/huggingface). "
+                        "Defaults to local storage (or FLATSEEK_STORAGE_BACKEND env var).")
+    p.add_argument("--storage-bucket", default=None, dest="storage_bucket",
+                   help="Bucket name for S3 or Vercel Blob. Defaults to FLATSEEK_BUCKET env var.")
+    p.add_argument("--storage-region", default=None, dest="storage_region",
+                   help="AWS region for S3. Defaults to FLATSEEK_S3_REGION env var.")
+    p.add_argument("--storage-endpoint", default=None, dest="storage_endpoint",
+                   help="Custom S3 endpoint URL (for MinIO, etc.). Defaults to FLATSEEK_S3_ENDPOINT env var.")
+    p.add_argument("--storage-base-path", default=None, dest="storage_base_path",
+                   help="Prefix path within bucket. Defaults to FLATSEEK_BASE_PATH env var.")
+    p.add_argument("--storage-url", default=None, dest="storage_url",
+                   help="URL for remote index (GitHub releases, HuggingFace, or generic URL). "
+                        "Used when --storage-backend is 'url'. E.g.: "
+                        "https://github.com/user/repo/releases/download/v1.0/")
 
     # generate
     _gen_help = "Generate dummy dataset for benchmarking (standard, ecommerce, logs, nested, sparse, article, adsb, campaign, devops, sosmed, blockchain)"
@@ -1865,6 +1951,22 @@ def main():
     p.add_argument("--passphrase", default=None, metavar="PASS",
                    help="Decryption passphrase (prompted interactively if index is encrypted "
                         "and this flag is omitted)")
+    p.add_argument("--storage-backend", default=None, choices=["local", "s3", "vercel-blob", "url"],
+                   dest="storage_backend",
+                   help="Storage backend: local (default), s3, vercel-blob, or url (github/huggingface). "
+                        "Defaults to local storage (or FLATSEEK_STORAGE_BACKEND env var).")
+    p.add_argument("--storage-bucket", default=None, dest="storage_bucket",
+                   help="Bucket name for S3 or Vercel Blob. Defaults to FLATSEEK_BUCKET env var.")
+    p.add_argument("--storage-region", default=None, dest="storage_region",
+                   help="AWS region for S3. Defaults to FLATSEEK_S3_REGION env var.")
+    p.add_argument("--storage-endpoint", default=None, dest="storage_endpoint",
+                   help="Custom S3 endpoint URL (for MinIO, etc.). Defaults to FLATSEEK_S3_ENDPOINT env var.")
+    p.add_argument("--storage-base-path", default=None, dest="storage_base_path",
+                   help="Prefix path within bucket. Defaults to FLATSEEK_BASE_PATH env var.")
+    p.add_argument("--storage-url", default=None, dest="storage_url",
+                   help="URL for remote index (GitHub releases, HuggingFace, or generic URL). "
+                        "Used when --storage-backend is 'url'. E.g.: "
+                        "https://github.com/user/repo/releases/download/v1.0/")
 
     # join
     p = sub.add_parser("join", help="Cross-dataset join on shared field")
@@ -1900,6 +2002,19 @@ def main():
     p.add_argument("--flatlens-dir", default=None, dest="flatlens_dir",
                    help="Path to flatlens installation (default: auto-detected from "
                         "FLATLENS_DIR, ~/.local/share/flatlens, or sibling flatlens repo)")
+    p.add_argument("--storage-backend", default=None,
+                   choices=["local", "s3", "vercel-blob", "url"],
+                   help="Storage backend for remote index (default: local)")
+    p.add_argument("--storage-url", default=None, dest="storage_url",
+                   help="Base URL for URL storage backend (GitHub releases, HuggingFace, etc.)")
+    p.add_argument("--storage-bucket", default=None, dest="storage_bucket",
+                   help="Bucket name for S3/Vercel Blob storage")
+    p.add_argument("--storage-region", default=None, dest="storage_region",
+                   help="Region for S3 storage")
+    p.add_argument("--storage-endpoint", default=None, dest="storage_endpoint",
+                   help="Custom endpoint for S3-compatible storage")
+    p.add_argument("--storage-base-path", default=None, dest="storage_base_path",
+                   help="Base path within storage")
 
     # api
     p = sub.add_parser("api", help="Start API server only (no dashboard)")
@@ -1911,6 +2026,19 @@ def main():
                    help="Host to bind to (default: 0.0.0.0)")
     p.add_argument("--no-reload", action="store_true", default=False,
                    help="Disable auto-reload (default: enabled)")
+    p.add_argument("--storage-backend", default=None,
+                   choices=["local", "s3", "vercel-blob", "url"],
+                   help="Storage backend for remote index (default: local)")
+    p.add_argument("--storage-url", default=None, dest="storage_url",
+                   help="Base URL for URL storage backend")
+    p.add_argument("--storage-bucket", default=None, dest="storage_bucket",
+                   help="Bucket name for S3/Vercel Blob storage")
+    p.add_argument("--storage-region", default=None, dest="storage_region",
+                   help="Region for S3 storage")
+    p.add_argument("--storage-endpoint", default=None, dest="storage_endpoint",
+                   help="Custom endpoint for S3-compatible storage")
+    p.add_argument("--storage-base-path", default=None, dest="storage_base_path",
+                   help="Base path within storage")
 
     # dashboard
     p = sub.add_parser("dashboard",

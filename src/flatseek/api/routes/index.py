@@ -13,7 +13,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -497,6 +497,7 @@ async def bulk_index(
     response: Response,
     http_request: Request = None,
     manager: IndexManager = Depends(get_index_manager),
+    bucket: str | None = Query(None, description="URL storage bucket for remote indexes"),
 ):
     """Bulk index multiple documents — runs in thread pool so API stays responsive.
 
@@ -835,6 +836,7 @@ async def flush_index(
     index: str,
     wait: bool = True,
     manager: IndexManager = Depends(get_index_manager),
+    bucket: str | None = Query(None, description="URL storage bucket for remote indexes"),
 ):
     """Flush in-memory buffers to disk and finalize the index.
 
@@ -936,6 +938,7 @@ async def flush_index(
 async def get_upload_progress(
     index: str,
     manager: IndexManager = Depends(get_index_manager),
+    bucket: str | None = Query(None, description="URL storage bucket for remote indexes"),
 ):
     """Get current upload resume position for an index.
 
@@ -974,6 +977,7 @@ async def update_upload_progress(
     index: str,
     body: dict,
     manager: IndexManager = Depends(get_index_manager),
+    bucket: str | None = Query(None, description="URL storage bucket for remote indexes"),
 ):
     """Update upload progress stats for an index.
 
@@ -998,6 +1002,7 @@ async def update_upload_progress(
 async def delete_index(
     index: str,
     manager: IndexManager = Depends(get_index_manager),
+    bucket: str | None = Query(None, description="URL storage bucket for remote indexes"),
 ):
     """Delete an index and all its data. Runs asynchronously."""
     data_dir = manager.data_dir
@@ -1039,6 +1044,7 @@ async def delete_index(
 async def get_index_logs(
     index: str,
     manager: IndexManager = Depends(get_index_manager),
+    bucket: str | None = Query(None, description="URL storage bucket for remote indexes"),
 ):
     """Get event logs for an index (indexing_started, flush_completed, errors, etc.)."""
     import json as _json
@@ -1063,6 +1069,7 @@ async def rename_index(
     index: str,
     body: dict,
     manager: IndexManager = Depends(get_index_manager),
+    bucket: str | None = Query(None, description="URL storage bucket for remote indexes"),
 ):
     """Rename an index by renaming its folder.
 
@@ -1170,7 +1177,7 @@ async def encrypt_index(
 
     # Generate a verification token to prove the password is correct
     verify_token = secrets.token_bytes(16)
-    verify_ciphertext = encrypt_bytes(b"SEEKIO_VERIFY_" + verify_token, key)
+    verify_ciphertext = encrypt_bytes(b"FLATSEEK_VERIFY_" + verify_token, key)
 
     with open(enc_path, "w") as f:
         json.dump({
@@ -1248,6 +1255,7 @@ async def encrypt_progress(
     index: str,
     job_id: str = None,
     manager: IndexManager = Depends(get_index_manager),
+    bucket: str | None = Query(None, description="URL storage bucket for remote indexes"),
 ):
     """Poll encrypt/decrypt job progress.
 
@@ -1383,15 +1391,21 @@ async def decrypt_index(
 async def is_index_encrypted(
     index: str,
     manager: IndexManager = Depends(get_index_manager),
+    bucket: str | None = Query(None, description="URL storage bucket for remote indexes"),
 ):
     """Check if an index is encrypted."""
+    # For bucket URLs, check via remote storage (skip local filesystem check)
+    if bucket:
+        return {"index": index, "encrypted": manager.is_encrypted(index, bucket)}
+
+    # For local indexes, check filesystem
     data_dir = manager.data_dir
     index_dir = os.path.join(data_dir, index)
 
     if not os.path.isdir(os.path.join(index_dir, "index")):
         raise HTTPException(404, f"Index not found: {index}")
 
-    return {"index": index, "encrypted": manager.is_encrypted(index)}
+    return {"index": index, "encrypted": manager.is_encrypted(index, bucket)}
 
 
 @router.post("/{index}/_authenticate")
@@ -1399,6 +1413,7 @@ async def authenticate_index(
     index: str,
     body: dict[str, Any] | None = None,
     manager: IndexManager = Depends(get_index_manager),
+    bucket: str | None = Query(None, description="URL storage bucket for remote indexes"),
 ):
     """Submit password for an encrypted index.
 
@@ -1408,8 +1423,57 @@ async def authenticate_index(
     On success, the password is stored in the session and subsequent
     search/aggregate/map requests will use it automatically.
     """
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.warning(f"[auth] authenticate_index called index={index} bucket={bucket}")
+
     from flatseek.core.query_engine import load_encryption_key, decrypt_bytes
 
+    passphrase = (body or {}).get("passphrase") if body else None
+    if not passphrase:
+        raise HTTPException(400, "passphrase is required")
+
+    # For bucket URLs, read encryption.json from remote storage
+    if bucket:
+        storage = manager._get_bucket_storage(bucket)
+        logger.warning(f"[auth] bucket={bucket} storage={storage}")
+        try:
+            enc_data = storage.read_bytes("encryption.json")
+            logger.warning(f"[auth] read encryption.json, len={len(enc_data)}")
+            meta = json.loads(enc_data)
+        except FileNotFoundError:
+            raise HTTPException(400, "Index is not encrypted — no encryption.json found in index folder")
+        except Exception as e:
+            raise HTTPException(400, f"Index is not encrypted: {e}")
+
+        try:
+            key = load_encryption_key(None, passphrase, meta)
+        except Exception as e:
+            return {"authenticated": False, "index": index, "error": f"key derivation failed: {e}"}
+
+        # Verify by trying to decrypt a known file (docs chunk) with the derived key
+        # If key is wrong, decryption will fail
+        try:
+            from flatseek.core.query_engine import decrypt_bytes
+            test_data = storage.read_bytes("docs/00/00/docs_0000000000.zlib")
+            if test_data[:9] == b'FLATSEEK\x01':
+                decrypt_bytes(test_data, key)
+        except Exception as e:
+            logger.warning(f"[auth] verification failed: {e}")
+            return {"authenticated": False, "index": index, "error": "Invalid passphrase"}
+
+        manager.set_password(index, passphrase, bucket)
+
+        # Pre-load the key into the engine so the next request doesn't need to re-derive
+        try:
+            engine = manager.get_engine(index, bucket_url=bucket)
+            engine.set_key(key)
+        except Exception:
+            pass
+
+        return {"authenticated": True, "index": index}
+
+    # Local filesystem authentication
     data_dir = manager.data_dir
     index_dir = os.path.join(data_dir, index)
 
@@ -1419,10 +1483,6 @@ async def authenticate_index(
     enc_path = os.path.join(index_dir, "encryption.json")
     if not os.path.isfile(enc_path):
         raise HTTPException(400, "Index is not encrypted — no encryption.json found in index folder")
-
-    passphrase = (body or {}).get("passphrase") if body else None
-    if not passphrase:
-        raise HTTPException(400, "passphrase is required")
 
     try:
         key = load_encryption_key(index_dir, passphrase)
@@ -1435,16 +1495,16 @@ async def authenticate_index(
             meta = json.load(f)
         verify_ct = bytes.fromhex(meta["verify_token"])
         decrypted = decrypt_bytes(verify_ct, key)
-        if not decrypted.startswith(b"SEEKIO_VERIFY_"):
+        if not decrypted.startswith(b"FLATSEEK_VERIFY_"):
             return {"authenticated": False, "index": index}
     except Exception:
         return {"authenticated": False, "index": index}
 
-    manager.set_password(index, passphrase)
+    manager.set_password(index, passphrase, bucket)
 
     # Pre-load the key into the engine so the next request doesn't need to re-derive
     try:
-        engine = manager.get_engine(index)
+        engine = manager.get_engine(index, bucket_url=bucket)
         engine.set_key(key)
     except Exception:
         pass
@@ -1456,12 +1516,13 @@ async def authenticate_index(
 async def logout_index(
     index: str,
     manager: IndexManager = Depends(get_index_manager),
+    bucket: str | None = Query(None, description="URL storage bucket for remote indexes"),
 ):
     """Clear stored password for an encrypted index.
 
     DELETE /my-index/_authenticate
     """
-    manager.clear_password(index)
+    manager.clear_password(index, bucket)
     return {"cleared": True, "index": index}
 
 
@@ -1470,6 +1531,7 @@ async def put_mapping(
     index: str,
     body: dict[str, Any],
     manager: IndexManager = Depends(get_index_manager),
+    bucket: str | None = Query(None, description="URL storage bucket for remote indexes"),
 ):
     """Create or update index mapping.
 
@@ -1501,25 +1563,33 @@ async def get_mapping(
     index: str,
     request: Request = None,
     manager: IndexManager = Depends(get_index_manager),
+    bucket: str | None = Query(None, description="URL storage bucket for remote indexes"),
 ):
     """Get the column type mapping for an index."""
-    index_dir = os.path.join(manager.data_dir, index)
-    # Try to authenticate if encrypted — but don't block mapping if no password
-    if manager.is_encrypted(index):
-        stored_pass = manager.get_password(index)
-        if not stored_pass and request:
-            stored_pass = request.headers.get("x-index-password")
-        if stored_pass:
-            try:
-                from flatseek.core.query_engine import load_encryption_key
+    # BLOCK unauthenticated access to encrypted buckets — metadata must not leak
+    if manager.is_encrypted(index, bucket):
+        stored_pass = request.headers.get("x-index-password") if request else None
+        if not stored_pass:
+            raise HTTPException(
+                403,
+                f"Index '{index}' is encrypted. Submit password via POST /{index}/_authenticate"
+            )
+        try:
+            from flatseek.core.query_engine import load_encryption_key
+            if bucket:
+                storage = manager._get_bucket_storage(bucket)
+                enc_data = storage.read_bytes("encryption.json")
+                meta = json.loads(enc_data)
+                key = load_encryption_key(None, stored_pass, meta)
+            else:
+                index_dir = os.path.join(manager.data_dir, index)
                 key = load_encryption_key(index_dir, stored_pass)
-                manager.get_engine(index).set_key(key)
-                manager.set_password(index, stored_pass)
-            except Exception:
-                pass  # Password invalid — continue without decrypting
+            manager.get_engine(index, bucket_url=bucket).set_key(key)
+        except Exception:
+            raise HTTPException(401, "Invalid passphrase for encrypted index")
 
     try:
-        engine = manager.get_engine(index)
+        engine = manager.get_engine(index, bucket_url=bucket)
     except Exception as e:
         raise HTTPException(404, f"Index not found or cannot load: {e}")
 
@@ -1549,25 +1619,33 @@ async def get_stats(
     index: str,
     request: Request = None,
     manager: IndexManager = Depends(get_index_manager),
+    bucket: str | None = Query(None, description="URL storage bucket for remote indexes"),
 ):
     """Get index statistics: document count, size, columns, encryption status."""
-    index_dir = os.path.join(manager.data_dir, index)
-    # Try to authenticate if encrypted — but don't block stats if no password
-    if manager.is_encrypted(index):
-        stored_pass = manager.get_password(index)
-        if not stored_pass and request:
-            stored_pass = request.headers.get("x-index-password")
-        if stored_pass:
-            try:
-                from flatseek.core.query_engine import load_encryption_key
+    # BLOCK unauthenticated access to encrypted buckets — metadata must not leak
+    if manager.is_encrypted(index, bucket):
+        stored_pass = request.headers.get("x-index-password") if request else None
+        if not stored_pass:
+            raise HTTPException(
+                403,
+                f"Index '{index}' is encrypted. Submit password via POST /{index}/_authenticate"
+            )
+        try:
+            from flatseek.core.query_engine import load_encryption_key
+            if bucket:
+                storage = manager._get_bucket_storage(bucket)
+                enc_data = storage.read_bytes("encryption.json")
+                meta = json.loads(enc_data)
+                key = load_encryption_key(None, stored_pass, meta)
+            else:
+                index_dir = os.path.join(manager.data_dir, index)
                 key = load_encryption_key(index_dir, stored_pass)
-                manager.get_engine(index).set_key(key)
-                manager.set_password(index, stored_pass)
-            except Exception:
-                pass  # Password invalid — continue without decrypting
+            manager.get_engine(index, bucket_url=bucket).set_key(key)
+        except Exception:
+            raise HTTPException(401, "Invalid passphrase for encrypted index")
 
     try:
-        engine = manager.get_engine(index)
+        engine = manager.get_engine(index, bucket_url=bucket)
     except Exception as e:
         raise HTTPException(404, f"Index not found or cannot load: {e}")
 
@@ -1579,7 +1657,7 @@ async def get_stats(
             "_index": index,
             "docs": {"count": 0, "deleted": 0},
             "store": {"size_bytes": 0, "index_size_mb": 0, "docs_size_mb": 0},
-            "encrypted": manager.is_encrypted(index),
+            "encrypted": manager.is_encrypted(index, bucket),
             "columns": {},
             "in_upload": False,
             "upload": None,
@@ -1625,7 +1703,7 @@ async def get_stats(
             "index_size_mb": stats.get("index_size_mb", 0),
             "docs_size_mb": stats.get("docs_size_mb", 0),
         },
-        "encrypted": manager.is_encrypted(index),
+        "encrypted": manager.is_encrypted(index, bucket),
         "columns": stats.get("columns", {}),
         "in_upload": in_upload,
         "upload_interrupted": upload_interrupted,

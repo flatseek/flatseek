@@ -60,6 +60,7 @@ async def aggregate(
     index: str,
     body: dict[str, Any],
     request: Request = None,
+    bucket: str | None = Query(None, description="URL storage bucket for remote indexes"),
     manager: IndexManager = Depends(get_index_manager),
 ):
     """Run aggregations (facets, statistics, buckets) over matching documents.
@@ -79,10 +80,8 @@ async def aggregate(
     }
     ```
     """
-    if manager.is_encrypted(index):
-        stored_pass = manager.get_password(index)
-        if not stored_pass and request:
-            stored_pass = request.headers.get("x-index-password")
+    if manager.is_encrypted(index, bucket):
+        stored_pass = request.headers.get("x-index-password") if request else None
         if not stored_pass:
             raise HTTPException(
                 403,
@@ -90,15 +89,20 @@ async def aggregate(
             )
         try:
             from flatseek.core.query_engine import load_encryption_key
-            index_dir = os.path.join(manager.data_dir, index)
-            key = load_encryption_key(index_dir, stored_pass)
-            manager.get_engine(index).set_key(key)
-            manager.set_password(index, stored_pass)
+            if bucket:
+                storage = manager._get_bucket_storage(bucket)
+                enc_data = storage.read_bytes("encryption.json")
+                meta = json.loads(enc_data)
+                key = load_encryption_key(None, stored_pass, meta)
+            else:
+                index_dir = os.path.join(manager.data_dir, index)
+                key = load_encryption_key(index_dir, stored_pass)
+            manager.get_engine(index, bucket_url=bucket).set_key(key)
         except Exception:
             raise HTTPException(401, "Invalid passphrase for encrypted index")
 
     try:
-        engine = manager.get_engine(index)
+        engine = manager.get_engine(index, bucket_url=bucket)
     except Exception as e:
         raise HTTPException(404, f"Index not found: {index}") from e
 
@@ -123,6 +127,7 @@ async def aggregate_get(
     index: str,
     q: str = Query("*", description="Query string"),
     aggs: str = Query(None, description="Aggregations as JSON"),
+    bucket: str | None = Query(None, description="URL storage bucket for remote indexes"),
     request: Request = None,
     manager: IndexManager = Depends(get_index_manager),
 ):
@@ -133,4 +138,4 @@ async def aggregate_get(
             body["aggs"] = json.loads(aggs)
         except Exception:
             raise HTTPException(400, "Invalid aggs JSON")
-    return await aggregate(index, body, request, manager)
+    return await aggregate(index, body, request, bucket=None, manager=manager)

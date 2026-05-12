@@ -4,14 +4,16 @@
 
 # Flatseek
 
-**Full text search over flat files.** No JVM. No cluster. No ops burden.
+**Full-text search over flat files and remote datasets.** No JVM. No cluster. No operational overhead.
 
 <p align="center">
   <img src="docs/assets/dashboard.png" alt="Flatlens Dashboard" width="100%" />
 </p>
 
 <p align="center">
-  <em>Search, filter, and aggregate CSV/JSON visually — no setup required.</em>
+  <em>
+    Explore, filter, and aggregate CSV/JSON like a spreadsheet with search-grade power — run locally or query directly from Public/HuggingFace datasets.
+  </em>
 </p>
 
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
@@ -26,6 +28,8 @@
 **Dashboard:** [flatlens](https://github.com/flatseek/flatlens/)
 &nbsp;&middot;&nbsp;
 **Benchmark:** [flatbench](https://github.com/flatseek/flatbench/)
+&nbsp;&middot;&nbsp;
+**Hosted Datasets:** [HuggingFace](https://huggingface.co/flatseek)
 
 </div>
 
@@ -33,10 +37,38 @@
 
 ## Why Flatseek
 
-- **Correct always.** Every query returns exact counts. No silent wrong results.
-- **Single binary.** No JVM, no cluster config, no heap tuning.
-- **Fast enough.** p50 2.2ms handles production traffic.
-- **Embed or serve.** Use as a library or run as a sidecar API.
+- **Exact-by-design engine.** Query results are deterministic with full-count accuracy on flat files.
+- **No infra required.** Run locally as a single binary or deploy as a lightweight API sidecar.
+- **Millisecond search performance.** Built for interactive exploration over large datasets.
+- **Zero-ops distribution.** Store and query indexes directly from HuggingFace, S3, or Vercel Blob.
+- **Instant dataset access.** Paste a dataset URL in Flatlens and start searching immediately — no ingestion pipeline needed.
+- **Built-in analytics dashboard.** Spreadsheet-like experience with Kibana-style filtering, aggregation, and exploration — closer to Microsoft Excel for structured search workflows.
+- **Developer-first embedding.** Use as a Python library or full API without running a cluster or managing nodes.
+---
+## Search engine for public datasets instantly
+
+Flatseek can query indexes hosted remotely — no need to deploy or pay for expensive storage infrastructure. Build your Flatseek index locally, upload it to any free-cheap publicly accessible storage service, and instantly search and aggregate data from anywhere.
+
+Supported providers:
+
+- HuggingFace Datasets / Buckets
+- S3-compatible storage
+- Vercel Blob
+- Static HTTP hosting
+
+
+#### Samples
+
+| Dataset | Rows |
+|---|---|
+| Local Sample | [500 searchable rows](https://flatlens.demo.flatseek.io) |
+| [https://huggingface.co/buckets/flatseek/flatdata](https://huggingface.co/buckets/flatseek/flatdata) | [10K searchable rows](https://flatlens.demo.flatseek.io/?bucket=https://huggingface.co/buckets/flatseek/flatdata&index=adsb) |
+| [https://huggingface.co/datasets/flatseek/sample-articles](https://huggingface.co/datasets/flatseek/sample-articles) | [100K articles](https://flatlens.demo.flatseek.io/?bucket=https://huggingface.co/datasets/flatseek/sample-articles) |
+| [https://huggingface.co/datasets/flatseek/sample-adsb](https://huggingface.co/datasets/flatseek/sample-adsb) | [100K ADS-B records](https://flatlens.demo.flatseek.io/?bucket=https://huggingface.co/datasets/flatseek/sample-adsb) |
+| [https://huggingface.co/datasets/flatseek/sample-encrypted](https://huggingface.co/datasets/flatseek/sample-encrypted) | [100K encrypted rows](https://flatlens.demo.flatseek.io/?bucket=https://huggingface.co/datasets/flatseek/sample-encrypted) Password: `flatseek`|
+
+
+Encrypted datasets are supported with per-request passphrases.
 
 ---
 
@@ -66,17 +98,17 @@ flatseek build ./data.csv -o ./data
 
 # 3. Serve API + dashboard
 flatseek serve -d ./data
-# → API:       http://localhost:8000
-# → Dashboard: http://localhost:8000/dashboard
+
+# → API:
+# http://localhost:8000
+
+# → Dashboard:
+# http://localhost:8000/dashboard
 
 # 4. Query
 flatseek search ./data "program:raydium AND amount:>1000000"
 ```
-
-No config files. No cluster.
-
 ---
-
 ## Core Capabilities
 
 - **Full text search** — tokenized, trigram-backed wildcard (`*kube*`)
@@ -87,6 +119,8 @@ No config files. No cluster.
 - **Boolean operators** — AND, OR, NOT with grouping
 - **Encryption at rest** — ChaCha20-Poly1305
 - **Parallel indexing** — multi-worker builds
+- **Remote querying** — search HuggingFace datasets without downloading
+- **REST API** — Elasticsearch-compatible endpoints
 
 See [docs/](docs/) for full details.
 
@@ -101,8 +135,9 @@ See [docs/](docs/) for full details.
 | [Query Language](docs/query-language.md) | Full syntax reference |
 | [CLI Reference](docs/cli.md) | All CLI commands |
 | [REST API](docs/api.md) | API endpoints |
+| [Remote Storage](docs/storage.md) | HuggingFace, S3, Vercel Blob |
 | [Schemas](docs/schemas.md) | Supported Column Types |
-| [Architecture](docs/architecture.md) | A structural and behavioral map of the Flatseek codebase |
+| [Architecture](docs/architecture.md) | Structural and behavioral map |
 | [Internals](docs/internals.md) | Deep technical breakdown |
 
 ---
@@ -115,7 +150,7 @@ See [docs/](docs/) for full details.
 curl -fsSL flatseek.io/install.sh | sh
 ```
 
-Includes API server + Flatlens dashboard (http://localhost:8000/dashboard).
+Includes API server + Flatlens dashboard (`http://localhost:8000/dashboard`).
 
 ### PyPI
 
@@ -123,13 +158,19 @@ Includes API server + Flatlens dashboard (http://localhost:8000/dashboard).
 pip install flatseek
 ```
 
-CLI only. For [Flatlens dashboard](https://github.com/flatseek/flatlens): `git clone https://github.com/flatseek/flatlens`
+CLI only. For [Flatlens dashboard](https://github.com/flatseek/flatlens):
+
+```bash
+git clone https://github.com/flatseek/flatlens
+```
 
 ### From source
 
 ```bash
 git clone https://github.com/flatseek/flatseek.git
-cd flatseek && pip install -e .
+
+cd flatseek
+pip install -e .
 ```
 
 **Requirements:** Python ≥ 3.10, macOS / Linux / WSL.
@@ -141,9 +182,9 @@ cd flatseek && pip install -e .
 PRs welcome. Run tests:
 
 ```bash
-pytest src/flatseek/test/test_search.py -v   # accuracy tests (~110 cases)
+pytest src/flatseek/test/test_search.py -v   # accuracy tests
 pytest src/flatseek/test/test_api.py         # API smoke tests
-pytest src/flatseek/test/test_cli.py          # CLI integration
+pytest src/flatseek/test/test_cli.py         # CLI integration
 ```
 
 ---

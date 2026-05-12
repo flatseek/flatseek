@@ -52,20 +52,27 @@ class TestIndicesList:
 
 class TestIndexCreate:
     def test_create_and_delete_index(self):
-        with IndexContext(n_rows=20) as idx_dir:
-            from fastapi.testclient import TestClient
-            from flatseek.api.main import app
-            import os
+        import os
+        orig_data_dir = os.environ.get("FLATSEEK_DATA_DIR")
+        try:
+            with IndexContext(n_rows=20) as idx_dir:
+                from fastapi.testclient import TestClient
+                from flatseek.api.main import app
 
-            os.environ["FLATSEEK_DATA_DIR"] = idx_dir
-            client = TestClient(app, raise_server_exceptions=True)
+                os.environ["FLATSEEK_DATA_DIR"] = idx_dir
+                client = TestClient(app, raise_server_exceptions=True)
 
-            idx_name = "test_create_idx"
-            r = client.put(f"/{idx_name}")
-            assert r.status_code == 200, f"Expected 200, got {r.status_code}: {r.json()}"
-            data = r.json()
-            assert data["status"] in ("created", "exists")
-            assert data["_index"] == idx_name
+                idx_name = "test_create_idx"
+                r = client.put(f"/{idx_name}")
+                assert r.status_code == 200, f"Expected 200, got {r.status_code}: {r.json()}"
+                data = r.json()
+                assert data["status"] in ("created", "exists")
+                assert data["_index"] == idx_name
+        finally:
+            if orig_data_dir is None:
+                os.environ.pop("FLATSEEK_DATA_DIR", None)
+            else:
+                os.environ["FLATSEEK_DATA_DIR"] = orig_data_dir
 
     def test_create_twice_returns_exists(self):
         """Second PUT on same index returns status=exists."""
@@ -74,24 +81,37 @@ class TestIndexCreate:
         from flatseek.api.deps import _index_manager
         import os, tempfile, shutil
 
+        orig_data_dir = os.environ.get("FLATSEEK_DATA_DIR")
         tmp = tempfile.mkdtemp(prefix="fs_api_")
-        os.environ["FLATSEEK_DATA_DIR"] = tmp
-        # Clear the global manager cache so it picks up the new data_dir
-        if _index_manager is not None:
-            _index_manager._engines.clear()
-            _index_manager._index_passwords.clear()
-        client = TestClient(app, raise_server_exceptions=True)
+        try:
+            os.environ["FLATSEEK_DATA_DIR"] = tmp
+            # Reset global manager so it picks up the new data_dir
+            if _index_manager is not None:
+                _index_manager._engines.clear()
+                _index_manager._index_passwords.clear()
+            # Force recreation of the global manager with new data_dir
+            import flatseek.api.deps as deps
+            deps._index_manager = None
 
-        idx_name = "test_twice_idx"
-        r1 = client.put(f"/{idx_name}")
-        assert r1.status_code == 200
-        assert r1.json()["status"] == "created"
+            client = TestClient(app, raise_server_exceptions=True)
 
-        r2 = client.put(f"/{idx_name}")
-        assert r2.status_code == 200
-        assert r2.json()["status"] == "exists"
+            idx_name = "test_twice_idx"
+            r1 = client.put(f"/{idx_name}")
+            assert r1.status_code == 200
+            assert r1.json()["status"] == "created"
 
-        shutil.rmtree(tmp, ignore_errors=True)
+            r2 = client.put(f"/{idx_name}")
+            assert r2.status_code == 200
+            assert r2.json()["status"] == "exists"
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            if orig_data_dir is None:
+                os.environ.pop("FLATSEEK_DATA_DIR", None)
+            else:
+                os.environ["FLATSEEK_DATA_DIR"] = orig_data_dir
+            # Reset global manager again so subsequent tests use clean state
+            import flatseek.api.deps as deps
+            deps._index_manager = None
 
     def test_delete_nonexistent_returns_404(self):
         from fastapi.testclient import TestClient

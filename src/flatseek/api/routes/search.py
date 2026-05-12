@@ -2,6 +2,7 @@
 
 import asyncio
 import glob as _glob
+import json
 import logging
 import os
 import re
@@ -82,29 +83,42 @@ router = APIRouter(
 
 
 @router.get("/_debug/chunks/{index}")
-async def debug_chunks(index: str, manager: IndexManager = Depends(get_index_manager)):
+async def debug_chunks(index: str, bucket: str | None = Query(None), manager: IndexManager = Depends(get_index_manager)):
     """Debug: list first 5 chunk files found by _iter_chunks."""
     import glob as _glob
     import os
     import re
 
     try:
-        engine = manager.get_engine(index)
+        engine = manager.get_engine(index, bucket_url=bucket)
     except Exception as e:
         raise HTTPException(404, f"Index not found: {index}") from e
 
     docs_dir = engine.docs_dir
-    pattern = os.path.join(docs_dir, "**", "*.zlib")
-    files = _glob.glob(pattern, recursive=True)
-    if not files:
-        pattern2 = os.path.join(docs_dir, "chunks_*.zlib")
-        files = _glob.glob(pattern2)
+    from flatseek.core.storage import URLStorageAdapter
+
+    if isinstance(engine.storage, URLStorageAdapter):
+        try:
+            remote_files = engine._list_docs_recursive()
+            first_files = sorted(remote_files, key=lambda p: re.search(r"docs_(\d+)", p) or re.search(r"chunks_(\d+)", p) or "")[:5]
+            globbed_count = len(remote_files)
+        except Exception as e:
+            first_files = [f"error: {e}"]
+            globbed_count = 0
+    else:
+        pattern = os.path.join(docs_dir, "**", "*.zlib")
+        files = _glob.glob(pattern, recursive=True)
+        if not files:
+            pattern2 = os.path.join(docs_dir, "chunks_*.zlib")
+            files = _glob.glob(pattern2)
+        globbed_count = len(files)
+        first_files = sorted(files, key=lambda p: re.search(r"docs_(\d+)", p) or re.search(r"chunks_(\d+)", p) or "")[:5]
 
     return {
         "docs_dir": docs_dir,
-        "pattern": pattern,
-        "globbed_count": len(files),
-        "first_files": sorted(files, key=lambda p: re.search(r"docs_(\d+)", p) or re.search(r"chunks_(\d+)", p) or "")[:5],
+        "storage_url": engine.storage.base_url if hasattr(engine.storage, 'base_url') else str(engine.storage),
+        "globbed_count": globbed_count,
+        "first_files": first_files,
         "sub_engines": engine._sub_engines is not None,
         "stats_total_docs": engine.stats.get("total_docs"),
     }
@@ -129,15 +143,17 @@ async def search(
     q: str | None = Query(None, description="Query string (Lucene syntax)"),
     from_: int = Query(0, ge=0, alias="from"),
     size: int = Query(20, ge=0, le=10000),
+    bucket: str | None = Query(None, description="URL storage bucket (HuggingFace/GitHub URL) for remote indexes"),
     request: Request = None,
     manager: IndexManager = Depends(get_index_manager),
 ):
     """Search with request body or query params."""
     # Check if index is encrypted and requires password
-    if manager.is_encrypted(index):
-        stored_pass = manager.get_password(index)
-        if not stored_pass and request:
-            stored_pass = request.headers.get("x-index-password")
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.warning(f"[search] is_encrypted({index}, {bucket}) = {manager.is_encrypted(index, bucket)}")
+    if manager.is_encrypted(index, bucket):
+        stored_pass = request.headers.get("x-index-password") if request else None
         if not stored_pass:
             raise HTTPException(
                 403,
@@ -145,17 +161,27 @@ async def search(
             )
         try:
             from flatseek.core.query_engine import load_encryption_key
-            index_dir = os.path.join(manager.data_dir, index)
-            key = load_encryption_key(index_dir, stored_pass)
-            manager.get_engine(index).set_key(key)
-            manager.set_password(index, stored_pass)
-        except Exception:
+            if bucket:
+                storage = manager._get_bucket_storage(bucket)
+                enc_data = storage.read_bytes("encryption.json")
+                meta = json.loads(enc_data)
+                key = load_encryption_key(None, stored_pass, meta)
+            else:
+                index_dir = os.path.join(manager.data_dir, index)
+                key = load_encryption_key(index_dir, stored_pass)
+        except Exception as exc:
             raise HTTPException(401, "Invalid passphrase for encrypted index")
 
-    try:
-        engine = manager.get_engine(index)
-    except Exception as e:
-        raise HTTPException(404, f"Index not found: {index}") from e
+        try:
+            engine = manager.get_engine(index, bucket_url=bucket)
+            engine.set_key(key)
+        except Exception as exc:
+            raise HTTPException(401, "Invalid passphrase for encrypted index")
+    else:
+        try:
+            engine = manager.get_engine(index, bucket_url=bucket)
+        except Exception as e:
+            raise HTTPException(404, f"Index not found: {index}") from e
 
     try:
         start = time.perf_counter()
@@ -233,11 +259,12 @@ async def search_get(
     q: str | None = Query(None),
     from_: int = Query(0, ge=0, alias="from"),
     size: int = Query(20, ge=0, le=10000),
+    bucket: str | None = Query(None, description="URL storage bucket (HuggingFace/GitHub URL) for remote indexes"),
     request: Request = None,
     manager: IndexManager = Depends(get_index_manager),
 ):
     """Search with GET (query params only)."""
-    return await search(index, None, q, from_, size, request, manager)
+    return await search(index, None, q, from_, size, bucket, request, manager)
 
 
 @router.get(
@@ -249,11 +276,12 @@ async def search_get(
 async def get_document(
     index: str,
     doc_id: int,
+    bucket: str | None = Query(None, description="URL storage bucket for remote indexes"),
     manager: IndexManager = Depends(get_index_manager),
 ):
     """Get a document by ID."""
     try:
-        engine = manager.get_engine(index)
+        engine = manager.get_engine(index, bucket_url=bucket)
     except Exception as e:
         raise HTTPException(404, f"Index not found: {index}") from e
     
@@ -275,11 +303,12 @@ async def get_document(
 async def multi_search(
     index: str,
     request: list[dict[str, Any]],
+    bucket: str | None = Query(None, description="URL storage bucket for remote indexes"),
     manager: IndexManager = Depends(get_index_manager),
 ):
     """Execute multiple searches."""
     try:
-        engine = manager.get_engine(index)
+        engine = manager.get_engine(index, bucket_url=bucket)
     except Exception as e:
         raise HTTPException(404, f"Index not found: {index}") from e
     
@@ -306,11 +335,12 @@ async def multi_search(
 async def count(
     index: str,
     q: str | None = Query(None),
+    bucket: str | None = Query(None, description="URL storage bucket for remote indexes"),
     manager: IndexManager = Depends(get_index_manager),
 ):
     """Count documents matching a query."""
     try:
-        engine = manager.get_engine(index)
+        engine = manager.get_engine(index, bucket_url=bucket)
     except Exception as e:
         raise HTTPException(404, f"Index not found: {index}") from e
     
