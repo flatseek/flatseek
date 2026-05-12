@@ -16,7 +16,7 @@ try:
     with open(_PYPROJECT_TOML, "rb") as _f:
         API_VERSION = tomllib.load(_f)["project"]["version"]
 except Exception:
-    API_VERSION = "0.1.3"
+    API_VERSION = "0.1.4"
 
 # Configure logging
 logging.basicConfig(
