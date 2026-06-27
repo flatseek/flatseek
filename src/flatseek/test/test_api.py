@@ -88,7 +88,6 @@ class TestIndexCreate:
             # Reset global manager so it picks up the new data_dir
             if _index_manager is not None:
                 _index_manager._engines.clear()
-                _index_manager._index_passwords.clear()
             # Force recreation of the global manager with new data_dir
             import flatseek.api.deps as deps
             deps._index_manager = None

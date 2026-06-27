@@ -1510,6 +1510,22 @@ async def authenticate_index(
     return {"authenticated": True, "index": index, "note": "Pass X-Index-Password header on every request"}
 
 
+@router.delete("/{index}/_authenticate")
+async def logout_index(
+    index: str,
+    bucket: str | None = Query(None, description="URL storage bucket for remote indexes"),
+):
+    """No-op logout for header-auth mode.
+
+    DELETE /my-index/_authenticate
+
+    In X-Index-Password header mode, there is no session to clear —
+    every request carries its own key. This endpoint exists for API
+    compatibility (returns 200 even for unknown indexes).
+    """
+    return {"cleared": True, "index": index}
+
+
 @router.put("/{index}/_mapping")
 async def put_mapping(
     index: str,
