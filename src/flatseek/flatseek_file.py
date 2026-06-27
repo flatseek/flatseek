@@ -294,9 +294,10 @@ class FlatseekPacker:
             for key, path in manifest_paths.items():
                 if path.exists():
                     raw = path.read_bytes()
-                    # Re-encrypt as-is (handles both already-encrypted and plaintext source)
-                    encrypted = self._encrypt_bytes(raw)
-                    manifest_data[key] = encrypted.hex()  # hex for JSON-safe storage
+                    # Only encrypt if not already encrypted (avoid double-encryption)
+                    if not raw.startswith(_ENC_MAGIC):
+                        raw = self._encrypt_bytes(raw)
+                    manifest_data[key] = raw.hex()  # hex for JSON-safe storage
         else:
             # Plaintext source: parse and store as JSON
             for key, path in manifest_paths.items():
@@ -571,14 +572,20 @@ class FlatseekUnpacker:
         # Index
         if SID_INDEX in self.section_data:
             section_bytes = self.section_data[SID_INDEX]
-            # Decrypt section if it starts with FLATSEEK magic (new pack format)
+            # Decrypt section if it starts with FLATSEEK magic (section-level encryption).
+            # Without section magic: section is plaintext — per-file magic inside files
+            # triggers per-file decryption below.
+            section_decrypted = False
             if self.enc_key and section_bytes.startswith(_ENC_MAGIC):
                 section_bytes = self._decrypt_bytes(section_bytes)
+                section_decrypted = True
             idx_files = self._split_section(section_bytes, "index")
             for key, content in idx_files.items():
-                # Decrypt per-file encryption (FLATSEEK magic prefix) if key provided.
-                # Without key: files stay encrypted (user must `flatseek decrypt` separately).
-                if self.enc_key:
+                # Per-file decryption: only if section was NOT decrypted at section level.
+                # If section was decrypted, files inside are plaintext (even if they have
+                # FLATSEEK magic — that was the per-file encryption from the source, and
+                # section-level decrypt already unwrapped it). Re-decrypting would fail.
+                if self.enc_key and not section_decrypted:
                     content = self._decrypt_bytes(content)
                 write_tasks.append((self.output_dir / "index" / key, content))
             print(f"[UNPACK]   Index: {len(idx_files)} files")
@@ -586,11 +593,13 @@ class FlatseekUnpacker:
         # Docs
         if SID_DOCS in self.section_data:
             section_bytes = self.section_data[SID_DOCS]
+            section_decrypted = False
             if self.enc_key and section_bytes.startswith(_ENC_MAGIC):
                 section_bytes = self._decrypt_bytes(section_bytes)
+                section_decrypted = True
             doc_files = self._split_section(section_bytes, "docs")
             for key, content in doc_files.items():
-                if self.enc_key:
+                if self.enc_key and not section_decrypted:
                     content = self._decrypt_bytes(content)
                 write_tasks.append((self.output_dir / "docs" / key, content))
             print(f"[UNPACK]   Docs: {len(doc_files)} chunks")
@@ -598,11 +607,13 @@ class FlatseekUnpacker:
         # DocValues
         if SID_DOC_VALUES in self.section_data:
             section_bytes = self.section_data[SID_DOC_VALUES]
+            section_decrypted = False
             if self.enc_key and section_bytes.startswith(_ENC_MAGIC):
                 section_bytes = self._decrypt_bytes(section_bytes)
+                section_decrypted = True
             dv_files = self._split_section(section_bytes, "dv")
             for key, content in dv_files.items():
-                if self.enc_key:
+                if self.enc_key and not section_decrypted:
                     content = self._decrypt_bytes(content)
                 write_tasks.append((self.output_dir / "dv" / key, content))
             print(f"[UNPACK]   DocValues: {len(dv_files)} files")

@@ -99,6 +99,13 @@ flatseek build ./data.csv -o ./data
 # 3. Serve API + dashboard
 flatseek serve -d ./data
 
+# Pack index into single portable file
+flatseek pack ./data -o ./data.fsk
+
+# Serve API + dashboard from single portable index file
+flatseek serve data.fsk
+
+
 # → API:
 # http://localhost:8000
 
@@ -107,6 +114,10 @@ flatseek serve -d ./data
 
 # 4. Query
 flatseek search ./data "program:raydium AND amount:>1000000"
+
+# Query from single portable file
+flatseek search data.fsk "program:raydium AND amount:>1000000"
+
 ```
 ---
 ## Core Capabilities
