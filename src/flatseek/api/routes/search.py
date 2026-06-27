@@ -2,6 +2,7 @@
 
 import asyncio
 import glob as _glob
+import itertools
 import json
 import logging
 import os
@@ -68,6 +69,16 @@ class MSearchResponse(BaseModel):
     responses: list[dict]
 
 
+# ─── Configurable timeouts (seconds) ────────────────────────────────────────────
+# Override via environment variables before starting serve.
+# FLATSEEK_TIMEOUT_SEARCH   = 300  (default, 5 min)
+# FLATSEEK_TIMEOUT_COUNT     = 120  (default, 2 min)
+# FLATSEEK_TIMEOUT_MSEARCH   = 300  (default, 5 min)
+_SEARCH_TIMEOUT  = int(os.environ.get("FLATSEEK_TIMEOUT_SEARCH",  300))
+_COUNT_TIMEOUT   = int(os.environ.get("FLATSEEK_TIMEOUT_COUNT",   120))
+_MSEARCH_TIMEOUT = int(os.environ.get("FLATSEEK_TIMEOUT_MSEARCH", 300))
+
+
 class ValidateResponse(BaseModel):
     valid: bool = Field(..., example=True)
     query: str = Field(..., example="*")
@@ -114,6 +125,17 @@ async def debug_chunks(index: str, bucket: str | None = Query(None), manager: In
         globbed_count = len(files)
         first_files = sorted(files, key=lambda p: re.search(r"docs_(\d+)", p) or re.search(r"chunks_(\d+)", p) or "")[:5]
 
+    try:
+        await asyncio.to_thread(engine.reload_stats)
+    except Exception as e:
+        try:
+            from cryptography.fernet import InvalidToken
+            if isinstance(e, InvalidToken):
+                raise HTTPException(401, "Invalid passphrase for encrypted index")
+        except ImportError:
+            pass
+        raise HTTPException(500, str(e))
+
     return {
         "docs_dir": docs_dir,
         "storage_url": engine.storage.base_url if hasattr(engine.storage, 'base_url') else str(engine.storage),
@@ -148,17 +170,23 @@ async def search(
     manager: IndexManager = Depends(get_index_manager),
 ):
     """Search with request body or query params."""
-    # Check if index is encrypted and requires password
-    import logging
-    logger = logging.getLogger(__name__)
-    logger.warning(f"[search] is_encrypted({index}, {bucket}) = {manager.is_encrypted(index, bucket)}")
-    if manager.is_encrypted(index, bucket):
+    encrypted = manager.is_encrypted(index, bucket)
+    if encrypted:
+        # Password must come from request header — no global session store
+        # (prevents one user's authenticated session from leaking to others)
         stored_pass = request.headers.get("x-index-password") if request else None
         if not stored_pass:
             raise HTTPException(
                 403,
                 f"Index '{index}' is encrypted. Submit password via POST /{index}/_authenticate"
             )
+
+    try:
+        engine = manager.get_engine(index, bucket_url=bucket)
+    except Exception as e:
+        raise HTTPException(404, f"Index not found: {index}") from e
+
+    if encrypted:
         try:
             from flatseek.core.query_engine import load_encryption_key
             if bucket:
@@ -169,22 +197,19 @@ async def search(
             else:
                 index_dir = os.path.join(manager.data_dir, index)
                 key = load_encryption_key(index_dir, stored_pass)
-        except Exception as exc:
-            raise HTTPException(401, "Invalid passphrase for encrypted index")
-
-        try:
-            engine = manager.get_engine(index, bucket_url=bucket)
             engine.set_key(key)
+            # Reload stats after set_key — encrypted stats.json needs the key to decrypt
+            await asyncio.to_thread(engine.reload_stats)
         except Exception as exc:
             raise HTTPException(401, "Invalid passphrase for encrypted index")
-    else:
-        try:
-            engine = manager.get_engine(index, bucket_url=bucket)
-        except Exception as e:
-            raise HTTPException(404, f"Index not found: {index}") from e
 
     try:
         start = time.perf_counter()
+
+        # Bail early if client already disconnected
+        if request and await request.is_disconnected():
+            raise HTTPException(499, "Client disconnected")
+
         # Priority: body.query > body.q > URL query param q > "*"
         query = body.get('query') if body else None
         if query is None and body:
@@ -210,24 +235,27 @@ async def search(
         # If query contains AND/OR/NOT → use engine.query() (Lucene DSL)
         # If query is just "*" → use engine.search() for fetch-all
         # Otherwise for simple wildcards (*term* without field:) → use engine.search()
-        if query == "*" or query == "":
-            result = engine.search("", page=req_from // max(req_size, 1), page_size=req_size)
-            hits = result.get("results", [])
-            total_hits = result.get("total", 0)
-        elif ":" in query or any(op in query.upper() for op in [" AND ", " OR ", " NOT "]):
-            # Field-specific or DSL query → parse with query engine
-            result = engine.query(query, page=req_from // max(req_size, 1), page_size=req_size)
-            hits = result.get("results", [])
-            total_hits = result.get("total", 0)
-        elif "*" in query or "%" in query:
-            # Cross-column simple wildcard (no field:) → use search
-            result = engine.search(query, page=req_from // max(req_size, 1), page_size=req_size)
-            hits = result.get("results", [])
-            total_hits = result.get("total", 0)
-        else:
-            result = engine.query(query, page=req_from // max(req_size, 1), page_size=req_size)
-            hits = result.get("results", [])
-            total_hits = result.get("total", 0)
+
+        # Helper: run blocking query in thread so cancellation can propagate
+        def _do_query():
+            if query == "*" or query == "":
+                return engine.search("", page=req_from // max(req_size, 1), page_size=req_size)
+            elif ":" in query or any(op in query.upper() for op in [" AND ", " OR ", " NOT "]):
+                return engine.query(query, page=req_from // max(req_size, 1), page_size=req_size)
+            elif "*" in query or "%" in query:
+                return engine.search(query, page=req_from // max(req_size, 1), page_size=req_size)
+            else:
+                return engine.query(query, page=req_from // max(req_size, 1), page_size=req_size)
+
+        # Run with configurable timeout — prevents runaway queries from holding resources
+        try:
+            async with asyncio.timeout(_SEARCH_TIMEOUT):
+                result = await asyncio.to_thread(_do_query)
+        except asyncio.TimeoutError:
+            raise HTTPException(504, f"Query timed out after {_SEARCH_TIMEOUT}s. Try a narrower query.")
+
+        hits = result.get("results", [])
+        total_hits = result.get("total", 0)
 
         return {
             "_index": index,
@@ -243,7 +271,16 @@ async def search(
     except asyncio.CancelledError:
         logger.debug("Search request cancelled by client")
         raise
+    except HTTPException:
+        raise
     except Exception as e:
+        # Wrong key (InvalidToken from decrypt_bytes) → 401, not 500
+        try:
+            from cryptography.fernet import InvalidToken
+            if isinstance(e, InvalidToken):
+                raise HTTPException(401, "Invalid passphrase for encrypted index")
+        except ImportError:
+            pass
         logger.error(f"Search error: {e}")
         raise HTTPException(500, str(e))
 
@@ -277,19 +314,56 @@ async def get_document(
     index: str,
     doc_id: int,
     bucket: str | None = Query(None, description="URL storage bucket for remote indexes"),
+    request: Request = None,
     manager: IndexManager = Depends(get_index_manager),
 ):
     """Get a document by ID."""
+    encrypted = manager.is_encrypted(index, bucket)
+    if encrypted:
+        stored_pass = request.headers.get("x-index-password") if request else None
+        if not stored_pass:
+            raise HTTPException(
+                403,
+                f"Index '{index}' is encrypted. Submit password via POST /{index}/_authenticate"
+            )
+
     try:
         engine = manager.get_engine(index, bucket_url=bucket)
     except Exception as e:
         raise HTTPException(404, f"Index not found: {index}") from e
-    
-    docs = engine._fetch_docs([doc_id])
-    
+
+    if encrypted:
+        try:
+            from flatseek.core.query_engine import load_encryption_key
+            if bucket:
+                storage = manager._get_bucket_storage(bucket)
+                enc_data = storage.read_bytes("encryption.json")
+                meta = json.loads(enc_data)
+                key = load_encryption_key(None, stored_pass, meta)
+            else:
+                index_dir = os.path.join(manager.data_dir, index)
+                key = load_encryption_key(index_dir, stored_pass)
+            engine.set_key(key)
+            await asyncio.to_thread(engine.reload_stats)
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(401, "Invalid passphrase for encrypted index")
+
+    try:
+        docs = await asyncio.to_thread(engine._fetch_docs, [doc_id])
+    except Exception as e:
+        try:
+            from cryptography.fernet import InvalidToken
+            if isinstance(e, InvalidToken):
+                raise HTTPException(401, "Invalid passphrase for encrypted index")
+        except ImportError:
+            pass
+        raise HTTPException(500, str(e))
+
     if not docs:
         raise HTTPException(404, f"Document not found: {doc_id}")
-    
+
     doc = docs[0]
     return {"_index": index, "_id": doc.get("_id", doc_id), "_source": doc}
 
@@ -302,27 +376,71 @@ async def get_document(
 )
 async def multi_search(
     index: str,
-    request: list[dict[str, Any]],
+    body: list[dict[str, Any]],
     bucket: str | None = Query(None, description="URL storage bucket for remote indexes"),
+    request: Request = None,
     manager: IndexManager = Depends(get_index_manager),
 ):
     """Execute multiple searches."""
+    encrypted = manager.is_encrypted(index, bucket)
+    if encrypted:
+        stored_pass = request.headers.get("x-index-password") if request else None
+        if not stored_pass:
+            raise HTTPException(
+                403,
+                f"Index '{index}' is encrypted. Submit password via POST /{index}/_authenticate"
+            )
+
     try:
         engine = manager.get_engine(index, bucket_url=bucket)
     except Exception as e:
         raise HTTPException(404, f"Index not found: {index}") from e
-    
-    responses = []
-    
-    for req in request:
+
+    if encrypted:
+        try:
+            from flatseek.core.query_engine import load_encryption_key
+            if bucket:
+                storage = manager._get_bucket_storage(bucket)
+                enc_data = storage.read_bytes("encryption.json")
+                meta = json.loads(enc_data)
+                key = load_encryption_key(None, stored_pass, meta)
+            else:
+                index_dir = os.path.join(manager.data_dir, index)
+                key = load_encryption_key(index_dir, stored_pass)
+            engine.set_key(key)
+            await asyncio.to_thread(engine.reload_stats)
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(401, "Invalid passphrase for encrypted index")
+
+    async def _run_one(req: dict):
         query = req.get("q") or req.get("query", "*")
         size = req.get("size", 10)
         from_ = req.get("from", 0)
+        result = await asyncio.to_thread(
+            engine.search, query, page=from_ // max(size, 1), page_size=size
+        )
+        return {"hits": {"total": result.get("total", 0), "hits": result.get("results", [])}}
 
-        result = engine.search(query, page=from_ // max(size, 1), page_size=size)
-        
-        responses.append({"hits": {"total": result.get("total", 0), "hits": result.get("results", [])}})
-    
+    # Run all searches in parallel via gather, but individually wrapped in to_thread
+    # so cancellation of any one cancels that thread
+    # Overall timeout prevents runaway multi-search from holding resources
+    try:
+        async with asyncio.timeout(_MSEARCH_TIMEOUT):
+            responses = list(await asyncio.gather(
+                *(_run_one(req) for req in itertools.islice(body, 10))
+            ))
+    except Exception as e:
+        try:
+            from cryptography.fernet import InvalidToken
+            if isinstance(e, InvalidToken):
+                raise HTTPException(401, "Invalid passphrase for encrypted index")
+        except ImportError:
+            pass
+        raise HTTPException(500, str(e))
+    except asyncio.TimeoutError:
+        raise HTTPException(504, f"Multi-search timed out after {_MSEARCH_TIMEOUT}s.")
     return {"responses": responses}
 
 
@@ -336,17 +454,58 @@ async def count(
     index: str,
     q: str | None = Query(None),
     bucket: str | None = Query(None, description="URL storage bucket for remote indexes"),
+    request: Request = None,
     manager: IndexManager = Depends(get_index_manager),
 ):
     """Count documents matching a query."""
+    encrypted = manager.is_encrypted(index, bucket)
+    if encrypted:
+        stored_pass = request.headers.get("x-index-password") if request else None
+        if not stored_pass:
+            raise HTTPException(
+                403,
+                f"Index '{index}' is encrypted. Submit password via POST /{index}/_authenticate"
+            )
+
     try:
         engine = manager.get_engine(index, bucket_url=bucket)
     except Exception as e:
         raise HTTPException(404, f"Index not found: {index}") from e
-    
+
+    if encrypted:
+        try:
+            from flatseek.core.query_engine import load_encryption_key
+            if bucket:
+                storage = manager._get_bucket_storage(bucket)
+                enc_data = storage.read_bytes("encryption.json")
+                meta = json.loads(enc_data)
+                key = load_encryption_key(None, stored_pass, meta)
+            else:
+                index_dir = os.path.join(manager.data_dir, index)
+                key = load_encryption_key(index_dir, stored_pass)
+            engine.set_key(key)
+            # Reload stats after set_key — encrypted stats.json needs the key to decrypt
+            await asyncio.to_thread(engine.reload_stats)
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(401, "Invalid passphrase for encrypted index")
+
     query = q or "*"
-    result = engine.search(query, page_size=0)
-    
+    try:
+        async with asyncio.timeout(_COUNT_TIMEOUT):
+            result = await asyncio.to_thread(engine.search, query, page_size=0)
+    except asyncio.TimeoutError:
+        raise HTTPException(504, f"Count timed out after {_COUNT_TIMEOUT}s. Try a narrower query.")
+    except Exception as e:
+        try:
+            from cryptography.fernet import InvalidToken
+            if isinstance(e, InvalidToken):
+                raise HTTPException(401, "Invalid passphrase for encrypted index")
+        except ImportError:
+            pass
+        raise HTTPException(500, str(e))
+
     return {"_index": index, "count": result.get("total", 0)}
 
 

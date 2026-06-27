@@ -34,7 +34,7 @@ try:
     with open(_PYPROJECT_TOML, "rb") as _f:
         __version__ = tomllib.load(_f)["project"]["version"]
 except Exception:
-    __version__ = "0.1.5"
+    __version__ = "0.2.0"
 
 
 def _parse_columns(columns_str):
@@ -48,14 +48,21 @@ def _prompt_columns(path, delimiter):
     """Interactive: show a file preview, ask whether row 1 is a header,
     collect column names, then confirm/override per-column types.
 
-    Returns (columns, type_overrides) where:
-      columns       – list of names, or None (use file's own header row)
+    Returns (columns, type_overrides, excludes) where:
+      columns        – ordered list of final column names (or None = use file header)
       type_overrides – {col_name: sem_type} for any user-corrected types
+      excludes       – set of original column names to skip from indexing
+
+    Supported prompts:
+      ""            → accept detected type
+      TEXT/KEYWORD  → override semantic type
+      SKIP          → exclude this column from indexing
+      →new_name     → rename column (keeps order, renames key in docs)
 
     Skips entirely when stdin is not a tty (piped / scripted).
     """
     if not sys.stdin.isatty():
-        return None, {}
+        return None, {}, set()
 
     # Read up to 3 raw rows without any header interpretation
     raw_rows = []
@@ -68,10 +75,10 @@ def _prompt_columns(path, delimiter):
                     break
     except Exception as e:
         print(f"  (preview unavailable: {e})")
-        return None, {}
+        return None, {}, set()
 
     if not raw_rows:
-        return None, {}
+        return None, {}, set()
 
     n_cols = len(raw_rows[0])
     sep_label = repr(delimiter)
@@ -94,7 +101,7 @@ def _prompt_columns(path, delimiter):
         ans = input("  Is Row 1 the column header? [Y/n] ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         print()
-        return None, {}
+        return None, {}, set()
 
     if ans in ("", "y", "yes"):
         # Header is fine — still offer type-override step for the existing columns
@@ -115,7 +122,7 @@ def _prompt_columns(path, delimiter):
                 first = input("  Names (comma-sep): ").strip()
             except (EOFError, KeyboardInterrupt):
                 print()
-                return None, {}
+                return None, {}, set()
 
             if not first:
                 continue
@@ -134,7 +141,7 @@ def _prompt_columns(path, delimiter):
                         name = input(prompt).strip()
                     except (EOFError, KeyboardInterrupt):
                         print()
-                        return None, {}
+                        return None, {}, set()
                     cols.append(name if name else f"col_{i}")
             else:
                 print(f"  ✗ Got {len(parts)} names, need {n_cols}. Try again.\n")
@@ -153,78 +160,96 @@ def _prompt_columns(path, delimiter):
 
     detected = {}
     for col in cols:
-        samples = [row[cols.index(col)] for row in sample_rows_data
-                   if cols.index(col) < len(row)]
+        idx = cols.index(col)
+        samples = [row[idx] for row in sample_rows_data if idx < len(row)]
         sem_type, conf = classify_column(col, samples)
         detected[col] = (sem_type, conf)
 
-    # ── Type confirmation prompt ──────────────────────────────────────────────
+    # ── Type confirmation / rename / skip prompt ────────────────────────────
     print(f"\n  ── Column types ──────────────────────────────────────────")
-    print(f"  Available: {types_line}")
-    print(f"  Press Enter to accept detected type, or type a replacement.\n")
+    print(f"  Available types  : {types_line}")
+    print(f"  Rename column   : →new_name   (e.g. →phone, →email_address)")
+    print(f"  Skip column     : SKIP         (column will not be indexed)")
+    print(f"  Accept / next  : Enter\n")
 
     type_overrides = {}
-    i = 0
-    while i < len(cols):
-        col = cols[i]
+    excludes       = set()
+    renamed        = {}   # original → new name
+    final_cols     = []   # ordered list of final column names
+
+    for i, col in enumerate(cols):
         sem_type, conf = detected[col]
-        sample_val = (raw_rows[sample_start][cols.index(col)].strip()
-                      if sample_start < len(raw_rows)
-                      and cols.index(col) < len(raw_rows[sample_start]) else "")
+        sample_val = (raw_rows[sample_start][i].strip()
+                      if sample_start < len(raw_rows) and i < len(raw_rows[sample_start]) else "")
         sample_val = (sample_val[:20] + "…") if len(sample_val) > 20 else sample_val
 
-        prompt = (f"  [{i:>2}] {col:<20} {sample_val!r:<24} "
+        prompt = (f"  [{i:>2}] {col:<22} {sample_val!r:<24} "
                   f"detected: {sem_type:<12} ({conf:.0%})  → ")
         try:
-            ans = input(prompt).strip().lower()
+            ans = input(prompt).strip()
         except (EOFError, KeyboardInterrupt):
             print()
-            break
+            return None, {}, set()
 
         if ans == "a":
             print(f"  Accepting all remaining as detected.")
+            final_cols.extend(cols[j] for j in range(i, len(cols)) if cols[j] not in excludes)
             break
-        elif ans == "" or ans == sem_type:
-            pass   # accept detected
-        elif ans in _TYPES:
-            type_overrides[col] = ans
+        elif ans.upper() == "SKIP":
+            excludes.add(col)
+            print(f"  [{i:>2}] {col}  ← skipped (not indexed)")
+            continue
+        elif ans.startswith("→"):
+            new_name = ans[1:].strip()
+            if not new_name:
+                print(f"  ✗ Rename needs a name after →")
+                i -= 1; continue
+            renamed[col] = new_name
+            final_cols.append(new_name)
+        elif ans == "" or ans.upper() == sem_type:
+            final_cols.append(col)
+        elif ans.upper() in _TYPES:
+            type_overrides[col] = ans.upper()
+            final_cols.append(col)
         else:
-            print(f"  ✗ Unknown type {ans!r}. Valid: {types_line}")
-            continue   # re-prompt same column
-
-        i += 1
+            print(f"  ✗ Unknown input {ans!r}. Valid: type name, SKIP, or →new_name")
+            i -= 1; continue
 
     # ── Summary ──────────────────────────────────────────────────────────────
-    print(f"\n  Final mapping ({len(cols)} columns):")
-    for i, col in enumerate(cols):
-        final_type = type_overrides.get(col, detected[col][0])
-        override_marker = " ← overridden" if col in type_overrides else ""
-        print(f"    [{i:>2}]  {col:<20}  {final_type}{override_marker}")
+    print(f"\n  Final mapping ({len(final_cols)} columns, {len(excludes)} excluded):")
+    for col in final_cols:
+        orig  = next((k for k, v in renamed.items() if v == col), col)
+        ftype = type_overrides.get(orig, detected.get(orig, ("?", 0))[0])
+        marker = f" ← from {orig}" if col != orig else ""
+        print(f"    {col:<24}  {ftype}{marker}")
+    if excludes:
+        print(f"  Excluded: {', '.join(sorted(excludes))}")
     print()
 
     try:
         ok = input("  Apply? [Y/n] ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         print()
-        return None, {}
+        return None, {}, set()
 
     if ok not in ("", "y", "yes"):
         print("  Cancelled.")
-        return None, {}
+        return None, {}, set()
 
-    return (cols if user_provided_names else None), type_overrides
+    return (final_cols if user_provided_names else None), type_overrides, excludes
 
 
 def _resolve_columns(args, csv_src):
-    """Return (columns, type_overrides).
+    """Return (columns, type_overrides, excludes).
 
-    columns       – list of names (None = use file's own header row)
-    type_overrides – {col_name: sem_type} for any corrected types
+    columns        – ordered list of final column names (None = use file header)
+    type_overrides – {col_name: sem_type} for any user-corrected types
+    excludes       – set of original column names to skip from indexing
 
     Resolution order:
       1. --columns flag (no interactive prompt, no type overrides)
       2. Already classified in column_map.json with matching column count → skip
-      3. Interactive prompt (show preview, ask names + types)
+      3. Interactive prompt (show preview, ask names + types + rename + skip)
     """
     columns = _parse_columns(args.columns)
     if columns:
@@ -243,7 +268,7 @@ def _resolve_columns(args, csv_src):
         preview_file = next((f for f in files if f.lower().endswith(".csv")), None)
 
     if not preview_file:
-        return None, {}
+        return None, {}, set()
 
     # Check column_map.json for this file
     output_dir = os.path.abspath(getattr(args, "output", "./data"))
@@ -262,9 +287,10 @@ def _resolve_columns(args, csv_src):
             entry = col_map[file_rel]
             if entry.get("_headerless"):
                 stored = entry.get("_columns", [])
+                excludes = entry.get("_excludes", [])
                 print(f"  File already classified as headerless ({len(stored)} cols). "
                       f"Using stored column names.")
-                return None, {}   # builder reads from column_map
+                return None, {}, set(excludes)   # builder reads from column_map
 
             n_classified = len([k for k in entry if not k.startswith("_")])
             try:
@@ -272,20 +298,20 @@ def _resolve_columns(args, csv_src):
                     first_row = next(csv.reader(f, delimiter=args.sep))
                 n_file = len(first_row)
             except Exception:
-                return None, {}
+                return None, {}, set()
 
             if n_file == n_classified:
                 print(f"  [{os.path.basename(preview_file)}] already classified "
                       f"({n_classified} cols). Run 'flatseek classify' to re-classify.")
-                return None, {}   # unchanged, no prompt needed
+                return None, {}, set()   # unchanged, no prompt needed
             else:
                 print(f"  Column count changed ({n_classified} → {n_file}). Re-classifying.")
 
     # Not yet classified (or columns changed) — prompt interactively
-    columns, type_overrides = _prompt_columns(preview_file, args.sep)
+    columns, type_overrides, excludes = _prompt_columns(preview_file, args.sep)
     if columns:
         print(f"  Using {len(columns)} column name(s) from interactive prompt (first row = data).")
-    return columns, type_overrides
+    return columns, type_overrides, excludes
 
 
 def cmd_classify(args):
@@ -293,10 +319,10 @@ def cmd_classify(args):
     out = args.output or os.path.join("./data", "column_map.json")
     out = os.path.abspath(out)
     csv_src = os.path.abspath(args.csv_dir)
-    columns, type_overrides = _resolve_columns(args, csv_src)
+    columns, type_overrides, excludes = _resolve_columns(args, csv_src)
     print(f"Classifying: {csv_src}")
     build_column_map(csv_src, output_path=out, delimiter=args.sep,
-                     columns=columns, type_overrides=type_overrides)
+                     columns=columns, type_overrides=type_overrides, excludes=excludes)
 
 
 def _run_parallel_build(args, csv_src, output_dir, n_workers):
@@ -364,7 +390,7 @@ def _run_parallel_build(args, csv_src, output_dir, n_workers):
     if not resuming:
         # Show interactive column-type prompt (same as single-worker build).
         # Must happen here, before spawning — workers run non-interactively.
-        columns, type_overrides = _resolve_columns(args, csv_src)
+        columns, type_overrides, excludes = _resolve_columns(args, csv_src)
 
         # Pre-classify ALL files before spawning workers — avoids concurrent
         # writes to column_map.json by N workers starting at the same time.
@@ -374,7 +400,7 @@ def _run_parallel_build(args, csv_src, output_dir, n_workers):
         csv_base  = os.path.dirname(csv_abs) if os.path.isfile(csv_abs) else csv_abs
         print("── Pre-classify ──────────────────────────────────────")
         _auto_classify(all_files, csv_base, col_map_file, delimiter=args.sep,
-                       columns=columns, type_overrides=type_overrides)
+                       columns=columns, type_overrides=type_overrides, excludes=excludes)
 
         plan_data = do_plan(csv_src, output_dir, n_workers=n_workers,
                             delimiter=args.sep, columns=columns)
@@ -385,7 +411,7 @@ def _run_parallel_build(args, csv_src, output_dir, n_workers):
         # corrupt posting lists with double entries.
         _update_manifest_after_parallel(output_dir, plan_data)
     else:
-        columns, type_overrides = _resolve_columns(args, csv_src)
+        columns, type_overrides, excludes = _resolve_columns(args, csv_src)
         remaining = [w for w in range(n_workers) if not _worker_truly_done(w)]
 
     # Columns may have come from the interactive prompt rather than --columns flag.
@@ -676,8 +702,9 @@ def cmd_build(args):
     if plan_path and worker_id is not None:
         columns = _parse_columns(args.columns)
         type_overrides = {}
+        excludes = set()
     else:
-        columns, type_overrides = _resolve_columns(args, csv_src)
+        columns, type_overrides, excludes = _resolve_columns(args, csv_src)
 
     if not map_path:
         candidate = os.path.join(output_dir, "column_map.json")
@@ -691,6 +718,7 @@ def cmd_build(args):
 
     build(csv_src, output_dir, column_map_path=map_path, dataset=args.dataset,
           delimiter=args.sep, columns=columns, type_overrides=type_overrides,
+          excludes=excludes,
           worker_id=worker_id, plan_path=plan_path,
           estimate=getattr(args, "estimate", False),
           dedup_fields=dedup_fields,
@@ -1070,6 +1098,268 @@ def cmd_dedup(args):
     print(f"\nDedup complete: {dupes:,} duplicate docs removed, {kept:,} docs remain.")
 
 
+def cmd_wal(args):
+    """Manage WAL (Write-Ahead Log) files from ongoing builds.
+
+    Actions:
+      info   - Show WAL file statistics
+      merge  - Merge WAL files into index (safe during ongoing build)
+    """
+    import struct, shutil, glob as _glob
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    data_dir = os.path.abspath(args.data_dir)
+    wal_dir  = os.path.join(data_dir, "_wal")
+
+    if not os.path.isdir(wal_dir):
+        print(f"No _wal/ directory found in {data_dir}")
+        return
+
+    if args.wal_action == "info":
+        _cmd_wal_info(wal_dir)
+    elif args.wal_action == "merge":
+        _cmd_wal_merge(wal_dir, data_dir, args)
+    else:
+        print(f"Unknown WAL action: {args.wal_action}")
+        print("Available: info, merge")
+
+
+def _cmd_wal_info(wal_dir):
+    """Show WAL file statistics."""
+    import struct
+
+    try:
+        wal_files = sorted(f for f in os.listdir(wal_dir) if f.endswith(".wal"))
+    except OSError as e:
+        print(f"Cannot read WAL directory: {e}")
+        return
+
+    if not wal_files:
+        print("No WAL files found.")
+        return
+
+    _unpack_5sI = struct.Struct("<5sI")
+    total_bytes = 0
+    prefixes_by_file = []
+
+    for wal_file in wal_files:
+        wal_path = os.path.join(wal_dir, wal_file)
+        size = os.path.getsize(wal_path)
+        total_bytes += size
+        prefixes = set()
+
+        try:
+            with open(wal_path, "rb") as f:
+                data = f.read()
+            i = 0
+            while i + 9 <= len(data):
+                wal_prefix_bytes, data_len = _unpack_5sI.unpack_from(data, i)
+                wal_prefix = wal_prefix_bytes.decode("utf-8", errors="ignore")
+                prefixes.add(wal_prefix)
+                i += 9 + data_len
+        except (OSError, struct.error):
+            pass
+
+        prefixes_by_file.append((wal_file, size, prefixes))
+
+    print(f"WAL Directory: {wal_dir}")
+    print(f"Total files : {len(wal_files)}")
+    print(f"Total size  : {total_bytes / 1024 / 1024:.1f} MB")
+    print()
+    print(f"{'File':<30}  {'Size':>10}  {'Prefixes':>8}")
+    print("-" * 52)
+    all_prefixes = set()
+    for wal_file, size, prefixes in prefixes_by_file:
+        print(f"{wal_file:<30}  {size/1024/1024:>9.1f} MB  {len(prefixes):>8,}")
+        all_prefixes.update(prefixes)
+    print("-" * 52)
+    print(f"{'Total unique prefixes':<30}  {'':<10}  {len(all_prefixes):>8,}")
+
+
+def _cmd_wal_merge(wal_dir, data_dir, args):
+    """Merge WAL files into index as new segment files.
+
+    IMPORTANT: For ongoing builds, the builder now has a built-in WAL flush thread
+    that handles this automatically. Only use this command as a rescue tool for:
+      - Builds that crashed without merging
+      - Builds that don't have the WAL flush thread (old version)
+
+    For ongoing builds with the new WAL flush thread, the builder handles merging
+    every 60 seconds automatically.
+
+    Safety:
+      - Builder writes COMPLETE .wal files per checkpoint cycle (atomic)
+      - We only write NEW idx_segXXXX.bin files
+      - We sync segment counters with existing index to avoid conflicts
+    """
+    import struct
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    dry_run   = args.dry_run
+    n_workers = args.workers or 4
+
+    try:
+        wal_files = sorted(f for f in os.listdir(wal_dir) if f.endswith(".wal"))
+    except OSError as e:
+        print(f"Cannot read WAL directory: {e}")
+        return
+
+    if not wal_files:
+        print("No WAL files to merge.")
+        return
+
+    # Check for merged marker (created by builder's WAL flush thread)
+    marker_path = os.path.join(data_dir, "_wal_merged.txt")
+    merged_set = set()
+    if os.path.exists(marker_path):
+        try:
+            with open(marker_path) as f:
+                merged_set = set(line.strip() for line in f if line.strip())
+        except (OSError, IOError):
+            pass
+
+    # Filter to only files not yet merged
+    unmerged = [f for f in wal_files if f not in merged_set]
+    if not unmerged:
+        print(f"All {len(wal_files)} WAL files already merged.")
+        print(f"  (Use --force to merge anyway)")
+        if not getattr(args, 'force', False):
+            return
+
+    to_merge = wal_files if getattr(args, 'force', False) else unmerged
+    print(f"Merging {len(to_merge)} WAL file(s) → index/")
+    print(f"  ({len(merged_set)} already merged, {len(unmerged)} new)")
+    print(f"Workers    : {n_workers}")
+    print(f"Dry run    : {dry_run}")
+    print()
+
+    # WAL format: [5 bytes prefix "aa/bb"][4 bytes uint32 data_len][N bytes data]
+    _unpack_5sI = struct.Struct("<5sI")
+
+    prefix_entries: dict = {}  # prefix -> list of data_bytes
+    total_entries = 0
+    total_data = 0
+
+    for idx, wal_file in enumerate(to_merge, 1):
+        wal_path = os.path.join(wal_dir, wal_file)
+        try:
+            with open(wal_path, "rb") as f:
+                data = f.read()
+            i = 0
+            entries_in_file = 0
+            while i + 9 <= len(data):
+                wal_prefix_bytes, data_len = _unpack_5sI.unpack_from(data, i)
+                wal_prefix = wal_prefix_bytes.decode("utf-8", errors="ignore")
+                i += 9
+                if i + data_len > len(data):
+                    break  # truncated entry
+                entry_data = data[i:i + data_len]
+                i += data_len
+                entries_in_file += 1
+                if wal_prefix not in prefix_entries:
+                    prefix_entries[wal_prefix] = []
+                prefix_entries[wal_prefix].append(entry_data)
+                total_entries += 1
+                total_data += data_len
+            sys.stderr.write(
+                f"\r  [{idx}/{len(to_merge)}] {wal_file}: "
+                f"{entries_in_file:,} entries | "
+                f"{total_entries:,} total | "
+                f"{total_data / 1024 / 1024:.1f} MB"
+            )
+            sys.stderr.flush()
+        except (OSError, struct.error) as e:
+            print(f"\n  Warning: could not read {wal_file}: {e}")
+
+    sys.stderr.write("\r" + " " * 80 + "\r")
+    print(f"  Prefixes    : {len(prefix_entries):,}")
+    print(f"  Entries     : {total_entries:,}")
+    print(f"  Data        : {total_data / 1024 / 1024:.1f} MB")
+
+    if dry_run:
+        print(f"\n--dry-run: no files written.")
+        return
+
+    # ── Sync segment counters ────────────────────────────────────────────────
+    index_dir = os.path.join(data_dir, "index")
+    os.makedirs(index_dir, exist_ok=True)
+    seg_counters: dict = {}
+
+    def _scan_segs():
+        for root, dirs, files in os.walk(index_dir):
+            for f in files:
+                if f.startswith("idx_seg") and f.endswith(".bin"):
+                    try:
+                        seg_num = int(f.replace("idx_seg", "").replace(".bin", ""))
+                        rel = os.path.relpath(root, index_dir).replace("\\", "/")
+                        if rel == ".":
+                            continue
+                        existing = seg_counters.get(rel, 0)
+                        seg_counters[rel] = max(existing, seg_num)
+                    except (ValueError, IndexError):
+                        pass
+
+    _scan_segs()
+
+    # ── Write segment files in parallel ─────────────────────────────────────
+    def _write_prefix(item):
+        prefix, entries = item
+        # prefix is "aa/bb" — directory is index/aa/bb/
+        seg_dir = os.path.join(index_dir, prefix)
+        os.makedirs(seg_dir, exist_ok=True)
+
+        if prefix not in seg_counters:
+            seg_counters[prefix] = 0
+        seg_counters[prefix] += 1
+        seg_num = seg_counters[prefix]
+        seg_path = os.path.join(seg_dir, f"idx_seg{seg_num:04d}.bin")
+
+        combined = b"".join(entries)
+        with open(seg_path, "wb") as f:
+            f.write(combined)
+        return len(entries), len(combined)
+
+    items = list(prefix_entries.items())
+    written = 0
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        futs = {ex.submit(_write_prefix, item): item for item in items}
+        for fut in as_completed(futs):
+            try:
+                fut.result()
+                written += 1
+            except Exception:
+                pass
+            if written % 1000 == 0:
+                sys.stderr.write(f"\r  Writing: {written:,}/{len(items):,} prefixes …")
+                sys.stderr.flush()
+
+    # ── Update merged marker ─────────────────────────────────────────────────
+    new_merged = merged_set | set(to_merge)
+    try:
+        with open(marker_path, "w") as f:
+            for wf in sorted(new_merged):
+                f.write(wf + "\n")
+    except (OSError, IOError):
+        pass
+
+    # ── Delete merged WAL files (free disk space) ─────────────────────────────
+    deleted = 0
+    for wf in to_merge:
+        wf_path = os.path.join(wal_dir, wf)
+        try:
+            os.unlink(wf_path)
+            deleted += 1
+        except (OSError, PermissionError):
+            pass  # Skip if file is locked or protected
+
+    sys.stderr.write("\r" + " " * 70 + "\r")
+    print(f"  Written  : {written:,} segment files")
+    if deleted:
+        print(f"  Deleted: {deleted} WAL file(s) (freed disk space)")
+    print(f"\nWAL merge complete!")
+    print(f"  Search now uses checkpointed index — no more WAL lookups.")
+
+
 def cmd_encrypt(args):
     """Encrypt all index and doc files in-place with ChaCha20-Poly1305.
 
@@ -1135,6 +1425,12 @@ def cmd_encrypt(args):
         for fn in files:
             if fn.endswith(".zlib"):
                 targets.append(os.path.join(root, fn))
+    # Also encrypt metadata JSON files — they contain column names/types which are sensitive
+    # These are at data_dir level, not inside index/ subdirectory
+    for fn in ("stats.json", "column_map.json", "manifest.json"):
+        p = os.path.join(data_dir, fn)
+        if os.path.exists(p):
+            targets.append(p)
 
     n_already = n_done = n_err = 0
     lock = __import__("threading").Lock()
@@ -2091,6 +2387,20 @@ def main():
     p.add_argument("-w", "--workers", type=int, default=None, metavar="N",
                    help="Parallel workers for rewrite phase (default: min(8, cpu_count))")
 
+    # wal
+    p = sub.add_parser("wal", help="Manage WAL (Write-Ahead Log) files from ongoing builds")
+    sub_wal = p.add_subparsers(dest="wal_action", metavar="ACTION")
+
+    p_merge = sub_wal.add_parser("merge", help="Merge WAL files into index (safe during ongoing build)")
+    p_merge.add_argument("data_dir", help="Index directory with _wal/ folder")
+    p_merge.add_argument("--dry-run", action="store_true", default=False, dest="dry_run",
+                         help="Show what would be merged without writing anything")
+    p_merge.add_argument("--workers", type=int, default=4, metavar="N",
+                         help="Parallel workers for WAL merge (default: 4)")
+
+    p_info = sub_wal.add_parser("info", help="Show WAL file statistics")
+    p_info.add_argument("data_dir", help="Index directory with _wal/ folder")
+
     args = parser.parse_args()
 
     if args.command == "classify":
@@ -2121,6 +2431,8 @@ def main():
         cmd_delete(args)
     elif args.command == "dedup":
         cmd_dedup(args)
+    elif args.command == "wal":
+        cmd_wal(args)
     elif args.command == "plan":
         cmd_plan(args)
     elif args.command == "generate":

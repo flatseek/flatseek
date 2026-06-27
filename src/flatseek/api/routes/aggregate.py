@@ -80,13 +80,21 @@ async def aggregate(
     }
     ```
     """
-    if manager.is_encrypted(index, bucket):
+    encrypted = manager.is_encrypted(index, bucket)
+    if encrypted:
         stored_pass = request.headers.get("x-index-password") if request else None
         if not stored_pass:
             raise HTTPException(
                 403,
-                f"Index '{index}' is encrypted. Submit password via POST /{index}/_authenticate"
+                f"Index '{index}' is encrypted. Passphrase required via X-Index-Password header."
             )
+
+    try:
+        engine = manager.get_engine(index, bucket_url=bucket)
+    except Exception as e:
+        raise HTTPException(404, f"Index not found: {index}") from e
+
+    if encrypted:
         try:
             from flatseek.core.query_engine import load_encryption_key
             if bucket:
@@ -97,29 +105,44 @@ async def aggregate(
             else:
                 index_dir = os.path.join(manager.data_dir, index)
                 key = load_encryption_key(index_dir, stored_pass)
-            manager.get_engine(index, bucket_url=bucket).set_key(key)
+            engine.set_key(key)
+            # Reload stats after set_key — encrypted stats.json needs the key to decrypt
+            await asyncio.to_thread(engine.reload_stats)
         except Exception:
             raise HTTPException(401, "Invalid passphrase for encrypted index")
 
-    try:
-        engine = manager.get_engine(index, bucket_url=bucket)
-    except Exception as e:
-        raise HTTPException(404, f"Index not found: {index}") from e
 
+    _AGG_TIMEOUT = int(os.environ.get("FLATSEEK_TIMEOUT_AGG", 300))
     query = body.get("query", None)
     size = body.get("size", 10)
     aggs = body.get("aggs", {})
 
     try:
-        result = await asyncio.to_thread(
-            engine.aggregate, q=query, aggs=aggs, size=size
-        )
+        # reload_stats + aggregate both decrypt encrypted data — wrong key fails here
+        async with asyncio.timeout(_AGG_TIMEOUT):
+            await asyncio.to_thread(engine.reload_stats)
+            result = await asyncio.to_thread(
+                engine.aggregate, q=query, aggs=aggs, size=size
+            )
         return result
+    except asyncio.TimeoutError:
+        raise HTTPException(504, f"Aggregation timed out after {_AGG_TIMEOUT}s. Try a narrower query or fewer aggregations.")
     except MemoryError as e:
         raise HTTPException(
             503,
             f"Memory limit exceeded: {e}. Try a narrower query or fewer aggregations."
         ) from e
+    except Exception as e:
+        # Wrong key / corrupted encrypted data → 401 (not 500).
+        try:
+            from cryptography.fernet import InvalidToken as _IT
+        except ImportError:
+            _IT = None
+        if _IT is not None and isinstance(e, _IT):
+            raise HTTPException(401, "Invalid passphrase for encrypted index")
+        if isinstance(e, HTTPException):
+            raise e
+        raise   # re-raise other errors as 500
 
 
 @router.get("/{index}/_aggregate", response_model=AggregateResponse)

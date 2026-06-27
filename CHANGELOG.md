@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-06-26
+
+### Live Search During Ongoing Builds
+- **WAL-Aware Query Engine**: Search now reads from both `index/` and `_wal/` directories
+  - Solves the "search returns 0 while aggregate has data" issue during ongoing builds
+  - No more waiting for build to complete before searching
+- **Automatic WAL Flush Thread**: Builder now flushes WAL to index every 60 seconds
+  - Makes index searchable in near real-time while building
+  - Survives builder restart (uses `_wal_merged.txt` marker)
+- **New CLI Commands**:
+  - `flatseek wal info` — show WAL file statistics
+  - `flatseek wal merge` — merge WAL files (rescue tool for builds without flush thread)
+
+### CLI Improvements
+- `wal merge` now detects already-merged files and syncs segment counters
+
 ## [0.1.4] - 2026-05-08
 
 ### Hosting & UX

@@ -861,6 +861,28 @@ class IndexBuilder:
         self._idx_bytes_flushed: int = 0
         self._doc_bytes_flushed: int = 0
 
+        # ── WAL flush thread ───────────────────────────────────────────────────
+        # Periodically merges completed WAL files from _wal/ into the index as
+        # segment files. This makes search up-to-date even while the build is running.
+        # The builder writes COMPLETE .wal files per checkpoint cycle (atomic writes),
+        # so we can safely read and merge them without stopping the build.
+        self._wal_flush_interval = 60  # seconds between WAL flush cycles
+        self._wal_flush_stop = threading.Event()
+        self._wal_flush_thread: threading.Thread | None = None
+        self._wal_merged_files: set = set()   # paths of already-merged WAL files
+        self._wal_flush_lock = threading.Lock()  # guards _wal_merged_files + seg_counters
+        # Load previously merged files from disk (survives builder restart)
+        self._load_merged_wal_marker()
+
+        # Start WAL flush thread unconditionally — it's cheap when no WAL files exist.
+        # No need for --daemon flag; WAL accumulates in non-daemon mode too.
+        self._wal_flush_thread = threading.Thread(
+            target=self._wal_flush_loop,
+            daemon=True,
+            name="flatseek-wal-flush",
+        )
+        self._wal_flush_thread.start()
+
     # ─── Column info ──────────────────────────────────────────────────────────
 
     def _col_info(self, col_name, file_rel):
@@ -1418,7 +1440,243 @@ class IndexBuilder:
         self._pressure_wal_paths.clear()
         sys.stderr.write("\r" + " " * 50 + "\r")
 
-    # ─── Daemon lazy writer ────────────────────────────────────────────────────
+    # ─── WAL flush thread (live index update during build) ─────────────────────
+
+    def _wal_marker_path(self):
+        """Path to the file tracking which WAL files have been merged."""
+        return os.path.join(self.output_dir, "_wal_merged.txt")
+
+    def _load_merged_wal_marker(self):
+        """Load previously merged WAL files (survives builder restart)."""
+        marker = self._wal_marker_path()
+        if os.path.exists(marker):
+            try:
+                with open(marker) as f:
+                    self._wal_merged_files = set(line.strip() for line in f if line.strip())
+            except (OSError, IOError):
+                pass
+
+    def _save_merged_wal_marker(self):
+        """Save merged WAL file list to disk."""
+        marker = self._wal_marker_path()
+        try:
+            with open(marker, "w") as f:
+                for path in sorted(self._wal_merged_files):
+                    f.write(path + "\n")
+        except (OSError, IOError):
+            pass
+
+    def _wal_flush_loop(self):
+        """Background thread: periodically merges completed WAL files into the index.
+
+        Runs every _wal_flush_interval seconds. Each cycle:
+          1. Scan _wal/ for completed .wal files (complete = not currently being written)
+          2. Filter out already-merged files
+          3. Merge each new WAL → index as segment files
+          4. Delete merged WAL files
+          5. Save merged marker
+
+        Safe for concurrent builder writes:
+          - Builder writes WAL files with unique names (idx_cNNNNNN.wal)
+          - We only read+merge complete files, never modify them
+          - We write NEW segment files (idx_segXXXX.bin), never modify existing ones
+          - Finalize will merge all segments when the build completes
+        """
+        while not self._wal_flush_stop.wait(timeout=self._wal_flush_interval):
+            try:
+                self._wal_flush_cycle()
+            except Exception:
+                pass  # Don't let errors kill the thread
+
+    def _wal_flush_cycle(self):
+        """One WAL flush cycle: merge new WAL files into index."""
+        wal_dir = os.path.join(self.output_dir, "_wal")
+        if not os.path.isdir(wal_dir):
+            return
+
+        try:
+            wal_files = sorted(f for f in os.listdir(wal_dir) if f.endswith(".wal"))
+        except (OSError, PermissionError):
+            return
+
+        if not wal_files:
+            return
+
+        # Filter to only new (not yet merged) files
+        new_files = [f for f in wal_files if f not in self._wal_merged_files]
+        if not new_files:
+            return
+
+        # Only flush if there are a few files accumulated (avoid too-frequent flushes)
+        if len(new_files) < 2:
+            return
+
+        self._do_wal_merge(new_files)
+        # Persist updated sizes so serve sees accurate stats without disk walk
+        self._write_partial_stats()
+
+    def flush_wal(self, wait=True):
+        """Manually trigger a WAL flush cycle.
+
+        Can be called from another process or thread while the build is running.
+        By default waits for the flush to complete. Pass wait=False for fire-and-forget.
+
+        Returns the number of WAL files merged.
+        """
+        if not wait:
+            import threading
+            t = threading.Thread(target=self._wal_flush_cycle, daemon=True)
+            t.start()
+            return -1  # indicates async
+
+        self._wal_flush_cycle()
+        return len(self._wal_merged_files)
+
+    def _do_wal_merge(self, wal_files):
+        """Merge a list of WAL files into the index as segment files.
+
+        Thread-safe: uses _wal_flush_lock to guard seg_counters and merged_files set.
+        """
+        if not wal_files:
+            return
+
+        wal_dir = os.path.join(self.output_dir, "_wal")
+        merged_count = 0
+        total_bytes = 0
+
+        # Phase 1: scan all WAL files, collect entries by prefix
+        _struct_hdr = struct.Struct("<5sI")
+        _hdr_size = _struct_hdr.size  # 9 bytes
+
+        # Read all WAL files into memory (WAL files are ~50-75MB each, manageable)
+        prefix_entries: dict = {}  # prefix -> list of data_bytes
+
+        for wal_file in wal_files:
+            wal_path = os.path.join(wal_dir, wal_file)
+            try:
+                with open(wal_path, "rb") as f:
+                    data = f.read()
+            except (OSError, PermissionError):
+                continue
+
+            i = 0
+            entries_in_file = 0
+            while i + _hdr_size <= len(data):
+                prefix_b, dlen = _struct_hdr.unpack_from(data, i)
+                i += _hdr_size
+                if i + dlen > len(data):
+                    break  # truncated entry
+                prefix = prefix_b.decode("utf-8", errors="ignore")
+                entry_data = data[i:i + dlen]
+                i += dlen
+                entries_in_file += 1
+                if prefix not in prefix_entries:
+                    prefix_entries[prefix] = []
+                prefix_entries[prefix].append(entry_data)
+                total_bytes += dlen
+
+        if not prefix_entries:
+            return
+
+        # Phase 2: write segment files
+        index_dir = os.path.join(self.output_dir, "index")
+        os.makedirs(index_dir, exist_ok=True)
+
+        with self._wal_flush_lock:
+            # Detect existing segment counters per prefix dir (safe: we append from highest)
+            # WAL entries use full prefix "aa/bb", matching builder's index structure
+            self._sync_seg_counters(index_dir)
+
+            def _write_prefix(item):
+                prefix, entries = item
+                # prefix is "aa/bb" — create directory index/aa/bb/
+                seg_dir = os.path.join(index_dir, prefix)
+                os.makedirs(seg_dir, exist_ok=True)
+
+                # Increment segment counter for this prefix
+                if prefix not in self._seg_counters:
+                    self._seg_counters[prefix] = 0
+                self._seg_counters[prefix] += 1
+                seg_num = self._seg_counters[prefix]
+                seg_path = os.path.join(seg_dir, f"idx_seg{seg_num:04d}.bin")
+
+                combined = b"".join(entries)
+                with open(seg_path, "wb") as f:
+                    f.write(combined)
+                # Return bytes written so caller can update _idx_bytes_flushed
+                return len(combined)
+
+            from concurrent.futures import ThreadPoolExecutor
+            written = 0
+            bytes_written = 0
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futs = {pool.submit(_write_prefix, item): item for item in prefix_entries.items()}
+                for fut in futs:
+                    try:
+                        bytes_written += fut.result()
+                        written += 1
+                    except Exception:
+                        pass
+            self._idx_bytes_flushed += bytes_written
+
+            # Phase 3: delete merged WAL files only after all segments written
+            for wal_file in wal_files:
+                wal_path = os.path.join(wal_dir, wal_file)
+                try:
+                    os.unlink(wal_path)
+                    self._wal_merged_files.add(wal_file)
+                    merged_count += 1
+                except (OSError, PermissionError):
+                    pass
+
+            self._save_merged_wal_marker()
+
+        tag = "\033[35m[wal-flush]\033[0m"
+        sys.stderr.write(
+            f"  {tag} merged {merged_count} WAL files "
+            f"({written:,} prefixes, {total_bytes>>20}MB → index/)\n"
+        )
+        sys.stderr.flush()
+
+    def _sync_seg_counters(self, index_dir):
+        """Scan index directory to find the highest existing segment number per prefix.
+
+        Called under _wal_flush_lock to safely determine the next segment number.
+        This prevents conflicts when both the builder and WAL flush thread write segments.
+        """
+        for root, dirs, files in os.walk(index_dir):
+            for f in files:
+                if f.startswith("idx_seg") and f.endswith(".bin"):
+                    try:
+                        seg_num = int(f.replace("idx_seg", "").replace(".bin", ""))
+                        # rel is "aa/bb" — the prefix
+                        rel = os.path.relpath(root, index_dir).replace("\\", "/")
+                        if rel == ".":
+                            continue
+                        existing = self._seg_counters.get(rel, 0)
+                        self._seg_counters[rel] = max(existing, seg_num)
+                    except (ValueError, IndexError):
+                        pass
+
+    def _final_wal_flush(self):
+        """Merge any remaining WAL files before finalize.
+
+        Called from finalize() after all indexing is done.
+        Unlike _wal_flush_cycle, this merges ALL remaining WAL files
+        regardless of count.
+        """
+        wal_dir = os.path.join(self.output_dir, "_wal")
+        if not os.path.isdir(wal_dir):
+            return
+        try:
+            wal_files = sorted(f for f in os.listdir(wal_dir) if f.endswith(".wal"))
+        except (OSError, PermissionError):
+            return
+        if not wal_files:
+            return
+
+        sys.stderr.write(f"  [finalize] merging {len(wal_files)} remaining WAL files...\n")
+        self._do_wal_merge(wal_files)
 
     def _lazy_writer_loop(self):
         """Daemon-mode background thread: drains large in-memory buffers to disk.
@@ -1840,11 +2098,20 @@ class IndexBuilder:
         # Resolve effective columns: explicit arg > column_map metadata > None (use file header)
         effective_columns = self.columns
         effective_delimiter = self.delimiter
-        if effective_columns is None and file_rel in self.column_map:
+        if file_rel in self.column_map:
             file_meta = self.column_map[file_rel]
+            # Always use stored delimiter if available (applies to both header and
+            # headerless files — column_map stores it after classify step).
+            stored_delimiter = file_meta.get("_delimiter")
+            if stored_delimiter is not None:
+                effective_delimiter = stored_delimiter
             if file_meta.get("_headerless"):
-                effective_columns  = file_meta.get("_columns")
-                effective_delimiter = file_meta.get("_delimiter", self.delimiter)
+                effective_columns = file_meta.get("_columns")
+
+        # Build-time excludes: columns marked SKIP during classify/prompt are not indexed.
+        file_excludes: set = set()
+        if file_rel in self.column_map:
+            file_excludes = set(self.column_map[file_rel].get("_excludes", []))
 
         size_mb   = os.path.getsize(path) / 1024 ** 2
         ext_lower = ext   # kept for compat with code below that uses ext_lower
@@ -2035,6 +2302,8 @@ class IndexBuilder:
 
                         for row_dict in chunk.to_dict("records"):
                             try:
+                                if file_excludes:
+                                    row_dict = {k: v for k, v in row_dict.items() if k not in file_excludes}
                                 self.add_row(row_dict, headers, file_rel, col_schema)
                                 count += 1
                                 _tick()
@@ -2098,6 +2367,8 @@ class IndexBuilder:
                         try:
                             if len(row) != len(headers):
                                 continue
+                            if file_excludes:
+                                row = {k: v for k, v in row.items() if k not in file_excludes}
                             self.add_row(row, headers, file_rel, col_schema)
                             count += 1
                             _tick()
@@ -2126,6 +2397,8 @@ class IndexBuilder:
                     if skipped < skip_rows:
                         skipped += 1
                         continue
+                    if file_excludes:
+                        row = {k: v for k, v in row.items() if k not in file_excludes}
                     self.add_row(row, headers, file_rel, col_schema)
                     count += 1
                     _tick()
@@ -2193,6 +2466,15 @@ class IndexBuilder:
             self._lazy_writer_stop.set()
             self._lazy_writer_thread.join(timeout=30)
             self._lazy_writer_thread = None
+
+        # Stop the WAL flush thread and do a final merge before finalize.
+        # This ensures any remaining WAL files are merged before we rebuild segments.
+        if self._wal_flush_thread is not None:
+            self._wal_flush_stop.set()
+            self._wal_flush_thread.join(timeout=30)
+            self._wal_flush_thread = None
+        # Final WAL flush: merge any remaining WAL files
+        self._final_wal_flush()
 
         # Wait for any in-flight background checkpoint flush before touching
         # the index files ourselves — avoids concurrent writes to idx.bin.
@@ -3463,7 +3745,8 @@ def _is_unchanged(path, entry):
     return mtime == entry.get("mtime") and size == entry.get("size_bytes")
 
 
-def _auto_classify(files, csv_base, col_map_file, delimiter=",", columns=None, type_overrides=None):
+def _auto_classify(files, csv_base, col_map_file, delimiter=",", columns=None,
+                   type_overrides=None, excludes=None):
     """Classify new files only (from an explicit file list), merge with existing column_map.json."""
     from flatseek.core.classify import classify_file
 
@@ -3475,9 +3758,17 @@ def _auto_classify(files, csv_base, col_map_file, delimiter=",", columns=None, t
     new_classified = 0
     for path in files:
         rel = os.path.relpath(path, csv_base)
-        if rel not in existing:
+        # Always re-classify if _delimiter is missing or differs from current delimiter.
+        # This handles: (a) new files, (b) old column_maps without _delimiter,
+        # (c) rebuilds with a different separator (e.g. comma → #).
+        needs_reclassify = (
+            rel not in existing
+            or existing[rel].get("_delimiter") != delimiter
+        )
+        if needs_reclassify:
             result = classify_file(path, delimiter=delimiter,
-                                   columns=columns, type_overrides=type_overrides)
+                                   columns=columns, type_overrides=type_overrides,
+                                   excludes=excludes)
             existing[rel] = result
             new_classified += 1
             print(f"  Classify {rel}:")
@@ -3486,8 +3777,12 @@ def _auto_classify(files, csv_base, col_map_file, delimiter=",", columns=None, t
                     continue
                 flag = "✓" if info["confidence"] >= 0.8 else "?"
                 print(f"    {col!r:35s} → {info['semantic_type']:12s} ({info['confidence']:.0%}) {flag}")
+        else:
+            # Up to date — ensure _delimiter is stored (was missing before this fix).
+            existing[rel]["_delimiter"] = delimiter
 
-    if new_classified:
+    needs_write = new_classified > 0
+    if needs_write:
         os.makedirs(os.path.dirname(os.path.abspath(col_map_file)), exist_ok=True)
         with open(col_map_file, "w") as f:
             json.dump(existing, f, indent=2, ensure_ascii=False)
@@ -3499,7 +3794,7 @@ def _auto_classify(files, csv_base, col_map_file, delimiter=",", columns=None, t
 
 
 def build(csv_src, output_dir, column_map_path=None, dataset=None, delimiter=",",
-          columns=None, type_overrides=None, worker_id=None, plan_path=None,
+          columns=None, type_overrides=None, excludes=None, worker_id=None, plan_path=None,
           estimate=False, dedup_fields=None, daemon=False, storage=None):
     """Build index from csv_src, which may be a single file or a directory.
 
@@ -3630,7 +3925,8 @@ def build(csv_src, output_dir, column_map_path=None, dataset=None, delimiter=","
     col_map_file = column_map_path or os.path.join(output_dir, "column_map.json")
     print("── Classify ──────────────────────────────────────────")
     column_map = _auto_classify(all_files, csv_base, col_map_file, delimiter=delimiter,
-                                columns=columns, type_overrides=type_overrides)
+                                columns=columns, type_overrides=type_overrides,
+                                excludes=excludes)
 
     # In worker mode (plan_path set): skip manifest-based checkpoint resume.
     # Workers run concurrently and would race on manifest.json; their doc_id

@@ -23,9 +23,11 @@ import re
 import json
 import struct
 import zlib
+import mmap
 import time as _time
 from collections import defaultdict
 from datetime import date as _date
+from pathlib import Path
 
 from flatseek.core.storage import StorageAdapter, create_storage_adapter
 
@@ -119,8 +121,27 @@ def decrypt_bytes(data: bytes, key: bytes) -> bytes:
     ct    = data[_ENC_HEADER_LEN:]
     try:
         return ChaCha20Poly1305(key).decrypt(nonce, ct, None)
-    except Exception:
-        raise ValueError("Decryption failed — wrong key or corrupted data")
+    except Exception as e:
+        # Wrong key → re-raise as InvalidToken so route handlers detect it as 401.
+        _is_wrong_key = False
+        try:
+            from cryptography.fernet import InvalidToken
+            _is_wrong_key = isinstance(e, InvalidToken)
+        except ImportError:
+            pass
+        if not _is_wrong_key:
+            try:
+                from cryptography.exceptions import InvalidTag
+                _is_wrong_key = isinstance(e, InvalidTag)
+            except ImportError:
+                pass
+        if _is_wrong_key:
+            try:
+                from cryptography.fernet import InvalidToken as _IT
+                raise _IT(str(e)) from e
+            except ImportError:
+                raise ValueError(f"Decryption failed (wrong key): {e}")
+        raise ValueError(f"Decryption failed: {e}")
 
 
 def is_encrypted(data: bytes) -> bool:
@@ -172,6 +193,31 @@ def decode_doclist(data):
         prev += val
         ids.append(prev)
     return ids
+
+
+def _decode_wal_chunk(chunk, _S_H, _S_I, term_ids):
+    """Decode a WAL entry data blob into term→doc_ids mapping.
+
+    Reusable across mmap and bytes code paths.
+    """
+    buf_start = 0
+    buf_end = len(chunk)
+    while buf_start + 6 <= buf_end:
+        term_len = _S_H.unpack_from(chunk, buf_start)[0]
+        buf_start += 2
+        if buf_start + term_len > buf_end:
+            break
+        term = chunk[buf_start:buf_start + term_len].decode("utf-8", errors="ignore")
+        buf_start += term_len
+        if buf_start + 4 > buf_end:
+            break
+        pl_len = _S_I.unpack_from(chunk, buf_start)[0]
+        buf_start += 4
+        if buf_start + pl_len > buf_end:
+            break
+        ids = decode_doclist(chunk[buf_start:buf_start + pl_len])
+        buf_start += pl_len
+        term_ids[term] = term_ids.get(term, []) + ids
 
 
 _PREFIX_CACHE: dict = {}
@@ -390,7 +436,15 @@ class QueryEngine:
                 if not os.path.exists(stats_path) and not self.storage.exists(stats_path):
                     raise FileNotFoundError(
                         f"No index found in {data_dir}. Run: flatseek build <csv_dir>")
-                self.stats = json.loads(self.storage.read_bytes(stats_path))
+                # If stats.json is encrypted (starts with FLATSEEK\x01 magic),
+                # the bytes won't be valid JSON. Skip and let reload_stats() re-read
+                # after the key is set via set_key().
+                try:
+                    self.stats = json.loads(self.storage.read_bytes(stats_path))
+                except (json.JSONDecodeError, ValueError):
+                    # Encrypted or malformed — stats will be loaded by reload_stats()
+                    # once a key is provided via set_key()
+                    self.stats = {}
             else:
                 # ── Multi-index mode: root contains per-file sub-indexes ──────────
                 self._sub_engines = [QueryEngine(d, storage) for d in dirs]
@@ -424,6 +478,11 @@ class QueryEngine:
         self._dv_cache: dict = {}   # field → doc_values data (lazy loaded)
         self._mmap_cache = {}        # path → mmap object (reusable across queries)
         self._term_set_cache = {}    # bucket_prefix → frozenset of all terms in bucket
+        # WAL index: prefix → {wal_file: [offset, ...]} built lazily on first scan
+        self._wal_index: dict[str, dict[str, list[int]]] = {}
+        self._wal_index_built: set[str] = set()   # WAL files already indexed
+        # WAL posting cache: prefix → {term: [doc_id, ...]} — persists across queries
+        self._wal_posting_cache: dict[str, dict[str, list[int]]] = {}
 
         # ── Lightweight profiling hooks (enable with env var) ──────────────────
         self._profile: bool = os.environ.get("FLATSEEK_PROFILE", "") == "1"
@@ -449,11 +508,48 @@ class QueryEngine:
         return _PhaseTimer(name, self._profile, self._phase_times)
 
     def reload_stats(self):
-        """Re-read stats.json from disk to pick up changes after a flush."""
+        """Re-read stats.json from disk and refresh sizes if needed.
+
+        stats.json is stale during ongoing builds (not updated by WAL flush).
+        Recalculate sizes from disk so serve shows accurate numbers during a build.
+        For completed builds, stats.json is authoritative and we skip the disk walk.
+        """
         import json
+        from flatseek.core.storage import LocalStorageAdapter
         stats_path = os.path.join(self.data_dir, "stats.json")
         if self.storage.exists(stats_path):
-            self.stats = json.loads(self.storage.read_bytes(stats_path))
+            raw = self.storage.read_bytes(stats_path)
+            # Decrypt if encrypted (starts with FLATSEEK\x01 magic).
+            # InvalidKey / corrupted data → re-raise so the route (wrapped in
+            # asyncio.to_thread) catches it and returns 401.
+            if self._enc_key and is_encrypted(raw):
+                raw = decrypt_bytes(raw, self._enc_key)
+            self.stats = json.loads(raw)
+
+        # Only recalculate sizes during active builds. Detect active build by
+        # presence of WAL files (even if _wal_merged.txt exists from a previous
+        # session, new WAL files mean a new build is in progress).
+        if isinstance(self.storage, LocalStorageAdapter):
+            wal_dir = os.path.join(self.data_dir, "_wal")
+            has_wals = False
+            try:
+                has_wals = any(f.endswith(".wal") for f in os.listdir(wal_dir))
+            except OSError:
+                pass
+            if has_wals:
+                index_size = 0
+                docs_size = 0
+                for root, _, files in os.walk(self.index_dir):
+                    for f in files:
+                        index_size += os.path.getsize(os.path.join(root, f))
+                for root, _, files in os.walk(self.docs_dir):
+                    for f in files:
+                        docs_size += os.path.getsize(os.path.join(root, f))
+                self.stats["index_size_mb"] = round(index_size / 1024 ** 2, 1)
+                self.stats["docs_size_mb"] = round(docs_size / 1024 ** 2, 1)
+                self.stats["total_size_mb"] = round(
+                    self.stats["index_size_mb"] + self.stats["docs_size_mb"], 1
+                )
 
     def set_key(self, key: bytes):
         """Supply the decryption key for an encrypted index.
@@ -528,6 +624,151 @@ class QueryEngine:
         self._term_set_cache[prefix] = None
         return None
 
+    # ─── WAL (Write-Ahead Log) reader ─────────────────────────────────────────
+
+    def _read_wal_postings(self, prefix):
+        """Read all WAL files and return {term: [doc_ids]} for a bucket prefix.
+
+        WAL format (written by builder._write_pressure_wal):
+          [5 bytes  : prefix string "xx/yy"          ]
+          [4 bytes  : uint32 data length              ]
+          [N bytes  : raw binary posting data          ]
+            ↳ same binary format as idx.bin entries:
+              [2 bytes term_len][N bytes term][4 bytes pl_len][delta-varint doc_ids]
+
+        This enables search on ongoing builds where the index hasn't been
+        checkpointed yet — the inverted index is still in WAL buffers.
+        """
+        # ── Fast path: return cached postings for this prefix ───────────────────
+        # After the first scan of each WAL file, the posting data is cached here.
+        # Subsequent queries on the same prefix hit this cache instantly.
+        #
+        # Cache safety: only use cache when ALL WAL files have been indexed
+        # (meaning _wal_index_built has every .wal file).  During an active build,
+        # new WAL files appear continuously; using the cache would return stale
+        # results missing the newest entries.
+        _wal_dir = os.path.join(self.data_dir, "_wal")
+        _all_indexed = True
+        try:
+            _current_wals = set(f for f in os.listdir(_wal_dir) if f.endswith(".wal"))
+            if _current_wals - self._wal_index_built:
+                _all_indexed = False
+        except (OSError, PermissionError):
+            _all_indexed = False
+
+        if _all_indexed and prefix in self._wal_posting_cache:
+            return self._wal_posting_cache[prefix]
+
+        # ── Slow path: scan WAL files lazily ─────────────────────────────────────
+        # Each WAL file is scanned once, building an in-memory index of
+        # prefix → [(offset, data_len), ...].  After indexing, we read and
+        # decode only the entries matching |prefix|.
+        # Subsequent queries reuse the index without re-scanning.
+        #
+        # If a persisted index exists (_wal_index.json), load it to skip the
+        # full scan on cold-start sessions.
+        from flatseek.core.storage import LocalStorageAdapter
+        if not isinstance(self.storage, LocalStorageAdapter):
+            return {}
+
+        wal_dir = os.path.join(self.data_dir, "_wal")
+        if not os.path.isdir(wal_dir):
+            return {}
+
+        # Skip WAL files already merged to the checkpointed index
+        merged_path = os.path.join(self.data_dir, "_wal_merged.txt")
+        try:
+            merged_wal: set = set()
+            with open(merged_path, "r") as f:
+                for line in f:
+                    name = line.strip()
+                    if name.endswith(".wal"):
+                        merged_wal.add(name)
+        except (OSError, FileNotFoundError):
+            merged_wal = set()
+
+        try:
+            wal_files = sorted(f for f in os.listdir(wal_dir) if f.endswith(".wal"))
+        except (OSError, PermissionError):
+            return {}
+
+        if not wal_files:
+            return {}
+
+        term_ids: dict = {}
+        _S_H = struct.Struct("<H")
+        _S_I = struct.Struct("<I")
+        _S_5sI = struct.Struct("<5sI")
+
+        for wal_file in wal_files:
+            if wal_file in merged_wal:
+                continue  # Already in checkpointed index
+
+            wal_path = os.path.join(wal_dir, wal_file)
+
+            # ── Pass 1: build prefix index (one-time, reads full file) ─────────────
+            if wal_file not in self._wal_index_built:
+                try:
+                    with open(wal_path, "rb") as f:
+                        data = f.read()
+                except (OSError, PermissionError, EOFError):
+                    continue
+                idx: dict[str, list[tuple]] = {}
+                i = 0
+                while i + 9 <= len(data):
+                    wal_prefix_bytes, data_len = _S_5sI.unpack_from(data, i)
+                    wal_prefix = wal_prefix_bytes.decode("utf-8", errors="ignore")
+                    i += 9
+                    if i + data_len > len(data):
+                        break  # truncated
+                    if data_len > 0:  # skip zero-length padding entries
+                        idx.setdefault(wal_prefix, []).append((i, data_len))
+                    i += data_len
+                self._wal_index[wal_file] = idx
+                self._wal_index_built.add(wal_file)
+                # Decode using the same data we just read (no extra I/O)
+                chunk_offsets = idx.get(prefix)
+                if chunk_offsets:
+                    for entry_start, dl in chunk_offsets:
+                        chunk = data[entry_start:entry_start + dl]
+                        _decode_wal_chunk(chunk, _S_H, _S_I, term_ids)
+                continue
+
+            # ── Pass 2: for already-indexed files, use mmap for selective reads ──
+            offsets = self._wal_index.get(wal_file, {}).get(prefix)
+            if not offsets:
+                continue
+
+            mmap_key = wal_path
+            cached = self._mmap_cache.get(mmap_key)
+            if cached is None:
+                try:
+                    fh = open(wal_path, "rb")
+                    m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+                    self._mmap_cache[mmap_key] = (m, fh)
+                    cached = (m, fh)
+                except (OSError, PermissionError, ValueError):
+                    cached = None  # force bytes fallback below
+
+            if cached is not None:
+                mmap_obj, fh = cached
+                for entry_start, dl in offsets:
+                    chunk = mmap_obj[entry_start:entry_start + dl]
+                    _decode_wal_chunk(chunk, _S_H, _S_I, term_ids)
+            else:
+                try:
+                    with open(wal_path, "rb") as f:
+                        data = f.read()
+                    for entry_start, dl in offsets:
+                        chunk = data[entry_start:entry_start + dl]
+                        _decode_wal_chunk(chunk, _S_H, _S_I, term_ids)
+                except (OSError, PermissionError):
+                    continue
+
+        # Cache so the next query on this prefix is instant
+        self._wal_posting_cache[prefix] = term_ids
+        return term_ids
+
     # ─── Index file lookup ────────────────────────────────────────────────────
 
     def _read_posting(self, term):
@@ -536,6 +777,9 @@ class QueryEngine:
         Reads ALL *.bin files in the bucket directory — supports both single-builder
         (idx.bin) and distributed/parallel builds (idx_w0.bin, idx_w1.bin, …).
         Merges all doc_id lists into a single sorted, deduplicated result.
+
+        Also reads WAL files from _wal/ to support search on ongoing builds
+        where the inverted index hasn't been checkpointed to disk yet.
 
         Uses mmap for hot files (OS page cache), _hot_postings for
         never-evicted persistent cache, and bucket term sets for O(1) fast-reject.
@@ -549,20 +793,24 @@ class QueryEngine:
         bucket_dir = os.path.join(self.index_dir, prefix)
 
         from flatseek.core.storage import LocalStorageAdapter
-        if isinstance(self.storage, LocalStorageAdapter):
-            if not self.storage.exists(bucket_dir) and not os.path.isdir(bucket_dir):
-                return []
+        bucket_exists = (isinstance(self.storage, LocalStorageAdapter)
+                         and (self.storage.exists(bucket_dir) or os.path.isdir(bucket_dir)))
 
         # Fast reject: if bucket has a term-set file and term is not in it,
-        # skip all posting file reads entirely (2x–4x speedup for non-existent terms)
-        term_set = self._load_bucket_term_set(prefix)
+        # skip all posting file reads entirely (2x–4x speedup for non-existent terms).
+        # NOTE: term_set covers only checkpointed index data — WAL data may have terms
+        # not yet in term_set, so fast-reject only applies when bucket exists (has index).
+        term_set = self._load_bucket_term_set(prefix) if bucket_exists else None
         if term_set is not None and term not in term_set:
             return []
 
         # Use storage adapter for listing if remote, otherwise fall back to os.listdir
         from flatseek.core.storage import LocalStorageAdapter, URLStorageAdapter
         if isinstance(self.storage, LocalStorageAdapter):
-            bin_files = sorted(f for f in os.listdir(bucket_dir) if f.endswith(".bin"))
+            if bucket_exists:
+                bin_files = sorted(f for f in os.listdir(bucket_dir) if f.endswith(".bin"))
+            else:
+                bin_files = []
         elif isinstance(self.storage, URLStorageAdapter):
             # URL mode optimization: skip listdir entirely.
             # We already know bucket_dir from term_hash, so directly check
@@ -587,8 +835,14 @@ class QueryEngine:
                 if self.storage.exists(bin_path):
                     bin_files.append(pattern)
 
-        if not bin_files:
-            return []
+        # ── Merge WAL postings (for ongoing builds only) ─────────────────────────
+        # WAL files contain unflushed index buffers from in-progress builds.
+        # Once _wal_merged.txt exists, all WAL data has been checkpointed → skip WAL.
+        # Skip WAL entirely when the merged marker exists (build is complete).
+        wal_ids: list = []
+        merged_marker = os.path.join(self.data_dir, "_wal_merged.txt")
+        if not os.path.isfile(merged_marker):
+            wal_ids = self._read_wal_postings(prefix).get(term, [])
 
         # Check bounded LRU cache
         cached = self._posting_cache.get(term)
@@ -620,7 +874,11 @@ class QueryEngine:
                     all_ids.extend(decode_doclist(data[offset:offset + pl_len]))
                 offset += pl_len
 
+        all_ids.extend(wal_ids)
+
         result = sorted(set(all_ids)) if all_ids else []
+
+        # ── Promote to hot cache ───────────────────────────────────────────────
         # Promote to hot cache if term looks like a common filter (column:value with
         # common column names).  Terms with very large posting lists are excluded.
         _COMMON_COLUMNS = frozenset({"status", "type", "program", "service", "level",
@@ -748,7 +1006,32 @@ class QueryEngine:
         if not clean:
             return []
 
+        # Auto-wildcard: bare term with @ or . (e.g. "gmail.com", "user@") →
+        # treat as partial match so "@gmail.com" finds all emails containing it
+        # without requiring user to type *gmail.com*
+        if not column and not has_wildcard and ("@" in term or "." in term):
+            has_wildcard = True
+            clean = f"*{clean}*"
+
         col_prefix = f"{column}:" if column else ""
+
+        # Date field shortcuts: dob:month=11, dob:year=1997
+        # Resolves to YYYYMMDD range so existing DATE-stored values work without rebuild.
+        if not has_wildcard:
+            _DATE_MONTH_SHORTCUT = re.match(r"^month=(\d{1,2})$", clean)
+            _DATE_YEAR_SHORTCUT  = re.match(r"^year=(\d{4})$", clean)
+            if column and _DATE_MONTH_SHORTCUT:
+                m = int(_DATE_MONTH_SHORTCUT.group(1))
+                if 1 <= m <= 12:
+                    _MONTH_DAYS = [0, 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+                    lo = f"0000{m:02d}01"
+                    hi = f"9999{m:02d}{_MONTH_DAYS[m]:02d}"
+                    return self._resolve_range(column, "between", lo, hi)
+            if column and _DATE_YEAR_SHORTCUT:
+                y = int(_DATE_YEAR_SHORTCUT.group(1))
+                lo = f"{y}0101"
+                hi = f"{y}1231"
+                return self._resolve_range(column, "between", lo, hi)
 
         if not has_wildcard:
             ids = self._read_posting(f"{col_prefix}{clean}")
@@ -790,11 +1073,21 @@ class QueryEngine:
         _seen_tg: set = set()
         tgs: list = []
         for _seg in _lit_segs:
-            for _i in range(len(_seg) - 2):
-                _tg = _seg[_i:_i+3]
+            # Strip non-alphanumeric chars (dots, @, hyphens) from each segment
+            # before extracting trigrams. Without this, "gmail.com" → trigrams "il.",
+            # ".co", "l.c" which never appear in any indexed field → empty result.
+            _seg_clean = re.sub(r"[^a-z0-9]", "", _seg.lower())
+            for _i in range(len(_seg_clean) - 2):
+                _tg = _seg_clean[_i:_i+3]
                 if _tg not in _seen_tg:
                     _seen_tg.add(_tg)
                     tgs.append(_tg)
+
+        # Email/domain patterns (contain @ or .): skip trigram intersection entirely.
+        # Trigrams break on dots/@, so "gmail" and "com" are matched as separate
+        # words instead of one substring — leads to false-negative or tiny results.
+        # Fall straight to _wildcard_fallback for accurate substring matching.
+        _skip_trigrams = not column and bool(re.search(r"[@.]", clean.lstrip("*%")))
 
         if not tgs:
             # All literal segments are < 3 chars — no trigrams available.
@@ -806,6 +1099,11 @@ class QueryEngine:
             ids = self._read_posting(f"{col_prefix}{clean}")
             return sorted(ids)
 
+        if _skip_trigrams:
+            # Email-like pattern: trigrams can't handle dot-separated substrands.
+            # Go straight to full bucket scan.
+            return self._wildcard_fallback(clean, column, has_wildcard, col_prefix)
+
         if column:
             # Column-scoped wildcard: read all trigram posting lists, then intersect
             # smallest→largest so rare trigrams prune the candidate set early.
@@ -813,6 +1111,10 @@ class QueryEngine:
             for tg in tgs:
                 ids = self._read_posting(f"{col_prefix}~{tg}")
                 if not ids:
+                    # No trigram index OR intersection empty — try wildcard fallback
+                    # for email-like patterns (dots/@ break trigram consecutive matching)
+                    if re.search(r"[@.]", clean.lstrip("*")):
+                        return self._wildcard_fallback(clean, column, has_wildcard, col_prefix)
                     return []
                 tg_lists.append(ids)
             tg_lists.sort(key=len)   # rarest (smallest) first → fastest intersection
@@ -848,6 +1150,11 @@ class QueryEngine:
                 if col_result:
                     result |= col_result
             candidates = sorted(result)
+            # If trigram intersection is empty but term has dots/@ (email-like),
+            # fall back to regex scan — trigrams fail because "gmail" and "com"
+            # are separated by a dot, breaking consecutive char matching.
+            if not candidates and (re.search(r"[@.]", clean.lstrip("*"))):
+                return self._wildcard_fallback(clean, column, has_wildcard, col_prefix)
             if len(candidates) > _MAX_WILDCARD_CANDIDATES:
                 return self._wildcard_fallback(clean, column, has_wildcard, col_prefix)
 
@@ -876,6 +1183,11 @@ class QueryEngine:
         prefix = clean.lstrip('%*')
         prefix = prefix.rstrip('%*')
 
+        # Email/domain patterns (contain @ or .): treat as both-side wildcard
+        # even without explicit * so "gmail.com" matches "user@gmail.com".
+        if not starts_wild and not ends_wild and re.search(r"[@.]", prefix):
+            starts_wild = ends_wild = True
+
         if not prefix:
             return []
 
@@ -901,6 +1213,62 @@ class QueryEngine:
             cols_to_scan = [column]
         else:
             cols_to_scan = list(self.columns())
+
+        # For email-like patterns (@ or .), per-column bucket scanning misses terms
+        # because "email:gmail.com" is stored in bucket(term_hash("email:gmail.com"))
+        # = "28/c2", NOT in bucket(term_hash("email")) = "e7/92".  Instead, scan
+        # ALL buckets so every indexed term is checked against the pattern.
+        _scan_all = not column and bool(re.search(r"[@.]", clean.lstrip("*%")))
+
+        if _scan_all:
+            # Wildcard email/domain scan: iterate all first-level buckets.
+            # This is slower but necessary for email/domain partial matching.
+            for root, dirs, files in os.walk(self.index_dir):
+                if checked_terms >= max_terms_check:
+                    break
+                for bin_file in files:
+                    if not bin_file.endswith(".bin"):
+                        continue
+                    if checked_terms >= max_terms_check:
+                        break
+                    bin_path = os.path.join(root, bin_file)
+                    try:
+                        data = self._mmap_read(bin_path)
+                        if not data:
+                            continue
+                        if is_encrypted(data):
+                            try:
+                                data = self._decrypt_if_needed(data)
+                            except Exception:
+                                continue
+                        if len(data) >= 2 and data[0] == 0x78 and data[1] in (0x01, 0x5e, 0x9c, 0xda):
+                            data = zlib.decompress(data)
+                    except Exception:
+                        continue
+                    offset = 0
+                    while offset + 2 <= len(data) and checked_terms < max_terms_check:
+                        term_len = struct.unpack_from("<H", data, offset)[0]; offset += 2
+                        if offset + term_len > len(data):
+                            break
+                        try:
+                            stored = data[offset:offset + term_len].decode("utf-8"); offset += term_len
+                        except UnicodeDecodeError:
+                            offset += term_len
+                            if offset + 4 > len(data):
+                                break
+                            pl_len = struct.unpack_from("<I", data, offset)[0]; offset += 4
+                            continue
+                        if offset + 4 > len(data):
+                            break
+                        pl_len = struct.unpack_from("<I", data, offset)[0]; offset += 4
+                        checked_terms += 1
+                        # Match against the full stored term (includes column prefix)
+                        if rx.match(stored):
+                            all_ids.update(decode_doclist(data[offset:offset + pl_len]))
+                            if len(all_ids) > _MAX_VERIFIED_RESULTS:
+                                return sorted(all_ids)[:_MAX_VERIFIED_RESULTS]
+                        offset += pl_len
+            return sorted(all_ids)
 
         for col_key in cols_to_scan:
             if checked_terms >= max_terms_check:
@@ -1070,8 +1438,37 @@ class QueryEngine:
                 raw = _decompress_doc(blob)
                 chunk = {int(k): v for k, v in _doc_loads(raw).items()}
                 yield chunk_start, chunk
-            except Exception:
-                pass
+            except Exception as e:
+                # Wrong key (InvalidToken from decrypt_bytes) → propagate so
+                # callers get 401.  Other errors (bad file, decompress failure)
+                # → silently skip this chunk.
+                try:
+                    from cryptography.fernet import InvalidToken
+                except ImportError:
+                    InvalidToken = None
+                if InvalidToken is not None and isinstance(e, InvalidToken):
+                    raise
+
+    def _find_first_chunk_path(self):
+        """Return the path of the first chunk file, or None if no chunks."""
+        import glob as _glob
+        pattern = os.path.join(self.docs_dir, "**", "*.zlib")
+        files = _glob.glob(pattern, recursive=True)
+        if not files:
+            pattern2 = os.path.join(self.docs_dir, "chunks_*.zlib")
+            files = _glob.glob(pattern2)
+        if not files:
+            return None
+
+        def _chunk_num(p):
+            m = re.search(r"docs_(\d+)", p.replace("\\", "/"))
+            if not m:
+                m = re.search(r"chunks_(\d+)", p.replace("\\", "/"))
+            if not m:
+                m = re.match(r"(\d+)", os.path.basename(p))
+            return int(m.group(1)) if m else 0
+
+        return sorted(files, key=_chunk_num)[0]
 
     def _scan_doc_ids(self, max_ids=None):
         """Iterate chunk files and yield actual stored doc IDs in order.
@@ -1317,6 +1714,14 @@ class QueryEngine:
         # For match-all on a single index, scan chunks directly to get actual
         # stored docs — skips gaps left by dedup (IDs are not always consecutive).
         if is_match_all:
+            # Validate key early for encrypted indexes (even with page_size=0,
+            # which causes _fetch_page_from_chunks to exit before touching chunks).
+            if self._enc_key and self.docs_dir:
+                first_chunk = self._find_first_chunk_path()
+                if first_chunk:
+                    blob = self.storage.read_bytes(first_chunk)
+                    if is_encrypted(blob):
+                        blob = self._decrypt_if_needed(blob)  # raises InvalidToken on wrong key
             real_total = self.stats.get("total_docs", 0)
             docs = self._fetch_page_from_chunks(page, page_size)
             return {"total": real_total, "page": page, "page_size": page_size, "results": docs}
@@ -1687,6 +2092,64 @@ class QueryEngine:
         """
         current_year = _date.today().year
         op = args[0]
+
+        # ── DATE field between: dob between 00001101 and 99991130 ─────────────
+        # Handles dob:month=11 → between "00001101" "99991130"
+        # and dob:year=1997 → between "19970101" "19971231"
+        _DATE_FIELDS = None   # lazily resolved
+        if op == 'between' and len(args) == 3:
+            lo_str, hi_str = str(args[1]), str(args[2])
+            if len(lo_str) == 8 and len(hi_str) == 8 and lo_str.isdigit() and hi_str.isdigit():
+                # Resolve DATE fields from column type
+                if _DATE_FIELDS is None:
+                    _DATE_FIELDS = {c for c, t in self.columns().items() if t == 'DATE'}
+                if field in _DATE_FIELDS:
+                    # Use exact match on year token for year ranges
+                    # and full YYYYMMDD comparison for month ranges
+                    lo_y_match = re.match(r'^(\d{4})0101$', lo_str)
+                    hi_y_match = re.match(r'^(\d{4})1231$', hi_str)
+                    if lo_y_match and hi_y_match:
+                        # Full year range: 19970101 to 19971231 → union of year tokens
+                        lo_y = int(lo_y_match.group(1))
+                        hi_y = int(hi_y_match.group(1))
+                        return self._year_range_ids(field, lo_y, hi_y)
+                    else:
+                        # Month range: 00001101 to 99991130 → scan all years,
+                        # check month digits (pos 4-5) match lo month
+                        month_digit = lo_str[4:6]   # e.g. '11' for November
+                        year_start = int(lo_str[:4]) if lo_str[:4] != '0000' else 1900
+                        year_end   = int(hi_str[:4]) if hi_str[:4] != '9999' else current_year
+                        day_start  = int(lo_str[6:8]) if lo_str[6:8] != '00' else 1
+                        day_end    = int(hi_str[6:8]) if hi_str[6:8] != '00' else 31
+
+                        result = set()
+                        by_chunk = {}
+                        chunk_start_fn = self._chunk_start
+                        total = self.stats.get("total_docs", 0)
+                        for doc_id in range(total):
+                            cs = chunk_start_fn(doc_id)
+                            if cs not in by_chunk:
+                                by_chunk[cs] = []
+                            by_chunk[cs].append(doc_id)
+                        load_chunk = self._load_chunk
+                        for cs in sorted(by_chunk):
+                            chunk = load_chunk(cs)
+                            for doc_id in by_chunk[cs]:
+                                row = chunk.get(doc_id, {})
+                                fval = _get_nested_value(row, field)
+                                if fval and len(fval) == 8 and fval.isdigit():
+                                    # Check: year in range, month matches, day in range
+                                    try:
+                                        yr  = int(fval[0:4])
+                                        mon = int(fval[4:6])
+                                        day = int(fval[6:8])
+                                        if (year_start <= yr <= year_end and
+                                                mon == int(month_digit) and
+                                                day_start <= day <= day_end):
+                                            result.add(doc_id)
+                                    except ValueError:
+                                        pass
+                        return result
 
         # ── umur / age → birthday year range (inverted) ──────────────────────
         _AGE_FIELDS = {'umur', 'age', 'usia'}

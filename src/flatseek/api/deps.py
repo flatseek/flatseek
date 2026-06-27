@@ -28,7 +28,6 @@ class IndexManager:
 
     def __init__(self):
         self._engines: dict[str, Any] = {}
-        self._index_passwords: dict[str, str] = {}
         # Shared default storage adapter
         self._storage: StorageAdapter = create_storage_adapter()
         # Per-bucket URL storage adapters (key = bucket URL)
@@ -38,27 +37,6 @@ class IndexManager:
     def data_dir(self) -> str:
         """Data directory, read dynamically from environment."""
         return os.environ.get("FLATSEEK_DATA_DIR", DEFAULT_DATA_DIR)
-
-    def set_password(self, index: str, password: str, bucket_url: str | None = None) -> None:
-        """Store password for an index. For bucket URLs, include bucket in key to avoid collisions."""
-        key = f"{bucket_url}::{index}" if bucket_url else index
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.warning(f"[deps] set_password index={index} bucket={bucket_url} key={key}")
-        self._index_passwords[key] = password
-
-    def get_password(self, index: str, bucket_url: str | None = None) -> str | None:
-        """Get stored password for an index. For bucket URLs, include bucket in key."""
-        key = f"{bucket_url}::{index}" if bucket_url else index
-        password = self._index_passwords.get(key)
-        import logging
-        logging.warning(f"[deps] get_password index={index} bucket={bucket_url} key={key} -> password={'SET' if password else 'NONE'}")
-        return password
-
-    def clear_password(self, index: str, bucket_url: str | None = None) -> None:
-        """Remove stored password for an index."""
-        key = f"{bucket_url}::{index}" if bucket_url else index
-        self._index_passwords.pop(key, None)
 
     def is_encrypted(self, index: str, bucket_url: str | None = None) -> bool:
         """Check if a specific index is encrypted.
@@ -187,7 +165,14 @@ class IndexManager:
                 for path in possible_paths:
                     if os.path.isdir(os.path.join(path, "index")):
                         engine = QueryEngine(path, storage=self._storage)
-                        self._engines[cache_key] = engine
+                        # Never cache encrypted local indexes — they require a per-session
+                        # key that must not leak to other sessions
+                        if not self.is_encrypted(index, bucket_url):
+                            self._engines[cache_key] = engine
+                        else:
+                            # For encrypted indexes, always return a fresh engine to prevent
+                            # a previous request's key from leaking into this request.
+                            pass
                         break
 
         if engine is None:

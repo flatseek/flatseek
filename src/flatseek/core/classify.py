@@ -299,30 +299,37 @@ def _sample_file(path, sample_rows=300, delimiter=",", columns=None):
     return [], []
 
 
-def classify_file(path, sample_rows=300, delimiter=",", columns=None, type_overrides=None):
+def classify_file(path, sample_rows=300, delimiter=",", columns=None,
+                  type_overrides=None, excludes=None):
     """Classify all columns in a CSV or JSON file.
 
     columns:        explicit list of column names for headerless files.
     type_overrides: {col_name: sem_type} — user-confirmed types that bypass auto-detection.
+    excludes:       set of original column names to skip from indexing.
 
     Returns:
-        {original_col_name: {semantic_type, canonical_key, confidence},
+        {final_col_name: {semantic_type, canonical_key, confidence},
          "_headerless": True,          # only present when columns were provided
          "_columns": ["col1", ...],    # stored so builder can re-use on resume
-         "_delimiter": "#"}            # stored for the same reason
+         "_delimiter": "#",             # stored for the same reason
+         "_excludes": ["salary", ...]}  # excluded column names
     """
     headers, rows = _sample_file(path, sample_rows, delimiter=delimiter, columns=columns)
     if not headers:
         return {}
 
+    excludes = excludes or set()
     overrides = type_overrides or {}
+
     result = {}
     for col in headers:
+        if col in excludes:
+            continue   # excluded — don't classify or store
         if col in overrides:
             sem_type   = overrides[col]
             confidence = 1.0   # user explicitly specified
         else:
-            samples    = [r.get(col, "") for r in rows]
+            samples = [row.get(col, "") for row in rows]
             sem_type, confidence = classify_column(col, samples)
         canonical = _norm(col)
         result[col] = {
@@ -336,19 +343,29 @@ def classify_file(path, sample_rows=300, delimiter=",", columns=None, type_overr
     if columns:
         result["_headerless"] = True
         result["_columns"]    = list(columns)
-        result["_delimiter"]  = delimiter
+
+    # Always store delimiter — builder needs it to read CSV correctly on resume,
+    # regardless of whether the file has a header.
+    result["_delimiter"] = delimiter
+
+    # Store excludes so the builder knows which columns to skip during indexing.
+    if excludes:
+        result["_excludes"] = sorted(excludes)
 
     return result
 
 
-def build_column_map(csv_dir, output_path=None, delimiter=",", columns=None, type_overrides=None):
+def build_column_map(csv_dir, output_path=None, delimiter=",", columns=None,
+                     type_overrides=None, excludes=None):
     """Classify all CSVs in a directory and write column_map.json.
 
     columns:        explicit list of column names for headerless files.
     type_overrides: {col_name: sem_type} — user-confirmed types.
+    excludes:        set of original column names to skip from indexing.
 
     Returns:
-        {relative_filename: {col_name: {semantic_type, canonical_key, confidence}}}
+        {relative_filename: {col_name: {semantic_type, canonical_key, confidence},
+                              "_excludes": [...]}}
     """
     from flatseek.core.scanner import discover_csvs
 
@@ -396,13 +413,15 @@ def build_column_map(csv_dir, output_path=None, delimiter=",", columns=None, typ
             _t.start()
             try:
                 classifications = classify_file(csv_path, delimiter=delimiter,
-                                                columns=columns, type_overrides=type_overrides)
+                                                columns=columns, type_overrides=type_overrides,
+                                                excludes=excludes)
             finally:
                 _done.set()
                 _t.join()
         else:
             classifications = classify_file(csv_path, delimiter=delimiter,
-                                            columns=columns, type_overrides=type_overrides)
+                                            columns=columns, type_overrides=type_overrides,
+                                            excludes=excludes)
 
         elapsed = time.time() - t0
 

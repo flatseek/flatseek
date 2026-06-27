@@ -1423,7 +1423,9 @@ async def authenticate_index(
     On success, the password is stored in the session and subsequent
     search/aggregate/map requests will use it automatically.
     """
+    import glob
     import logging
+    import os
     logger = logging.getLogger(__name__)
     logger.warning(f"[auth] authenticate_index called index={index} bucket={bucket}")
 
@@ -1462,16 +1464,7 @@ async def authenticate_index(
             logger.warning(f"[auth] verification failed: {e}")
             return {"authenticated": False, "index": index, "error": "Invalid passphrase"}
 
-        manager.set_password(index, passphrase, bucket)
-
-        # Pre-load the key into the engine so the next request doesn't need to re-derive
-        try:
-            engine = manager.get_engine(index, bucket_url=bucket)
-            engine.set_key(key)
-        except Exception:
-            pass
-
-        return {"authenticated": True, "index": index}
+        return {"authenticated": True, "index": index, "note": "Pass X-Index-Password header on every request"}
 
     # Local filesystem authentication
     data_dir = manager.data_dir
@@ -1489,41 +1482,32 @@ async def authenticate_index(
     except FileNotFoundError:
         raise HTTPException(400, "Index is not encrypted")
 
-    # Verify passphrase by decrypting the stored verification token
+    # Verify passphrase: try verify_token (if present), else decrypt a real doc chunk.
+    # Real doc decryption is authoritative — if it works, passphrase is correct.
+    verified = False
     try:
         with open(enc_path) as f:
             meta = json.load(f)
-        verify_ct = bytes.fromhex(meta["verify_token"])
-        decrypted = decrypt_bytes(verify_ct, key)
-        if not decrypted.startswith(b"FLATSEEK_VERIFY_"):
-            return {"authenticated": False, "index": index}
+        if "verify_token" in meta and meta["verify_token"]:
+            verify_ct = bytes.fromhex(meta["verify_token"])
+            decrypted = decrypt_bytes(verify_ct, key)
+            verified = decrypted.startswith(b"FLATSEEK_VERIFY_")
+        else:
+            # No verify_token — try decrypting an actual encrypted doc chunk
+            docs_chunks = sorted(glob.glob(os.path.join(index_dir, "docs", "**", "*.zlib"), recursive=True))
+            if docs_chunks:
+                with open(docs_chunks[0], "rb") as f:
+                    data = f.read()
+                if data[:9] == b"FLATSEEK\x01":
+                    decrypted = decrypt_bytes(data, key)
+                    verified = True   # decrypted without error → key correct
     except Exception:
+        verified = False
+
+    if not verified:
         return {"authenticated": False, "index": index}
 
-    manager.set_password(index, passphrase, bucket)
-
-    # Pre-load the key into the engine so the next request doesn't need to re-derive
-    try:
-        engine = manager.get_engine(index, bucket_url=bucket)
-        engine.set_key(key)
-    except Exception:
-        pass
-
-    return {"authenticated": True, "index": index}
-
-
-@router.delete("/{index}/_authenticate")
-async def logout_index(
-    index: str,
-    manager: IndexManager = Depends(get_index_manager),
-    bucket: str | None = Query(None, description="URL storage bucket for remote indexes"),
-):
-    """Clear stored password for an encrypted index.
-
-    DELETE /my-index/_authenticate
-    """
-    manager.clear_password(index, bucket)
-    return {"cleared": True, "index": index}
+    return {"authenticated": True, "index": index, "note": "Pass X-Index-Password header on every request"}
 
 
 @router.put("/{index}/_mapping")
@@ -1567,13 +1551,23 @@ async def get_mapping(
 ):
     """Get the column type mapping for an index."""
     # BLOCK unauthenticated access to encrypted buckets — metadata must not leak
-    if manager.is_encrypted(index, bucket):
+    encrypted = manager.is_encrypted(index, bucket)
+    if encrypted:
         stored_pass = request.headers.get("x-index-password") if request else None
         if not stored_pass:
             raise HTTPException(
                 403,
-                f"Index '{index}' is encrypted. Submit password via POST /{index}/_authenticate"
+                f"Index '{index}' is encrypted. Passphrase required via X-Index-Password header."
             )
+
+    try:
+        engine = manager.get_engine(index, bucket_url=bucket)
+    except Exception as e:
+        raise HTTPException(404, f"Index not found: {index}") from e
+
+    # Set key on THIS engine instance — encrypted local engines are NOT cached,
+    # so calling get_engine() twice would create two different instances.
+    if encrypted:
         try:
             from flatseek.core.query_engine import load_encryption_key
             if bucket:
@@ -1584,19 +1578,27 @@ async def get_mapping(
             else:
                 index_dir = os.path.join(manager.data_dir, index)
                 key = load_encryption_key(index_dir, stored_pass)
-            manager.get_engine(index, bucket_url=bucket).set_key(key)
+            engine.set_key(key)
         except Exception:
             raise HTTPException(401, "Invalid passphrase for encrypted index")
 
     try:
-        engine = manager.get_engine(index, bucket_url=bucket)
-    except Exception as e:
-        raise HTTPException(404, f"Index not found or cannot load: {e}")
-
-    try:
+        # Reload stats so columns() has data — stats.json is unreadable at
+        # __init__ time for encrypted indexes; reload_stats() decrypts it after
+        # the key is set above.
+        await asyncio.to_thread(engine.reload_stats)
         columns = engine.columns()
     except Exception as e:
-        # Encrypted index without key — return minimal mapping
+        # Wrong key / corrupted encrypted stats.json → 401 (not empty mapping).
+        try:
+            from cryptography.fernet import InvalidToken as _IT
+        except ImportError:
+            _IT = None
+        if _IT is not None and isinstance(e, _IT):
+            raise HTTPException(401, "Invalid passphrase for encrypted index")
+        if isinstance(e, HTTPException):
+            raise e   # already an HTTP error
+        # For other errors — return minimal mapping
         return {
             "_index": index,
             "mappings": {"properties": {}},
@@ -1623,13 +1625,25 @@ async def get_stats(
 ):
     """Get index statistics: document count, size, columns, encryption status."""
     # BLOCK unauthenticated access to encrypted buckets — metadata must not leak
-    if manager.is_encrypted(index, bucket):
+    encrypted = manager.is_encrypted(index, bucket)
+    if encrypted:
         stored_pass = request.headers.get("x-index-password") if request else None
         if not stored_pass:
             raise HTTPException(
                 403,
-                f"Index '{index}' is encrypted. Submit password via POST /{index}/_authenticate"
+                f"Index '{index}' is encrypted. Passphrase required via X-Index-Password header."
             )
+
+    try:
+        engine = manager.get_engine(index, bucket_url=bucket)
+    except Exception as e:
+        raise HTTPException(404, f"Index not found or cannot load: {e}")
+
+    # Set key on THIS engine instance before reload_stats — do it here (not in
+    # a separate get_engine() call) so we use the same engine object that will
+    # be used for reload_stats.  Encrypted local indexes are NOT cached, so
+    # calling get_engine() twice would create two different instances.
+    if encrypted:
         try:
             from flatseek.core.query_engine import load_encryption_key
             if bucket:
@@ -1640,19 +1654,27 @@ async def get_stats(
             else:
                 index_dir = os.path.join(manager.data_dir, index)
                 key = load_encryption_key(index_dir, stored_pass)
-            manager.get_engine(index, bucket_url=bucket).set_key(key)
+            engine.set_key(key)
         except Exception:
             raise HTTPException(401, "Invalid passphrase for encrypted index")
 
     try:
-        engine = manager.get_engine(index, bucket_url=bucket)
-    except Exception as e:
-        raise HTTPException(404, f"Index not found or cannot load: {e}")
-
-    try:
+        # Thread it — reload_stats() does os.walk() over index+docs dirs
+        # which is slow on large indexes with many WAL files
+        await asyncio.to_thread(engine.reload_stats)
         stats = engine.stats
     except Exception as e:
-        # Encrypted index without key — return minimal stats
+        # Wrong key / corrupted encrypted stats.json → 401 (not empty data).
+        # Check InvalidToken before falling through to return minimal stats.
+        try:
+            from cryptography.fernet import InvalidToken as _IT
+        except ImportError:
+            _IT = None
+        if _IT is not None and isinstance(e, _IT):
+            raise HTTPException(401, "Invalid passphrase for encrypted index")
+        if isinstance(e, HTTPException):
+            raise e   # already an HTTP error
+        # For other errors (index rebuild mid-read, etc.) — return minimal stats
         return {
             "_index": index,
             "docs": {"count": 0, "deleted": 0},
