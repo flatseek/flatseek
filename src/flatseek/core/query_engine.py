@@ -371,13 +371,29 @@ def _get_nested_value(doc, field):
 class QueryEngine:
     def __init__(self, data_dir, storage: StorageAdapter | None = None):
         self.data_dir = os.path.abspath(data_dir) if not isinstance(data_dir, str) or not data_dir.startswith(("http://", "https://", "hf://")) else data_dir
-        self.storage = storage or create_storage_adapter()
+        self.storage = storage or create_storage_adapter(path=self.data_dir)
 
-        # Check if we're using URL storage adapter
+        # Check if we're using URL storage adapter or FlatseekFile
         from flatseek.core.storage import URLStorageAdapter
+        from flatseek.flatseek_file import FlatseekFileStorageAdapter
         is_url_storage = isinstance(self.storage, URLStorageAdapter)
+        is_flatseek_file = isinstance(self.storage, FlatseekFileStorageAdapter)
 
-        if is_url_storage:
+        if is_flatseek_file:
+            # FlatseekFile: files are stored inside the single file
+            # Manifest section contains stats.json, column_map.json, manifest.json
+            # Index/Docs/DV are accessed via offset tables
+            self.index_dir = "index"  # FlatseekFile uses virtual paths
+            self.docs_dir = "docs"
+            stats_path = "stats.json"  # Virtual path to manifest stats
+
+            if not self.storage.exists(stats_path):
+                raise FileNotFoundError(
+                    f"No stats found in {data_dir}. File may be corrupted.")
+            self.stats = json.loads(self.storage.read_bytes(stats_path))
+            self._sub_engines = None
+            dirs = []
+        elif is_url_storage:
             # URL storage: data_dir is the index name, storage handles URL resolution
             # data_dir can be:
             #   - "adsb" (single index in root folder of a multi-index repo)
@@ -558,6 +574,10 @@ class QueryEngine:
         For multi-index mode, propagates to all sub-engines.
         """
         self._enc_key = key
+        # Propagate to FlatseekFileStorageAdapter if present
+        from flatseek.flatseek_file import FlatseekFileStorageAdapter
+        if isinstance(self.storage, FlatseekFileStorageAdapter):
+            self.storage.set_key(key)
         if self._sub_engines:
             for eng in self._sub_engines:
                 eng.set_key(key)
@@ -1402,6 +1422,12 @@ class QueryEngine:
         sequential (docs_0000000000.zlib) and sparse/gapped chunk numbering.
         """
         from flatseek.core.storage import LocalStorageAdapter
+
+        # Delegate to storage adapter if it provides its own _iter_chunks
+        # (e.g. FlatseekFileStorageAdapter overrides this for single-file mode)
+        if hasattr(self.storage, "_iter_chunks"):
+            yield from self.storage._iter_chunks()
+            return
 
         # For local storage, use fast glob. For remote, use storage.listdir
         if isinstance(self.storage, LocalStorageAdapter):
@@ -2575,7 +2601,7 @@ class QueryEngine:
 
         for chunk_start, chunk in _iter_chunks_for_agg(self):
             chunk_len = len(chunk)
-            total_docs += chunk_len
+            # Only count towards hits.total if no filter, or doc matches filter
             chunks_since_mem_check += 1
 
             with self._timed_phase("agg_scan"):
@@ -2585,6 +2611,8 @@ class QueryEngine:
                     # Filter by query
                     if matching_ids is not None and doc_id not in matching_ids:
                         continue
+                    # Count matching doc towards total
+                    total_docs += 1
 
                     for agg_type, field, ppath in agg_items:
                         val = doc.get(field)

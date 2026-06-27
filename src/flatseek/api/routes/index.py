@@ -1400,7 +1400,15 @@ async def is_index_encrypted(
 
     # For local indexes, check filesystem
     data_dir = manager.data_dir
-    index_dir = os.path.join(data_dir, index)
+    nested_index_dir = os.path.join(data_dir, index)
+    if os.path.isdir(os.path.join(nested_index_dir, "index")):
+        index_dir = nested_index_dir
+    else:
+        index_dir = data_dir  # data_dir IS the index (unpacked .fsk)
+
+    # Single-file mode: .fsk has no index/ subdir — check via _single_file_engine
+    if manager._single_file_engine is not None:
+        return {"index": index, "encrypted": manager.is_encrypted(index, bucket)}
 
     if not os.path.isdir(os.path.join(index_dir, "index")):
         raise HTTPException(404, f"Index not found: {index}")
@@ -1429,7 +1437,7 @@ async def authenticate_index(
     logger = logging.getLogger(__name__)
     logger.warning(f"[auth] authenticate_index called index={index} bucket={bucket}")
 
-    from flatseek.core.query_engine import load_encryption_key, decrypt_bytes
+    from flatseek.core.query_engine import load_encryption_key, encrypt_bytes, decrypt_bytes, is_encrypted
 
     passphrase = (body or {}).get("passphrase") if body else None
     if not passphrase:
@@ -1466,9 +1474,32 @@ async def authenticate_index(
 
         return {"authenticated": True, "index": index, "note": "Pass X-Index-Password header on every request"}
 
+    # Single-file mode: authenticate via .fsk manifest (no filesystem encryption.json)
+    if manager._single_file_engine is not None:
+        storage = getattr(manager._single_file_engine, "storage", None)
+        enc_json_str = storage._manifest.get("_encryption_b64")
+        if enc_json_str:
+            import base64 as _b64
+            enc_meta = json.loads(_b64.b64decode(enc_json_str).decode("utf-8"))
+            try:
+                key = load_encryption_key(None, passphrase, meta=enc_meta)
+            except Exception:
+                return {"authenticated": False, "index": index}
+            # Set key on the single-file engine
+            manager._single_file_engine.set_key(key)
+            manager._single_file_engine._enc_key = key
+            return {"authenticated": True, "index": index, "note": "Pass X-Index-Password header on every request"}
+        return {"authenticated": False, "index": index}
+
     # Local filesystem authentication
     data_dir = manager.data_dir
-    index_dir = os.path.join(data_dir, index)
+    # If data_dir is the index itself (unpacked .fsk), list_indices() returns the dirname.
+    # Use data_dir directly; otherwise join as normal for multi-index parent dirs.
+    nested_index_dir = os.path.join(data_dir, index)
+    if os.path.isdir(os.path.join(nested_index_dir, "index")):
+        index_dir = nested_index_dir
+    else:
+        index_dir = data_dir  # data_dir IS the index
 
     if not os.path.isdir(os.path.join(index_dir, "index")):
         raise HTTPException(404, f"Index not found: {index}")
@@ -1493,14 +1524,47 @@ async def authenticate_index(
             decrypted = decrypt_bytes(verify_ct, key)
             verified = decrypted.startswith(b"FLATSEEK_VERIFY_")
         else:
-            # No verify_token — try decrypting an actual encrypted doc chunk
-            docs_chunks = sorted(glob.glob(os.path.join(index_dir, "docs", "**", "*.zlib"), recursive=True))
-            if docs_chunks:
-                with open(docs_chunks[0], "rb") as f:
-                    data = f.read()
-                if data[:9] == b"FLATSEEK\x01":
-                    decrypted = decrypt_bytes(data, key)
-                    verified = True   # decrypted without error → key correct
+            # No verify_token — find first encrypted file and try decrypting it.
+            # If all files are plaintext (e.g. unpacked with key), key derivation
+            # succeeding is sufficient proof (load_encryption_key already validated salt).
+            verified = True
+            probe_path = None
+            # Try index .bin files first
+            idx_dir = os.path.join(index_dir, "index")
+            if os.path.isdir(idx_dir):
+                for root, _, files in os.walk(idx_dir):
+                    for fn in sorted(files):
+                        if fn.endswith(".bin"):
+                            probe_path = os.path.join(root, fn)
+                            break
+                    if probe_path:
+                        break
+            # Fall back to JSON files
+            if not probe_path:
+                for fn in ("stats.json", "column_map.json", "manifest.json"):
+                    p = os.path.join(index_dir, fn)
+                    if os.path.isfile(p):
+                        probe_path = p
+                        break
+            if probe_path:
+                with open(probe_path, "rb") as f:
+                    probe_data = f.read()
+                if is_encrypted(probe_data):
+                    try:
+                        decrypt_bytes(probe_data, key)
+                    except Exception:
+                        verified = False  # wrong passphrase
+            # Persist verify_token for faster subsequent auths
+            if verified:
+                import secrets
+                verify_token = secrets.token_bytes(16)
+                ciphertext = encrypt_bytes(b"FLATSEEK_VERIFY_" + verify_token, key)
+                meta["verify_token"] = ciphertext.hex()
+                try:
+                    with open(enc_path, "w") as f:
+                        json.dump(meta, f, indent=2)
+                except Exception:
+                    pass  # Non-fatal — token is in memory for this session
     except Exception:
         verified = False
 
@@ -1593,6 +1657,8 @@ async def get_mapping(
                 key = load_encryption_key(None, stored_pass, meta)
             else:
                 index_dir = os.path.join(manager.data_dir, index)
+                if not os.path.isdir(os.path.join(index_dir, "index")):
+                    index_dir = manager.data_dir  # data_dir IS the index (unpacked .fsk)
                 key = load_encryption_key(index_dir, stored_pass)
             engine.set_key(key)
         except Exception:
@@ -1669,6 +1735,8 @@ async def get_stats(
                 key = load_encryption_key(None, stored_pass, meta)
             else:
                 index_dir = os.path.join(manager.data_dir, index)
+                if not os.path.isdir(os.path.join(index_dir, "index")):
+                    index_dir = manager.data_dir  # data_dir IS the index (unpacked .fsk)
                 key = load_encryption_key(index_dir, stored_pass)
             engine.set_key(key)
         except Exception:

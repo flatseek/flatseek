@@ -196,6 +196,8 @@ async def search(
                 key = load_encryption_key(None, stored_pass, meta)
             else:
                 index_dir = os.path.join(manager.data_dir, index)
+                if not os.path.isdir(os.path.join(index_dir, "index")):
+                    index_dir = manager.data_dir  # data_dir IS the index (unpacked .fsk)
                 key = load_encryption_key(index_dir, stored_pass)
             engine.set_key(key)
             # Reload stats after set_key — encrypted stats.json needs the key to decrypt
@@ -249,8 +251,9 @@ async def search(
 
         # Run with configurable timeout — prevents runaway queries from holding resources
         try:
-            async with asyncio.timeout(_SEARCH_TIMEOUT):
-                result = await asyncio.to_thread(_do_query)
+            result = await asyncio.wait_for(
+                asyncio.to_thread(_do_query), timeout=_SEARCH_TIMEOUT
+            )
         except asyncio.TimeoutError:
             raise HTTPException(504, f"Query timed out after {_SEARCH_TIMEOUT}s. Try a narrower query.")
 
@@ -342,6 +345,8 @@ async def get_document(
                 key = load_encryption_key(None, stored_pass, meta)
             else:
                 index_dir = os.path.join(manager.data_dir, index)
+                if not os.path.isdir(os.path.join(index_dir, "index")):
+                    index_dir = manager.data_dir  # data_dir IS the index (unpacked .fsk)
                 key = load_encryption_key(index_dir, stored_pass)
             engine.set_key(key)
             await asyncio.to_thread(engine.reload_stats)
@@ -406,6 +411,8 @@ async def multi_search(
                 key = load_encryption_key(None, stored_pass, meta)
             else:
                 index_dir = os.path.join(manager.data_dir, index)
+                if not os.path.isdir(os.path.join(index_dir, "index")):
+                    index_dir = manager.data_dir  # data_dir IS the index (unpacked .fsk)
                 key = load_encryption_key(index_dir, stored_pass)
             engine.set_key(key)
             await asyncio.to_thread(engine.reload_stats)
@@ -427,10 +434,11 @@ async def multi_search(
     # so cancellation of any one cancels that thread
     # Overall timeout prevents runaway multi-search from holding resources
     try:
-        async with asyncio.timeout(_MSEARCH_TIMEOUT):
-            responses = list(await asyncio.gather(
-                *(_run_one(req) for req in itertools.islice(body, 10))
-            ))
+        responses = await asyncio.wait_for(
+            asyncio.gather(*(_run_one(req) for req in itertools.islice(body, 10))),
+            timeout=_MSEARCH_TIMEOUT
+        )
+        responses = list(responses)
     except Exception as e:
         try:
             from cryptography.fernet import InvalidToken
@@ -482,6 +490,8 @@ async def count(
                 key = load_encryption_key(None, stored_pass, meta)
             else:
                 index_dir = os.path.join(manager.data_dir, index)
+                if not os.path.isdir(os.path.join(index_dir, "index")):
+                    index_dir = manager.data_dir  # data_dir IS the index (unpacked .fsk)
                 key = load_encryption_key(index_dir, stored_pass)
             engine.set_key(key)
             # Reload stats after set_key — encrypted stats.json needs the key to decrypt
@@ -493,8 +503,9 @@ async def count(
 
     query = q or "*"
     try:
-        async with asyncio.timeout(_COUNT_TIMEOUT):
-            result = await asyncio.to_thread(engine.search, query, page_size=0)
+        result = await asyncio.wait_for(
+            asyncio.to_thread(engine.search, query, page_size=0), timeout=_COUNT_TIMEOUT
+        )
     except asyncio.TimeoutError:
         raise HTTPException(504, f"Count timed out after {_COUNT_TIMEOUT}s. Try a narrower query.")
     except Exception as e:

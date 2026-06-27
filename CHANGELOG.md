@@ -5,7 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.0] - 2026-06-26
+## [0.1.6] - 2026-06-27
+
+### Pack & Unpack — Portable `.fsk` Format
+
+- **`flatseek pack <dir> -o out.fsk`**: Pack index directory into single portable `.fsk` binary file
+  - Preserves all index data, docs, and doc_values in one archive
+  - `--passphrase` encrypts the packed file (ChaCha20-Poly1305)
+  - Manifest stored as plaintext JSON — enables key derivation without circular dependency
+  - Encryption state preserved: encrypted source + `--passphrase` → encrypted `.fsk`
+- **`flatseek unpack file.fsk -o <dir>`**: Unpack `.fsk` file back to index directory
+  - Handles both OLD format (encrypted manifest, `__b64` values) and NEW format (plaintext manifest, encrypted sections)
+  - `--passphrase` decrypts encrypted `.fsk` files
+  - `encryption.json` restored from manifest metadata
+
+### API Encryption Auth — Single-File & Unpacked Index Modes
+
+- **`GET /{index}/_is_encrypted`**: Fixed path detection for unpacked directories (data_dir IS the index) and single-file `.fsk` mode
+- **`POST /{index}/_authenticate`**: Fixed authentication for:
+  - **Single-file `.fsk`**: reads manifest `_encryption_b64` instead of filesystem `encryption.json`
+  - **Unpacked directories**: handles self-as-index path (`data_dir` = index root)
+  - **Plaintext files**: key derivation success is sufficient proof (no `verify_token` needed)
+- **`is_encrypted()` in IndexManager**: Returns correctly for single-file mode via storage adapter's `_is_encrypted` flag; returns `false` when key provided via `--passphrase`
+
+### Serve API — Encryption Flow
+
+- **`flatseek serve` with `--passphrase`**: Key stored in `FLATSEEK_FSK_KEY` env → `is_encrypted` returns `false` → no password prompt in Flatlens
+- **`flatseek serve` without `--passphrase`**: Key not stored → `is_encrypted` returns `true` → Flatlens prompts for password
+- **Encrypted `.fsk` without `--passphrase`**: Server starts with warning, `is_encrypted=true`, user authenticates via API
+
+### Bug Fixes
+
+- **`query_engine.py`**: `decrypt_bytes` was never imported → `NameError` silently swallowed → `_iter_chunks` returned no data for encrypted indexes
+- **`query_engine.py`**: `total_docs` counted all documents instead of only matching ones → `aggregate` always showed wrong hit counts
+- **`deps.py`**: `list_indices()` and `get_engine()` didn't detect self-as-index directories → served wrong paths for unpacked `.fsk` dirs
+
 
 ### Live Search During Ongoing Builds
 - **WAL-Aware Query Engine**: Search now reads from both `index/` and `_wal/` directories

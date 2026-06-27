@@ -878,17 +878,29 @@ class URLStorageAdapter(StorageAdapter):
         raise NotImplementedError("URLStorageAdapter is read-only")
 
 
-def create_storage_adapter(config: StorageConfig | None = None) -> StorageAdapter:
+def create_storage_adapter(
+    config: StorageConfig | None = None,
+    path: str | Path | None = None,
+) -> StorageAdapter:
     """Factory to create a StorageAdapter from config.
 
     Args:
         config: StorageConfig instance. If None, reads from environment.
+        path: Optional path hint for auto-detection of .flatseek files.
 
     Returns:
         LocalStorageAdapter by default (backward compatible).
     """
     if config is None:
         config = StorageConfig.from_env()
+
+    # Auto-detect .flatseek files (including .flat alias)
+    if path is not None:
+        p = Path(path)
+        if p.is_file() and str(p).endswith((".fsk", ".flatseek", ".flat")):
+            # Import here to avoid circular dependency
+            from flatseek.flatseek_file import FlatseekFileStorageAdapter
+            return FlatseekFileStorageAdapter(p)
 
     if config.backend == "local":
         return LocalStorageAdapter(base_path=config.base_path)

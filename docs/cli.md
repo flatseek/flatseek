@@ -22,6 +22,8 @@
 - [`flatseek decrypt`](#flatseek-decrypt)
 - [`flatseek delete`](#flatseek-delete)
 - [`flatseek dedup`](#flatseek-dedup)
+- [`flatseek pack`](#flatseek-pack)
+- [`flatseek unpack`](#flatseek-unpack)
 - [Index Directory Layout](#index-directory-layout)
 - [Cross-Command Behavior](#cross-command-behavior)
 - [Common Workflows](#common-workflows)
@@ -39,6 +41,7 @@ The Flatseek CLI (`flatseek`) manages the full lifecycle: build, query, serve, a
 | Serve API + dashboard | `flatseek serve` |
 | Classification / planning | `flatseek classify`, `flatseek plan` |
 | Maintenance | `flatseek compress`, `encrypt`, `decrypt`, `dedup`, `delete` |
+| Pack/Unpack | `flatseek pack`, `flatseek unpack` |
 
 **CLI vs API vs Python client**: CLI is zero-config and disk-based. The REST API serves remote/http clients. The Python client (`from flatseek import Flatseek`) is for programmatic access within Python code.
 
@@ -64,6 +67,8 @@ The Flatseek CLI (`flatseek`) manages the full lifecycle: build, query, serve, a
 | `decrypt` | Decrypt index in-place |
 | `delete` | Delete index directory (parallel rm -rf) |
 | `dedup` | Remove duplicate docs from index |
+| `pack` | Pack index directory into portable `.fsk` file |
+| `unpack` | Unpack `.fsk` file into index directory |
 
 ---
 
@@ -677,6 +682,95 @@ flatseek dedup ./data
 
 ---
 
+## `flatseek pack`
+
+Pack an index directory into a single portable `.fsk` file. The output contains all index data in one archive — easy to share or move.
+
+#### What it does
+
+1. Reads `index/`, `docs/`, `dv/` directories from the source index
+2. Reads `stats.json`, `column_map.json`, `manifest.json`
+3. If `--passphrase` is given and source has `encryption.json`: re-encrypts JSON files and sections
+4. Packs everything into a single `.fsk` binary file
+
+#### Syntax
+
+```bash
+flatseek pack <index_dir> -o <output.fsk> [--passphrase PASSPHRASE]
+```
+
+#### Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-o`, `--output` | (required) | Output `.fsk` file path |
+| `--passphrase` | None | Encrypt the packed file with this passphrase |
+
+#### Examples
+
+```bash
+# Pack plaintext index
+flatseek pack ./data -o ./data.fsk
+
+# Pack encrypted index (preserves encryption)
+flatseek pack ./data -o ./data.fsk --passphrase mysecret
+```
+
+#### Notes
+
+- Output extension: if no `.` in filename, `.fsk` is appended automatically (`my_index` → `my_index.fsk`)
+- If source has `encryption.json` and `--passphrase` is given: sections are encrypted at pack time
+- If source is plaintext: packed file is plaintext unless `--passphrase` is used
+- Manifest is always stored as plaintext JSON — enables `_get_flatseek_enc_key()` to derive the key without circular dependency
+
+---
+
+## `flatseek unpack`
+
+Unpack a `.fsk` file into an index directory. Works with both plaintext and encrypted `.fsk` files.
+
+#### What it does
+
+1. Reads `.fsk` binary file header and section offsets
+2. Extracts manifest section (plaintext JSON, always readable)
+3. If `.fsk` is encrypted: decrypts index/docs/dv sections
+4. Writes all files to output directory
+
+#### Syntax
+
+```bash
+flatseek unpack <file.fsk> [-o <output_dir>] [--passphrase PASSPHRASE]
+```
+
+#### Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-o`, `--output` | `<name>.unpacked` | Output directory |
+| `--passphrase` | None | Decryption passphrase (prompted if needed) |
+
+#### Examples
+
+```bash
+# Unpack to default dir (e.g. data.unpacked/)
+flatseek unpack ./data.fsk
+
+# Unpack to specific dir
+flatseek unpack ./data.fsk -o ./my_index
+
+# Unpack encrypted file (will prompt for passphrase if omitted)
+flatseek unpack ./data.fsk -o ./my_index --passphrase mysecret
+```
+
+#### Notes
+
+- `encryption.json` is restored from the manifest's `_encryption_b64` field
+- For OLD format packs (plaintext manifest, `__b64` values): JSON files are encrypted blobs
+- For NEW format packs (plaintext manifest, hex-encoded encrypted JSONs): JSON files stay encrypted when key is provided
+- Without `--passphrase`: encrypted `.fsk` → encrypted output; plaintext `.fsk` → plaintext output
+
+---
+
 ## Index Directory Layout {#index-directory-layout}
 
 Commands that operate on an index (`search`, `stats`, `compress`, `encrypt`, `dedup`, `delete`) expect this structure:
@@ -749,9 +843,12 @@ flatseek build ./data.csv -o ./data
 
 # Serve
 flatseek serve -d ./data
+flatseek serve data.fsk
 
 # Query
 flatseek search ./data "program:raydium AND amount:>1000000"
+flatseek search data.fsk "program:raydium AND amount:>1000000"
+
 ```
 
 ### Parallel build

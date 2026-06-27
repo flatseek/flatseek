@@ -104,6 +104,8 @@ async def aggregate(
                 key = load_encryption_key(None, stored_pass, meta)
             else:
                 index_dir = os.path.join(manager.data_dir, index)
+                if not os.path.isdir(os.path.join(index_dir, "index")):
+                    index_dir = manager.data_dir  # data_dir IS the index (unpacked .fsk)
                 key = load_encryption_key(index_dir, stored_pass)
             engine.set_key(key)
             # Reload stats after set_key — encrypted stats.json needs the key to decrypt
@@ -119,11 +121,12 @@ async def aggregate(
 
     try:
         # reload_stats + aggregate both decrypt encrypted data — wrong key fails here
-        async with asyncio.timeout(_AGG_TIMEOUT):
+        async def _run():
             await asyncio.to_thread(engine.reload_stats)
-            result = await asyncio.to_thread(
+            return await asyncio.to_thread(
                 engine.aggregate, q=query, aggs=aggs, size=size
             )
+        result = await asyncio.wait_for(_run(), timeout=_AGG_TIMEOUT)
         return result
     except asyncio.TimeoutError:
         raise HTTPException(504, f"Aggregation timed out after {_AGG_TIMEOUT}s. Try a narrower query or fewer aggregations.")

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flatseek"
-version = "0.2.0"
+version = "0.1.6"
 description = "Scalable engine to ingest, process, and query large datasets—transactions, logs, events, and analytics—directly from flat files."
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -47,6 +47,7 @@ chat = [
 where = ["src"]
 
 [tool.pytest.ini_options]
-testpaths = ["test"]
+# Auto-discovers test_*.py from root and src/flatseek/test/
+testpaths = ["tests", "src/flatseek/test"]
 python_files = ["test_*.py"]
 python_functions = "test_*"

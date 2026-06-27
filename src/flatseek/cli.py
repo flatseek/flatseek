@@ -25,6 +25,7 @@ import sys
 import os
 import csv
 import argparse
+from pathlib import Path
 
 # ── Version from pyproject.toml ──────────────────────────────────────────────
 # __file__ is flatseek/src/flatseek/cli.py → up 2 levels to flatseek/ → sibling pyproject.toml
@@ -34,7 +35,7 @@ try:
     with open(_PYPROJECT_TOML, "rb") as _f:
         __version__ = tomllib.load(_f)["project"]["version"]
 except Exception:
-    __version__ = "0.2.0"
+    __version__ = "0.1.6"
 
 
 def _parse_columns(columns_str):
@@ -674,12 +675,15 @@ def _update_manifest_after_parallel(output_dir, plan_data):
 def cmd_build(args):
     from flatseek.core.builder import build
     from flatseek.core.storage import StorageConfig, create_storage_adapter
+    import tempfile as _tempfile
+    import shutil as _shutil
     csv_src = os.path.abspath(args.csv_dir)
     output_dir = os.path.abspath(args.output)
     map_path = args.map
     plan_path = args.plan
     worker_id = args.worker_id
     n_workers = getattr(args, "workers", 1)
+    single_file = getattr(args, "single_file", False)
 
     # Build storage adapter from CLI args or environment
     storage = None
@@ -716,6 +720,32 @@ def cmd_build(args):
     if getattr(args, "dedup", False) and dedup_fields is None:
         dedup_fields = []
 
+    # --single-file: build to temp dir first, then pack
+    if single_file:
+        flatseek_out = Path(output_dir)
+        # User gives foo → output foo.fsk
+        if not str(flatseek_out).endswith((".fsk", ".flatseek", ".flat")):
+            flatseek_out = Path(str(flatseek_out) + ".fsk")
+        tmp_dir = Path(_tempfile.mkdtemp(prefix="flatseek_build_"))
+        try:
+            build(csv_src, str(tmp_dir), column_map_path=map_path, dataset=args.dataset,
+                  delimiter=args.sep, columns=columns, type_overrides=type_overrides,
+                  excludes=excludes,
+                  worker_id=worker_id, plan_path=plan_path,
+                  estimate=getattr(args, "estimate", False),
+                  dedup_fields=dedup_fields,
+                  daemon=getattr(args, "daemon", False),
+                  storage=storage)
+
+            # Auto-pack into .flatseek
+            from flatseek.flatseek_file import FlatseekPacker
+            packer = FlatseekPacker(tmp_dir, flatseek_out)
+            packer.pack()
+            print(f"[BUILD] Single file output: {flatseek_out}")
+        finally:
+            _shutil.rmtree(tmp_dir, ignore_errors=True)
+        return
+
     build(csv_src, output_dir, column_map_path=map_path, dataset=args.dataset,
           delimiter=args.sep, columns=columns, type_overrides=type_overrides,
           excludes=excludes,
@@ -732,6 +762,51 @@ def cmd_plan(args):
     output_dir = os.path.abspath(args.output)
     columns = _parse_columns(args.columns)
     plan(csv_src, output_dir, n_workers=args.workers, delimiter=args.sep, columns=columns)
+
+
+def _get_flatseek_enc_key(flatseek_path: Path, args) -> bytes | None:
+    """Read .flatseek manifest, prompt for passphrase if encrypted, derive key."""
+    import base64 as _b64
+    import json as _json
+    from flatseek.core.query_engine import load_encryption_key
+    from flatseek.flatseek_file import HEADER_SIZE, FlatseekHeader
+
+    with open(flatseek_path, "rb") as f:
+        header_data = f.read(HEADER_SIZE)
+        header = FlatseekHeader.unpack(header_data)
+        for desc in header.sections:
+            if desc.section_id == 0x01:  # SID_MANIFEST
+                f.seek(desc.offset)
+                data = f.read(desc.size)
+                break
+        else:
+            return None
+
+    try:
+        manifest = _json.loads(data.decode("utf-8"))
+    except Exception:
+        return None
+
+    enc_b64 = manifest.get("_encryption_b64")
+    if not enc_b64:
+        return None  # not encrypted
+
+    # Index is encrypted — need passphrase
+    import getpass as _getpass
+    passphrase = getattr(args, "passphrase", None)
+    if not passphrase:
+        # Non-interactive mode: don't block — let server start without key.
+        # API will report is_encrypted=true and prompt client for password.
+        import sys
+        sys.stderr.write(
+            f"WARNING: {flatseek_path} is encrypted — provide --passphrase to unlock at startup,\n"
+            f"         or authenticate via API (Flatlens will prompt).\n"
+        )
+        return None
+
+    enc_json = _b64.b64decode(enc_b64)
+    enc_meta = _json.loads(enc_json.decode("utf-8"))
+    return load_encryption_key(None, passphrase, meta=enc_meta)
 
 
 def _apply_passphrase(qe, args):
@@ -752,9 +827,22 @@ def _apply_passphrase(qe, args):
 def cmd_search(args):
     from flatseek.core.query_engine import QueryEngine
     from flatseek.core.storage import StorageConfig, create_storage_adapter
+    import json as _json
 
     storage = None
-    if getattr(args, "storage_backend", None):
+    enc_key = None
+
+    # Handle .flatseek files (including custom extensions like .flat)
+    data_path = Path(args.data_dir)
+    is_flat_file = data_path.is_file() and (
+        str(data_path).endswith((".fsk", ".flatseek", ".flat"))
+    )
+    if is_flat_file:
+        # Read manifest to detect encryption
+        enc_key = _get_flatseek_enc_key(data_path, args)
+        from flatseek.flatseek_file import FlatseekFileStorageAdapter
+        storage = FlatseekFileStorageAdapter(data_path, enc_key=enc_key)
+    elif getattr(args, "storage_backend", None):
         config = StorageConfig(
             backend=args.storage_backend,
             bucket=getattr(args, "storage_bucket", "") or "",
@@ -766,7 +854,10 @@ def cmd_search(args):
         storage = create_storage_adapter(config)
 
     qe = QueryEngine(args.data_dir, storage=storage)
-    _apply_passphrase(qe, args)
+    if enc_key is not None:
+        qe.set_key(enc_key)  # key already derived above
+    else:
+        _apply_passphrase(qe, args)
 
     # Build Lucene query string from args.
     # -c / --and are convenience shortcuts converted to Lucene syntax.
@@ -1373,10 +1464,9 @@ def cmd_encrypt(args):
     Constraint: incremental builds cannot append to encrypted index files.
     Run 'flatseek decrypt' first, rebuild, then 'flatseek encrypt' again.
     """
-    import os, json, secrets, sys
-    from concurrent.futures import ThreadPoolExecutor
+    import os, json, secrets, sys, time as _time
+    from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
     from flatseek.core.query_engine import derive_key, encrypt_bytes, is_encrypted
-    from flatseek.core.builder import FLUSH_THREADS
 
     data_dir  = args.data_dir
     index_dir = os.path.join(data_dir, "index")
@@ -1433,7 +1523,9 @@ def cmd_encrypt(args):
             targets.append(p)
 
     n_already = n_done = n_err = 0
-    lock = __import__("threading").Lock()
+    n_workers = min(32, max(4, len(targets)))
+    t0 = _time.time()
+    done = 0
 
     def _encrypt_file(path):
         nonlocal n_already, n_done, n_err
@@ -1441,30 +1533,39 @@ def cmd_encrypt(args):
             with open(path, "rb") as f:
                 data = f.read()
             if not data:
-                return
+                return None
             if is_encrypted(data):
-                with lock:
-                    n_already += 1
-                return
+                return (path, "already", len(data))
             enc = encrypt_bytes(data, key)
             tmp = path + f".{os.getpid()}.etmp"
             with open(tmp, "wb") as f:
                 f.write(enc)
             os.replace(tmp, path)
-            with lock:
-                n_done += 1
+            return (path, "done", len(data))
         except Exception as e:
-            with lock:
-                n_err += 1
-            print(f"\n  Error encrypting {path}: {e}")
+            return (path, "error", str(e))
 
     print(f"Encrypting {len(targets):,} files …")
-    with ThreadPoolExecutor(max_workers=FLUSH_THREADS) as ex:
-        for i, _ in enumerate(ex.map(_encrypt_file, targets)):
-            if i % 2000 == 0:
-                sys.stderr.write(f"\r  {i:,}/{len(targets):,} …")
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        futures = {ex.submit(_encrypt_file, p): p for p in targets}
+        for fut in _as_completed(futures):
+            path, status, val = fut.result()
+            if status == "already":
+                n_already += 1
+            elif status == "done":
+                n_done += 1
+            elif status == "error":
+                n_err += 1
+                sys.stderr.write(f"\n  Error: {path}: {val}\n")
+            done += 1
+            if done % 5000 == 0 or done == len(targets):
+                elapsed = _time.time() - t0
+                pct = done / len(targets) * 100
+                rate = done / elapsed if elapsed > 0 else 0
+                eta = (len(targets) - done) / rate if rate > 0 else 0
+                sys.stderr.write(f"\r  {done:,}/{len(targets):,} ({pct:.0f}%)  {eta/60:.1f}m remaining   ")
                 sys.stderr.flush()
-    sys.stderr.write("\r" + " " * 30 + "\r")
+    sys.stderr.write("\r" + " " * 50 + "\r")
 
     print(f"Done: {n_done:,} encrypted, {n_already:,} already encrypted, {n_err:,} errors")
     if n_err == 0:
@@ -1479,10 +1580,9 @@ def cmd_decrypt(args):
     permanently remove encryption. The encryption.json salt file is removed
     after successful decryption.
     """
-    import os, json, sys
-    from concurrent.futures import ThreadPoolExecutor
+    import os, json, sys, time as _time
+    from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
     from flatseek.core.query_engine import load_encryption_key, decrypt_bytes, is_encrypted
-    from flatseek.core.builder import FLUSH_THREADS
 
     data_dir = args.data_dir
     enc_path = os.path.join(data_dir, "encryption.json")
@@ -1508,6 +1608,7 @@ def cmd_decrypt(args):
 
     print("Verifying passphrase …", end=" ", flush=True)
     _probe_path = None
+    # Try .bin files first
     for root, _, files in os.walk(index_dir):
         for fn in sorted(files):
             if fn.endswith(".bin"):
@@ -1515,6 +1616,13 @@ def cmd_decrypt(args):
                 break
         if _probe_path:
             break
+    # Fall back to JSON files if no .bin found
+    if not _probe_path:
+        for fn in ("stats.json", "column_map.json", "manifest.json"):
+            p = os.path.join(data_dir, fn)
+            if os.path.exists(p):
+                _probe_path = p
+                break
     if _probe_path:
         with open(_probe_path, "rb") as f:
             _probe_data = f.read()
@@ -1526,7 +1634,7 @@ def cmd_decrypt(args):
                 print("\nError: wrong passphrase — decryption failed. No files were modified.")
                 return
         else:
-            print("OK (index not encrypted)")
+            print("OK (file not encrypted)")
     else:
         print("OK (no files found to verify)")
 
@@ -1539,44 +1647,57 @@ def cmd_decrypt(args):
         for fn in files:
             if fn.endswith(".zlib"):
                 targets.append(os.path.join(root, fn))
+    # Also decrypt metadata JSON files (mirrors cmd_encrypt)
+    for fn in ("stats.json", "column_map.json", "manifest.json"):
+        p = os.path.join(data_dir, fn)
+        if os.path.exists(p):
+            targets.append(p)
 
     n_plain = n_done = n_err = 0
-    lock = __import__("threading").Lock()
+    n_workers = min(32, max(4, len(targets)))
+    t0 = _time.time()
+    done = 0
 
     def _decrypt_file(path):
-        nonlocal n_plain, n_done, n_err
         try:
             with open(path, "rb") as f:
                 data = f.read()
             if not data:
-                return
+                return (path, "skip", 0)
             if not is_encrypted(data):
-                with lock:
-                    n_plain += 1
-                return
+                return (path, "plain", 0)
             dec = decrypt_bytes(data, key)
             tmp = path + f".{os.getpid()}.dtmp"
             with open(tmp, "wb") as f:
                 f.write(dec)
             os.replace(tmp, path)
-            with lock:
-                n_done += 1
+            return (path, "done", len(data))
         except ValueError as e:
-            with lock:
-                n_err += 1
-            print(f"\n  Error decrypting {path}: {e}")
+            return (path, "error", str(e))
         except Exception as e:
-            with lock:
-                n_err += 1
-            print(f"\n  Error decrypting {path}: {e}")
+            return (path, "error", str(e))
 
     print(f"Decrypting {len(targets):,} files …")
-    with ThreadPoolExecutor(max_workers=FLUSH_THREADS) as ex:
-        for i, _ in enumerate(ex.map(_decrypt_file, targets)):
-            if i % 2000 == 0:
-                sys.stderr.write(f"\r  {i:,}/{len(targets):,} …")
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        futures = {ex.submit(_decrypt_file, p): p for p in targets}
+        for fut in _as_completed(futures):
+            path, status, val = fut.result()
+            if status == "plain":
+                n_plain += 1
+            elif status == "done":
+                n_done += 1
+            elif status == "error":
+                n_err += 1
+                sys.stderr.write(f"\n  Error: {path}: {val}\n")
+            done += 1
+            if done % 5000 == 0 or done == len(targets):
+                elapsed = _time.time() - t0
+                pct = done / len(targets) * 100
+                rate = done / elapsed if elapsed > 0 else 0
+                eta = (len(targets) - done) / rate if rate > 0 else 0
+                sys.stderr.write(f"\r  {done:,}/{len(targets):,} ({pct:.0f}%)  {eta/60:.1f}m remaining   ")
                 sys.stderr.flush()
-    sys.stderr.write("\r" + " " * 30 + "\r")
+    sys.stderr.write("\r" + " " * 50 + "\r")
 
     print(f"Done: {n_done:,} decrypted, {n_plain:,} already plain, {n_err:,} errors")
     if n_err == 0 and n_done > 0:
@@ -1910,8 +2031,34 @@ def cmd_serve(args):
     import uvicorn, webbrowser
 
     import os as _os
-    data_dir = os.path.abspath(args.data_dir) if args.data_dir else os.getcwd()
+    from pathlib import Path
+    # Merge positional and -d/--data (argparse can't share dest between both)
+    data_dir = getattr(args, "data_option", None) or args.data_dir
+    data_dir = os.path.abspath(data_dir) if data_dir else os.getcwd()
     _os.environ["FLATSEEK_DATA_DIR"] = data_dir
+    # Detect single-file mode (.fsk) and derive encryption key if needed
+    if _os.path.isfile(data_dir) and data_dir.endswith((".fsk", ".flatseek", ".flat")):
+        _os.environ["FLATSEEK_SINGLE_FILE"] = data_dir
+        # Derive encryption key from passphrase and store as base64 in env
+        if not _os.environ.get("FLATSEEK_FSK_KEY"):
+            enc_key = _get_flatseek_enc_key(Path(data_dir), args)
+            if enc_key:
+                import base64 as _b64
+                _os.environ["FLATSEEK_FSK_KEY"] = _b64.b64encode(enc_key).decode("ascii")
+    # Also handle unpacked .fsk directories — if data_dir has encryption.json and --passphrase
+    # was provided, derive key and store it so IndexManager.get_engine() can apply it.
+    elif _os.path.isdir(data_dir):
+        enc_json = os.path.join(data_dir, "encryption.json")
+        if os.path.isfile(enc_json) and not _os.environ.get("FLATSEEK_FSK_KEY"):
+            from flatseek.core.query_engine import load_encryption_key
+            passphrase = getattr(args, "passphrase", None)
+            if passphrase:
+                try:
+                    enc_key = load_encryption_key(data_dir, passphrase)
+                    import base64 as _b64
+                    _os.environ["FLATSEEK_FSK_KEY"] = _b64.b64encode(enc_key).decode("ascii")
+                except Exception:
+                    pass
     _os.environ["FLATSEEK_PORT"] = str(args.port)
     _os.environ["FLATSEEK_API_BASE"] = f"http://localhost:{args.port}"
     if args.flatlens_dir:
@@ -1994,8 +2141,17 @@ def cmd_api(args):
     import uvicorn
 
     import os as _os
-    data_dir = os.path.abspath(args.data_dir) if args.data_dir else os.getcwd()
+    from pathlib import Path
+    data_dir = getattr(args, "data_option", None) or args.data_dir
+    data_dir = os.path.abspath(data_dir) if data_dir else os.getcwd()
     _os.environ["FLATSEEK_DATA_DIR"] = data_dir
+    if _os.path.isfile(data_dir) and data_dir.endswith((".fsk", ".flatseek", ".flat")):
+        _os.environ["FLATSEEK_SINGLE_FILE"] = data_dir
+        if not _os.environ.get("FLATSEEK_FSK_KEY"):
+            enc_key = _get_flatseek_enc_key(Path(data_dir), args)
+            if enc_key:
+                import base64 as _b64
+                _os.environ["FLATSEEK_FSK_KEY"] = _b64.b64encode(enc_key).decode("ascii")
     _os.environ["FLATSEEK_PORT"] = str(args.port)
     # Do NOT set FLATSEEK_API_BASE — dashboard should not be attached
 
@@ -2157,6 +2313,10 @@ def main():
     p = sub.add_parser("build", help="Build trigram index from CSVs")
     p.add_argument("csv_dir", help="CSV file or directory containing CSV files")
     p.add_argument("-o", "--output", default="./data", help="Output directory (default: ./data)")
+    p.add_argument("--single-file", action="store_true", default=False, dest="single_file",
+                   help="Output a single .flatseek file instead of a directory. "
+                        "Builds to a temp dir first, then auto-packs. "
+                        "Passphrase handled automatically if --passphrase is set.")
     p.add_argument("-m", "--map", help="Path to column_map.json (auto-detected if in output dir)")
     p.add_argument("--dataset", default=None, help="Dataset label (e.g. 'people', 'accounts')")
     p.add_argument("-s", "--sep", default=",", metavar="CHAR",
@@ -2287,8 +2447,10 @@ def main():
 
     # serve
     p = sub.add_parser("serve", help="Start API server + dashboard")
-    p.add_argument("-d", "--data", dest="data_dir", default=None,
-                   help="Data directory to serve (default: current directory)")
+    p.add_argument("data_dir", nargs="?", default=None,
+                   help="Data directory or .fsk file to serve (default: current directory)")
+    p.add_argument("-d", "--data", dest="data_option", default=None,
+                   help="Data directory or .fsk file to serve (default: current directory)")
     p.add_argument("-p", "--port", type=int, default=8000, dest="port",
                    help="Port number (default: 8000)")
     p.add_argument("--host", default="0.0.0.0", dest="host",
@@ -2311,11 +2473,15 @@ def main():
                    help="Custom endpoint for S3-compatible storage")
     p.add_argument("--storage-base-path", default=None, dest="storage_base_path",
                    help="Base path within storage")
+    p.add_argument("--passphrase", default=None, dest="passphrase",
+                   help="Passphrase for encrypted .fsk files")
 
     # api
     p = sub.add_parser("api", help="Start API server only (no dashboard)")
-    p.add_argument("-d", "--data", dest="data_dir", default=None,
-                   help="Data directory to serve (default: current directory)")
+    p.add_argument("data_dir", nargs="?", default=None,
+                   help="Data directory or .fsk file to serve (default: current directory)")
+    p.add_argument("-d", "--data", dest="data_option", default=None,
+                   help="Data directory or .fsk file to serve (default: current directory)")
     p.add_argument("-p", "--port", type=int, default=8000, dest="port",
                    help="Port number (default: 8000)")
     p.add_argument("--host", default="0.0.0.0", dest="host",
@@ -2335,6 +2501,8 @@ def main():
                    help="Custom endpoint for S3-compatible storage")
     p.add_argument("--storage-base-path", default=None, dest="storage_base_path",
                    help="Base path within storage")
+    p.add_argument("--passphrase", default=None, dest="passphrase",
+                   help="Passphrase for encrypted .fsk files")
 
     # dashboard
     p = sub.add_parser("dashboard",
@@ -2396,10 +2564,24 @@ def main():
     p_merge.add_argument("--dry-run", action="store_true", default=False, dest="dry_run",
                          help="Show what would be merged without writing anything")
     p_merge.add_argument("--workers", type=int, default=4, metavar="N",
-                         help="Parallel workers for WAL merge (default: 4)")
+                        help="Parallel workers for WAL merge (default: 4)")
 
     p_info = sub_wal.add_parser("info", help="Show WAL file statistics")
     p_info.add_argument("data_dir", help="Index directory with _wal/ folder")
+
+    # pack - pack index folder into single .flatseek file
+    p = sub.add_parser("pack", help="Pack index folder into single .flatseek file")
+    p.add_argument("index_dir", help="Index directory to pack")
+    p.add_argument("-o", "--output", required=True, help="Output .flatseek file path")
+    p.add_argument("--passphrase", default=None, metavar="PASS",
+                   help="Encrypt the packed file with this passphrase (omit to pack as plaintext)")
+
+    # unpack - unpack .flatseek file into directory
+    p = sub.add_parser("unpack", help="Unpack .flatseek file into index directory")
+    p.add_argument("flatseek_file", help=".flatseek file to unpack")
+    p.add_argument("-o", "--output", help="Output directory (default: <name>.unpacked)")
+    p.add_argument("--passphrase", default=None, metavar="PASS",
+                   help="Decryption passphrase for encrypted .fsk manifest (required if .fsk is encrypted)")
 
     args = parser.parse_args()
 
@@ -2437,6 +2619,63 @@ def main():
         cmd_plan(args)
     elif args.command == "generate":
         cmd_generate(args)
+    elif args.command == "pack":
+        from flatseek.flatseek_file import FlatseekPacker
+        from flatseek.core.query_engine import load_encryption_key, is_encrypted
+        import os as _os
+        index_dir = Path(args.index_dir).resolve()
+        output_path = Path(args.output).resolve()
+        # Only auto-add .fsk if no extension given (e.g. "my_index" → "my_index.fsk")
+        # If user gives "foo.bar", use it as-is
+        if "." not in output_path.name:
+            output_path = Path(str(output_path) + ".fsk")
+
+        # Load encryption key if index is encrypted AND --passphrase is provided.
+        # Without --passphrase, pack as plaintext (no interactive prompt).
+        enc_key = None
+        enc_path = index_dir / "encryption.json"
+        if enc_path.exists() and args.passphrase:
+            enc_key = load_encryption_key(str(index_dir), args.passphrase)
+
+        packer = FlatseekPacker(index_dir, output_path, enc_key=enc_key)
+        packer.pack()
+    elif args.command == "unpack":
+        import json
+        import base64
+        import re
+        import getpass as _getpass
+        from flatseek.flatseek_file import FlatseekUnpacker
+        flatseek_path = Path(args.flatseek_file).resolve()
+        if args.output:
+            output_dir = Path(args.output).resolve()
+        else:
+            output_dir = flatseek_path.parent / (flatseek_path.stem + "_unpacked")
+
+        # Derive encryption key if .fsk is encrypted
+        enc_key = None
+        enc_meta = None
+        try:
+            raw = flatseek_path.read_bytes()[:8192].decode("utf-8", errors="replace")
+            m = re.search(r'"_encryption_b64"\s*:\s*"([^"]+)"', raw)
+            if m:
+                enc_raw = base64.b64decode(m.group(1))
+                enc_meta = json.loads(enc_raw.decode("utf-8"))
+        except Exception:
+            enc_meta = None
+
+        if enc_meta:
+            from flatseek.core.query_engine import load_encryption_key
+            passphrase = args.passphrase
+            if not passphrase:
+                try:
+                    passphrase = _getpass.getpass(f"Passphrase for {flatseek_path.name}: ")
+                except Exception:
+                    passphrase = None
+            if passphrase:
+                enc_key = load_encryption_key(None, passphrase, meta=enc_meta)
+
+        unpacker = FlatseekUnpacker(flatseek_path, output_dir, enc_key=enc_key)
+        unpacker.unpack()
     else:
         parser.print_help()
 
