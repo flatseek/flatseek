@@ -674,6 +674,7 @@ class IndexBuilder:
                  checkpoint_cb=None, delimiter=",", columns=None, worker_id=None,
                  dedup_fields=None, doc_id_end=None, daemon=False,
                  storage: StorageAdapter | None = None):
+        self._file_excludes: set = set()   # set per-file by process_file
         """
         Args:
             output_dir:    where to write index/, docs/, stats.json
@@ -969,6 +970,10 @@ class IndexBuilder:
         self.doc_counter += 1
 
         doc = {}
+
+        # Skip columns marked SKIP in the classify/prompt step.
+        if self._file_excludes:
+            row = {k: v for k, v in row.items() if k not in self._file_excludes}
 
         # Expand nested arrays/objects before indexing
         # {"tags": ["api","cdn"], "address": {"city": "NYC"}}
@@ -2109,9 +2114,9 @@ class IndexBuilder:
                 effective_columns = file_meta.get("_columns")
 
         # Build-time excludes: columns marked SKIP during classify/prompt are not indexed.
-        file_excludes: set = set()
+        self._file_excludes = set()
         if file_rel in self.column_map:
-            file_excludes = set(self.column_map[file_rel].get("_excludes", []))
+            self._file_excludes = set(self.column_map[file_rel].get("_excludes", []))
 
         size_mb   = os.path.getsize(path) / 1024 ** 2
         ext_lower = ext   # kept for compat with code below that uses ext_lower
@@ -2127,6 +2132,11 @@ class IndexBuilder:
                     peek_headers = list(_pr.fieldnames or [])
             except Exception:
                 pass
+
+        # Exclude SKIP-marked columns before building the schema and throughout indexing.
+        if self._file_excludes:
+            peek_headers = [h for h in peek_headers if h not in self._file_excludes]
+
         _peek_col_schema = self._build_col_schema(peek_headers, file_rel) if peek_headers else {}
 
         # ── Row-counting (background for large files) ──────────────────────────
@@ -2302,8 +2312,8 @@ class IndexBuilder:
 
                         for row_dict in chunk.to_dict("records"):
                             try:
-                                if file_excludes:
-                                    row_dict = {k: v for k, v in row_dict.items() if k not in file_excludes}
+                                if self._file_excludes:
+                                    row_dict = {k: v for k, v in row_dict.items() if k not in self._file_excludes}
                                 self.add_row(row_dict, headers, file_rel, col_schema)
                                 count += 1
                                 _tick()
@@ -2367,8 +2377,8 @@ class IndexBuilder:
                         try:
                             if len(row) != len(headers):
                                 continue
-                            if file_excludes:
-                                row = {k: v for k, v in row.items() if k not in file_excludes}
+                            if self._file_excludes:
+                                row = {k: v for k, v in row.items() if k not in self._file_excludes}
                             self.add_row(row, headers, file_rel, col_schema)
                             count += 1
                             _tick()
@@ -2397,8 +2407,8 @@ class IndexBuilder:
                     if skipped < skip_rows:
                         skipped += 1
                         continue
-                    if file_excludes:
-                        row = {k: v for k, v in row.items() if k not in file_excludes}
+                    if self._file_excludes:
+                        row = {k: v for k, v in row.items() if k not in self._file_excludes}
                     self.add_row(row, headers, file_rel, col_schema)
                     count += 1
                     _tick()

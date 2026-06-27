@@ -326,12 +326,22 @@ def classify_file(path, sample_rows=300, delimiter=",", columns=None,
         if col in excludes:
             continue   # excluded — don't classify or store
         if col in overrides:
-            sem_type   = overrides[col]
-            confidence = 1.0   # user explicitly specified
+            override_val = overrides[col]
+            # Parse "TYPE→new_name" format (rename during classify prompt)
+            if "→" in override_val:
+                sem_type, new_name = override_val.split("→", 1)
+                sem_type = sem_type.strip().upper()
+                new_name = new_name.strip()
+                canonical = _norm(new_name)
+                confidence = 1.0   # user explicitly specified
+            else:
+                sem_type = override_val.upper()
+                confidence = 1.0   # user explicitly specified
+                canonical = _norm(col)
         else:
             samples = [row.get(col, "") for row in rows]
             sem_type, confidence = classify_column(col, samples)
-        canonical = _norm(col)
+            canonical = _norm(col)
         result[col] = {
             "semantic_type": sem_type,
             "confidence": round(confidence, 2),

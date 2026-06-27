@@ -205,9 +205,9 @@ def _prompt_columns(path, delimiter):
                 print(f"  ✗ Rename needs a name after →")
                 i -= 1; continue
             renamed[col] = new_name
+            # Encode rename into type_overrides so classify_file/build can read it
+            type_overrides[col] = f"{sem_type}→{new_name}"
             final_cols.append(new_name)
-        elif ans == "" or ans.upper() == sem_type:
-            final_cols.append(col)
         elif ans.upper() in _TYPES:
             type_overrides[col] = ans.upper()
             final_cols.append(col)
