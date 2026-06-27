@@ -691,15 +691,15 @@ class TestHuggingFaceBucketURL:
         assert adapter.base_url == "https://huggingface.co/datasets/flatseek/sample-articles/resolve/main"
 
     @pytest.mark.network
-    def test_list_indices_from_bucket(self):
-        """_list_url_indices discovers index names from HuggingFace bucket web UI HTML."""
+    def test_list_indices_from_dataset(self):
+        """_list_url_indices discovers index names from a HuggingFace dataset."""
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
         from flatseek.api.deps import IndexManager
         from flatseek.core.storage import URLStorageAdapter
 
-        # Create manager and use _list_url_indices directly with URLStorageAdapter
+        # sample-articles is a direct-index dataset (index/ and docs/ at root)
         storage = URLStorageAdapter(
-            url="https://huggingface.co/buckets/flatseek/flatdata",
+            url="https://huggingface.co/datasets/flatseek/sample-articles",
             base_path="",
             cache_enabled=True,
         )
@@ -707,45 +707,71 @@ class TestHuggingFaceBucketURL:
         manager = IndexManager()
         indices = manager._list_url_indices(storage)
 
-        # Bucket should list adsb, article, sosmed, standard
-        assert "adsb" in indices
-        assert "article" in indices
-        assert "sosmed" in indices
-        assert "standard" in indices
+        # Direct-index dataset returns its own repo name as the index
+        assert "sample-articles" in indices
 
     @pytest.mark.network
     def test_search_via_api_with_bucket_param(self):
-        """Search endpoint accepts ?bucket=<url> to query HuggingFace buckets."""
+        """Search endpoint accepts ?bucket=<url> to query HuggingFace datasets."""
         from fastapi.testclient import TestClient
+        from fastapi import HTTPException
         from flatseek.api.main import app
 
         client = TestClient(app, raise_server_exceptions=False)
 
-        # Search adsb index in the flatseek/flatdata bucket
         # Without bucket param → 404 (no such local index)
-        r_no_bucket = client.get("/adsb/_search?q=*")
+        r_no_bucket = client.get("/sample-articles/_search?q=*")
         assert r_no_bucket.status_code == 404
 
-        # With bucket param → should hit remote (200 or 403 if encrypted)
-        bucket = "https://huggingface.co/buckets/flatseek/flatdata"
-        r_with_bucket = client.get(f"/adsb/_search?q=*&bucket={bucket}")
-        # adsb is not encrypted, so should return 200 with search results
+        # With bucket param → should hit remote
+        bucket = "https://huggingface.co/datasets/flatseek/sample-articles"
+        r_with_bucket = client.get(f"/sample-articles/_search?q=*&bucket={bucket}")
         assert r_with_bucket.status_code == 200
         data = r_with_bucket.json()
         assert data["hits"]["total"] > 0
 
     @pytest.mark.network
+    def test_search_encrypted_dataset_with_correct_passphrase(self):
+        """Encrypted HF dataset returns results only with correct X-Index-Password."""
+        from fastapi.testclient import TestClient
+        from flatseek.api.main import app
+
+        client = TestClient(app, raise_server_exceptions=False)
+        bucket = "https://huggingface.co/datasets/flatseek/sample-encrypted"
+
+        # Without passphrase → 401/403
+        r_no_pass = client.get(f"/sample-encrypted/_search?q=*&bucket={bucket}")
+        assert r_no_pass.status_code in (401, 403), \
+            f"Expected 401/403 without passphrase, got {r_no_pass.status_code}"
+
+        # Wrong passphrase → 401
+        r_wrong = client.get(
+            f"/sample-encrypted/_search?q=*&bucket={bucket}",
+            headers={"X-Index-Password": "wrongpass"},
+        )
+        assert r_wrong.status_code == 401, \
+            f"Expected 401 with wrong passphrase, got {r_wrong.status_code}"
+
+        # Correct passphrase → 200 with results
+        r_ok = client.get(
+            f"/sample-encrypted/_search?q=*&bucket={bucket}",
+            headers={"X-Index-Password": "flatseek"},
+        )
+        assert r_ok.status_code == 200, \
+            f"Expected 200 with correct passphrase, got {r_ok.status_code}: {r_ok.json()}"
+        data = r_ok.json()
+        assert data["hits"]["total"] > 0
+
+    @pytest.mark.network
     def test_bucket_indices_endpoint(self):
-        """_indices?bucket= returns index list from HuggingFace bucket."""
+        """_indices?bucket= returns index list from HuggingFace dataset."""
         from fastapi.testclient import TestClient
         from flatseek.api.main import app
 
         client = TestClient(app, raise_server_exceptions=False)
 
-        bucket = "https://huggingface.co/buckets/flatseek/flatdata"
+        bucket = "https://huggingface.co/datasets/flatseek/sample-articles"
         r = client.get(f"/_indices?bucket={bucket}")
         assert r.status_code == 200
         data = r.json()
-        assert "adsb" in data["indices"]
-        assert "article" in data["indices"]
-        assert "standard" in data["indices"]
+        assert "sample-articles" in data["indices"]
