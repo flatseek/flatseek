@@ -1073,12 +1073,16 @@ class QueryEngine:
         _seen_tg: set = set()
         tgs: list = []
         for _seg in _lit_segs:
-            # Strip non-alphanumeric chars (dots, @, hyphens) from each segment
-            # before extracting trigrams. Without this, "gmail.com" → trigrams "il.",
-            # ".co", "l.c" which never appear in any indexed field → empty result.
-            _seg_clean = re.sub(r"[^a-z0-9]", "", _seg.lower())
-            for _i in range(len(_seg_clean) - 2):
-                _tg = _seg_clean[_i:_i+3]
+            # Extract trigrams from the raw segment as-is (matching what the builder
+            # does via make_trigrams).  Stripping non-alphanum chars would cause a
+            # mismatch: "dev.io" → indexed ["dev","ev.","v.i",".io"] but query
+            # ["dev","evi","vio"] — "evi" never appears in the index.
+            # Non-alphanum trigrams (e.g. "ev." from "dev.io") are fine; they
+            # still appear in the index and _verify_wildcard eliminates false
+            # positives via exact stored-value matching.
+            _seg_raw = _seg.lower()
+            for _i in range(len(_seg_raw) - 2):
+                _tg = _seg_raw[_i:_i+3]
                 if _tg not in _seen_tg:
                     _seen_tg.add(_tg)
                     tgs.append(_tg)
