@@ -20,7 +20,7 @@ jobs:
           pip install -e .
           pip install pytest pytest-cov
       - name: Run tests
-        run: pytest -v --cov=src/flatseek --cov-report=xml
+        run: pytest -v --cov=src/flatseek --cov-report=xml -m "not network"
       - name: Upload coverage
         uses: codecov/codecov-action@v4
         if: always()

@@ -51,3 +51,6 @@ where = ["src"]
 testpaths = ["tests", "src/flatseek/test"]
 python_files = ["test_*.py"]
 python_functions = "test_*"
+markers = [
+    "network: tests that hit live HuggingFace / S3 / Vercel Blob / etc. Skipped in CI (workflow uses `-m 'not network'`); run locally with `pytest -m network`.",
+]
