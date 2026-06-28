@@ -894,6 +894,535 @@ def cmd_search(args):
         print(doc)
 
 
+# ── export ─────────────────────────────────────────────────────────────────────
+
+_EXPORT_BATCH = 10_000
+_EXPORT_CHECKPOINT_FLUSH_EVERY = 1_000
+_EXPORT_CHECKPOINT_SUFFIX = ".flatseek-export-checkpoint.json"
+
+
+def _export_checkpoint_path(out_path) -> str:
+    return str(out_path) + _EXPORT_CHECKPOINT_SUFFIX
+
+
+def _export_load_checkpoint(out_path, query_str, fmt, cols, *, force_restart):
+    """Load checkpoint sidecar; return (last_doc_id, exported_count) or (None, 0).
+
+    Exits with code 2 on query/format mismatch.
+    """
+    import json as _json
+    cp_path = _export_checkpoint_path(out_path)
+    if not os.path.exists(cp_path):
+        return None, 0
+    if force_restart:
+        # User explicitly asked to discard.
+        try:
+            os.remove(cp_path)
+        except OSError:
+            pass
+        return None, 0
+    try:
+        with open(cp_path, "r") as f:
+            data = _json.load(f)
+    except Exception as e:
+        print(f"Warning: cannot read checkpoint ({e}), restarting from scratch",
+              file=sys.stderr)
+        return None, 0
+    if data.get("version") != 1:
+        print(f"Warning: stale checkpoint (version mismatch), restarting from scratch",
+              file=sys.stderr)
+        return None, 0
+    if data.get("query") != query_str:
+        print(
+            f"Error: checkpoint query differs from current run.\n"
+            f"  checkpoint: {data.get('query')!r}\n"
+            f"  current:    {query_str!r}\n"
+            f"Re-run with --force-restart to discard the checkpoint.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if data.get("format") != fmt:
+        print(
+            f"Error: checkpoint format ({data.get('format')!r}) differs from "
+            f"current ({fmt!r}). Re-run with --force-restart.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if data.get("columns") != cols:
+        print(
+            f"Warning: column subset differs from checkpoint; early rows in the "
+            f"output file may use the original column set.",
+            file=sys.stderr,
+        )
+    return data.get("last_doc_id", -1), data.get("exported_count", 0)
+
+
+def _export_save_checkpoint(out_path, *, query_str, fmt, cols, last_id, count,
+                            started_at):
+    """Atomically write checkpoint sidecar (write to .tmp, rename)."""
+    import json as _json
+    import datetime as _dt
+    cp_path = _export_checkpoint_path(out_path)
+    tmp_path = cp_path + ".tmp"
+    data = {
+        "version": 1,
+        "started_at": started_at,
+        "last_updated": _dt.datetime.utcnow().isoformat() + "Z",
+        "query": query_str,
+        "format": fmt,
+        "columns": list(cols) if cols is not None else None,
+        "last_doc_id": last_id,
+        "exported_count": count,
+    }
+    with open(tmp_path, "w") as f:
+        _json.dump(data, f, indent=2)
+    os.replace(tmp_path, cp_path)
+
+
+def _export_remove_checkpoint(out_path):
+    cp_path = _export_checkpoint_path(out_path)
+    try:
+        os.remove(cp_path)
+    except FileNotFoundError:
+        pass
+
+
+def _export_project(doc, cols):
+    """Keep _id (always) plus requested columns (or all if cols is None)."""
+    if cols is None:
+        return doc
+    out = {"_id": doc.get("_id")}
+    for c in cols:
+        if c in doc:
+            out[c] = doc[c]
+    return out
+
+
+def _export_csv_cell(v):
+    """Render any value as a string for CSV output."""
+    if v is None:
+        return ""
+    if isinstance(v, (str, int, float, bool)):
+        return v
+    # dict / list / other → JSON-encode
+    try:
+        import orjson as _orjson
+        return _orjson.dumps(v).decode("utf-8")
+    except ImportError:
+        import json as _json
+        return _json.dumps(v, separators=(",", ":"), ensure_ascii=False)
+
+
+def _export_stream_all(qe, cols, limit):
+    """Yield docs from all chunks in storage order, capped at limit."""
+    n = 0
+    for _chunk_start, chunk in qe._iter_chunks():
+        for did in sorted(chunk):
+            if limit is not None and n >= limit:
+                return
+            doc = {"_id": did, **chunk[did]}
+            qe._collapse_expanded_fields(doc)
+            yield _export_project(doc, cols)
+            n += 1
+
+
+def _export_stream_query(qe, query_str, cols, limit):
+    """Yield docs matching a query, paginated, capped at limit."""
+    page = 0
+    yielded = 0
+    while True:
+        try:
+            result = qe.query(query_str, page=page, page_size=_EXPORT_BATCH)
+        except SyntaxError as e:
+            print(f"Query syntax error: {e}", file=sys.stderr)
+            sys.exit(1)
+        docs = result["results"]
+        if not docs:
+            return
+        for doc in docs:
+            if limit is not None and yielded >= limit:
+                return
+            yield _export_project(doc, cols)
+            yielded += 1
+        if len(docs) < _EXPORT_BATCH:
+            return
+        page += 1
+
+
+def _export_dumps():
+    """Return (dumps, ext) where dumps(x) -> bytes and ext is the module name."""
+    try:
+        import orjson as _orjson
+        return _orjson.dumps, "orjson"
+    except ImportError:
+        import json as _json
+        return lambda o: _json.dumps(o, separators=(",", ":"), ensure_ascii=False).encode("utf-8"), "json"
+
+
+def _export_jsonl(qe, out, query_str, cols, limit, start_after_id,
+                  checkpoint_state, progress_fh, on_progress, on_checkpoint):
+    """Stream JSONL rows. Mutates checkpoint_state.
+
+    Returns the count of rows newly written.
+    """
+    dumps, _ext = _export_dumps()
+    stream = (_export_stream_query(qe, query_str, cols, limit)
+              if query_str else _export_stream_all(qe, cols, limit))
+    written = 0
+    last_id = start_after_id
+    for doc in stream:
+        last_id = doc.get("_id", last_id)
+        out.write(dumps(doc).decode("utf-8"))
+        out.write("\n")
+        written += 1
+        if on_progress and written % on_progress[0] == 0:
+            on_progress[1](written)
+        if on_checkpoint and written % on_checkpoint[0] == 0:
+            on_checkpoint[1](last_id, written)
+    return written, last_id
+
+
+def _export_collect_keys(qe, query_str, cols, limit):
+    """Pass 1 (CSV only): union of all column keys seen across the result set."""
+    keys: list = []
+    seen: set = set()
+    def add(k):
+        if k not in seen:
+            seen.add(k); keys.append(k)
+    # Always include _id first.
+    add("_id")
+    stream = (_export_stream_query(qe, query_str, cols=None, limit=limit)
+              if query_str else _export_stream_all(qe, cols=None, limit=limit))
+    for doc in stream:
+        for k in doc.keys():
+            add(k)
+    return keys
+
+
+def _export_finalize_csv_keys(keys, cols):
+    """Reorder keys: _id first, then user-requested cols in order, then the rest
+    in first-seen order. Drops cols not actually seen in the data."""
+    seen = set()
+    out = []
+    out.append("_id"); seen.add("_id")
+    if cols:
+        for c in cols:
+            if c in keys and c not in seen:
+                out.append(c); seen.add(c)
+    for k in keys:
+        if k not in seen:
+            out.append(k); seen.add(k)
+    return out
+
+
+def cmd_export(args):
+    """Export matching documents to JSONL or CSV.
+
+    Streams docs from the index (no in-memory accumulation) so very large
+    exports are OOM-safe. Supports resume via a sidecar checkpoint file so
+    an interrupted run can pick up where it left off. Writes to a file with
+    -o/--output, or to stdout (for piping to jq / csvkit / etc.) if omitted.
+    """
+    from flatseek.core.query_engine import QueryEngine
+    from flatseek.core.storage import StorageConfig, create_storage_adapter
+    import datetime as _dt
+    import time as _time
+
+    out_path = getattr(args, "output", None)
+    write_to_stdout = out_path is None
+    quiet = getattr(args, "quiet", False)
+    fmt = getattr(args, "format", "jsonl")
+    query_str = (getattr(args, "query", "") or "").strip()
+    cols = _parse_columns(getattr(args, "columns", None))
+    limit = getattr(args, "limit", None)
+    force_restart = not getattr(args, "resume", True)
+
+    # ── Resolve storage / encryption ──
+    data_path = Path(args.data_dir)
+    is_flat_file = data_path.is_file() and (
+        str(data_path).endswith((".fsk", ".flatseek", ".flat"))
+    )
+    enc_key = None
+    storage = None
+    if is_flat_file:
+        enc_key = _get_flatseek_enc_key(data_path, args)
+        from flatseek.flatseek_file import FlatseekFileStorageAdapter
+        storage = FlatseekFileStorageAdapter(data_path, enc_key=enc_key)
+    elif getattr(args, "storage_backend", None):
+        config = StorageConfig(
+            backend=args.storage_backend,
+            bucket=getattr(args, "storage_bucket", "") or "",
+            region=getattr(args, "storage_region", "") or "",
+            endpoint_url=getattr(args, "storage_endpoint", "") or "",
+            base_path=getattr(args, "storage_base_path", "") or "",
+            url=getattr(args, "storage_url", "") or "",
+        )
+        storage = create_storage_adapter(config)
+
+    qe = QueryEngine(args.data_dir, storage=storage)
+    if enc_key is not None:
+        qe.set_key(enc_key)
+    elif not is_flat_file:
+        _apply_passphrase(qe, args)
+
+    # ── Open output target ──
+    # Stdout mode: resume is silently disabled (stdout can't be replayed).
+    resume_enabled = (not write_to_stdout) and (not force_restart)
+    if write_to_stdout and not quiet:
+        progress_fh = None  # no progress to keep pipe clean
+    elif quiet:
+        progress_fh = None
+    else:
+        progress_fh = sys.stderr
+    if write_to_stdout:
+        out_fh = sys.stdout
+        start_after_id = -1
+        existing_count = 0
+    else:
+        start_after_id = -1
+        existing_count = 0
+        if resume_enabled:
+            start_after_id, existing_count = _export_load_checkpoint(
+                out_path, query_str, fmt, cols, force_restart=False,
+            )
+        if start_after_id is None or start_after_id < 0:
+            # Fresh start (or forced restart).
+            if os.path.exists(out_path):
+                os.remove(out_path)
+            out_fh = open(out_path, "w", encoding="utf-8", newline="")
+            start_after_id = -1
+            existing_count = 0
+        else:
+            if progress_fh:
+                print(
+                    f"[EXPORT] Resuming from checkpoint: {existing_count:,} rows "
+                    f"already exported (last _id={start_after_id})",
+                    file=progress_fh,
+                )
+            out_fh = open(out_path, "a", encoding="utf-8", newline="")
+
+    # ── Signal handler for graceful interrupt ──
+    _started_at = _dt.datetime.utcnow().isoformat() + "Z"
+    _export_state = {
+        "count": existing_count,
+        "last_id": start_after_id,
+        "out_path": out_path,
+        "query_str": query_str,
+        "fmt": fmt,
+        "cols": cols,
+    }
+    _interrupted = {"flag": False}
+
+    def _on_signal(signum, frame):
+        if _interrupted["flag"]:
+            return  # second signal: hard exit
+        _interrupted["flag"] = True
+        if _export_state["out_path"]:
+            _export_save_checkpoint(
+                _export_state["out_path"],
+                query_str=_export_state["query_str"],
+                fmt=_export_state["fmt"],
+                cols=_export_state["cols"],
+                last_id=_export_state["last_id"],
+                count=_export_state["count"],
+                started_at=_started_at,
+            )
+            print(
+                f"\n[EXPORT] Interrupted. Checkpoint saved "
+                f"({_export_state['count']:,} rows, last _id={_export_state['last_id']}). "
+                f"Re-run to resume.",
+                file=sys.stderr,
+            )
+        sys.exit(130)
+
+    if out_path is not None:
+        try:
+            import signal as _signal
+            _signal.signal(_signal.SIGINT, _on_signal)
+            _signal.signal(_signal.SIGTERM, _on_signal)
+        except (ValueError, OSError):
+            # signal may not be settable in all environments (threads, subinterpreters)
+            pass
+
+    # ── Dispatch writer ──
+    written = 0
+    t0 = _time.time()
+
+    def _on_progress(n_written):
+        if progress_fh:
+            progress_fh.write(
+                f"\r[EXPORT] {n_written:,} rows…   "
+            )
+            progress_fh.flush()
+
+    def _on_checkpoint(last_id, n_written):
+        _export_state["count"] = existing_count + n_written
+        _export_state["last_id"] = last_id
+        if out_path is not None:
+            _export_save_checkpoint(
+                out_path,
+                query_str=query_str,
+                fmt=fmt,
+                cols=cols,
+                last_id=last_id,
+                count=_export_state["count"],
+                started_at=_started_at,
+            )
+
+    try:
+        if fmt == "jsonl":
+            # JSONL is one-pass streamable; just skip already-written rows.
+            def _filtered_jsonl():
+                for doc in (_export_stream_query(qe, query_str, cols, limit)
+                            if query_str else _export_stream_all(qe, cols, limit)):
+                    if doc.get("_id", -1) <= start_after_id:
+                        continue
+                    yield doc
+            new_count = 0
+            last_id = start_after_id
+            dumps, _ext = _export_dumps()
+            for doc in _filtered_jsonl():
+                last_id = doc.get("_id", last_id)
+                out_fh.write(dumps(doc).decode("utf-8"))
+                out_fh.write("\n")
+                new_count += 1
+                _export_state["count"] = existing_count + new_count
+                _export_state["last_id"] = last_id
+                if new_count % 1_000 == 0:
+                    _on_progress(new_count)
+                if out_path is not None and new_count % _EXPORT_CHECKPOINT_FLUSH_EVERY == 0:
+                    _on_checkpoint(last_id, new_count)
+            written = new_count
+        else:  # csv
+            # CSV needs a stable header. Two-pass: collect keys, then write rows.
+            if write_to_stdout:
+                # Stdout mode: do both passes to a temp file, then dump to stdout.
+                import tempfile as _tempfile
+                tmp_dir = _tempfile.mkdtemp(prefix="flatseek_export_")
+                tmp_path = os.path.join(tmp_dir, "out.csv")
+                try:
+                    _export_csv_to_path(
+                        qe, tmp_path, query_str, cols, limit,
+                        start_after_id, existing_count, _export_state,
+                        progress_fh, _on_progress, _on_checkpoint,
+                    )
+                    with open(tmp_path, "r", encoding="utf-8", newline="") as f:
+                        for line in f:
+                            out_fh.write(line)
+                    written = _export_state["count"] - existing_count
+                finally:
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                    try:
+                        os.rmdir(tmp_dir)
+                    except OSError:
+                        pass
+            else:
+                # File mode: keys → write header → write rows.
+                if start_after_id < 0:
+                    # Fresh start: collect keys, write header, then rows.
+                    keys = _export_collect_keys(qe, query_str, cols, limit)
+                    final_keys = _export_finalize_csv_keys(keys, cols)
+                    w = csv.DictWriter(
+                        out_fh, fieldnames=final_keys,
+                        extrasaction="ignore", dialect="unix",
+                    )
+                    w.writeheader()
+                    out_fh.flush()
+                    _export_csv_rows(
+                        qe, out_fh, w, query_str, cols, limit,
+                        start_after_id, existing_count, _export_state,
+                        progress_fh, _on_progress, _on_checkpoint,
+                    )
+                else:
+                    # Resume: open in append mode, just append rows (header already present).
+                    keys = _export_collect_keys(qe, query_str, cols, limit)
+                    final_keys = _export_finalize_csv_keys(keys, cols)
+                    w = csv.DictWriter(
+                        out_fh, fieldnames=final_keys,
+                        extrasaction="ignore", dialect="unix",
+                    )
+                    _export_csv_rows(
+                        qe, out_fh, w, query_str, cols, limit,
+                        start_after_id, existing_count, _export_state,
+                        progress_fh, _on_progress, _on_checkpoint,
+                    )
+                written = _export_state["count"] - existing_count
+    finally:
+        if not write_to_stdout:
+            out_fh.close()
+
+    total_count = existing_count + written
+    if out_path is not None and not _interrupted["flag"]:
+        # Clean up checkpoint only on successful completion.
+        _export_remove_checkpoint(out_path)
+    if progress_fh:
+        elapsed = _time.time() - t0
+        rate = total_count / elapsed if elapsed > 0 else 0
+        progress_fh.write(
+            f"\r[EXPORT] Done — {total_count:,} rows in {elapsed:.1f}s "
+            f"({rate:,.0f} rows/s)        \n"
+        )
+        progress_fh.flush()
+    if write_to_stdout and not quiet:
+        # When piping to stdout, also write a brief summary to stderr.
+        elapsed = _time.time() - t0
+        print(
+            f"[EXPORT] {total_count:,} rows in {elapsed:.1f}s",
+            file=sys.stderr,
+        )
+
+
+def _export_csv_to_path(qe, out_path, query_str, cols, limit, start_after_id,
+                        existing_count, _export_state, progress_fh,
+                        _on_progress, _on_checkpoint):
+    """Helper: collect keys + write rows to a file path. Used by both fresh
+    file output and the stdout → temp file shim."""
+    keys = _export_collect_keys(qe, query_str, cols, limit)
+    final_keys = _export_finalize_csv_keys(keys, cols)
+    with open(out_path, "w", encoding="utf-8", newline="") as fh:
+        w = csv.DictWriter(
+            fh, fieldnames=final_keys,
+            extrasaction="ignore", dialect="unix",
+        )
+        w.writeheader()
+        fh.flush()
+        _export_csv_rows(
+            qe, fh, w, query_str, cols, limit,
+            start_after_id, existing_count, _export_state,
+            progress_fh, _on_progress, _on_checkpoint,
+        )
+
+
+def _export_csv_rows(qe, out_fh, writer, query_str, cols, limit, start_after_id,
+                     existing_count, _export_state, progress_fh, _on_progress,
+                     _on_checkpoint):
+    """Stream CSV rows from query/all, skipping already-written by _id."""
+    n = 0
+    last_id = start_after_id
+    stream = (_export_stream_query(qe, query_str, cols, limit)
+              if query_str else _export_stream_all(qe, cols, limit))
+    for doc in stream:
+        if doc.get("_id", -1) <= start_after_id:
+            continue
+        last_id = doc.get("_id", last_id)
+        writer.writerow({k: _export_csv_cell(doc.get(k)) for k in writer.fieldnames})
+        n += 1
+        _export_state["count"] = existing_count + n
+        _export_state["last_id"] = last_id
+        if n % 1_000 == 0:
+            _on_progress(n)
+        if n % _EXPORT_CHECKPOINT_FLUSH_EVERY == 0:
+            _on_checkpoint(last_id, n)
+    # Flush at end-of-pass.
+    try:
+        out_fh.flush()
+    except Exception:
+        pass
+
+
 def cmd_join(args):
     from flatseek.core.query_engine import QueryEngine
     qe = QueryEngine(args.data_dir)
@@ -2590,6 +3119,45 @@ def main():
     p = sub.add_parser("stats", help="Show index statistics")
     p.add_argument("data_dir")
 
+    # export
+    p = sub.add_parser("export",
+                       help="Export matching documents to JSONL or CSV")
+    p.add_argument("data_dir",
+                   help="Index directory (or .fsk / .flatseek / .flat file)")
+    p.add_argument("-o", "--output", default=None, metavar="PATH",
+                   help="Output file path (default: stdout)")
+    p.add_argument("-f", "--format", default="jsonl", choices=["jsonl", "csv"],
+                   help="Output format (default: jsonl)")
+    p.add_argument("-q", "--query", default="", metavar="Q",
+                   help="Lucene-like query (default: export all docs)")
+    p.add_argument("-c", "--columns", default=None, metavar="col1,col2,...",
+                   help="Comma-separated column list (default: all columns)")
+    p.add_argument("-n", "--limit", type=int, default=None, metavar="N",
+                   help="Maximum number of rows to export (default: no cap)")
+    p.add_argument("--passphrase", default=None, metavar="PASS",
+                   help="Passphrase for encrypted indexes")
+    p.add_argument("--quiet", dest="quiet", action="store_true", default=False,
+                   help="Suppress progress messages (only matters with -o)")
+    p.add_argument("--resume", dest="resume", action="store_true", default=True,
+                   help="Resume from checkpoint if output file exists "
+                        "(default: true — safe rerun)")
+    p.add_argument("--no-resume", "--force-restart", dest="resume",
+                   action="store_false",
+                   help="Discard existing output + checkpoint, start fresh")
+    p.add_argument("--storage-backend", default=None, choices=["local", "s3", "vercel-blob", "url"],
+                   dest="storage_backend",
+                   help="Storage backend (default: local)")
+    p.add_argument("--storage-bucket", default=None, dest="storage_bucket",
+                   help="Bucket name for S3 or Vercel Blob")
+    p.add_argument("--storage-region", default=None, dest="storage_region",
+                   help="AWS region for S3")
+    p.add_argument("--storage-endpoint", default=None, dest="storage_endpoint",
+                   help="Custom S3 endpoint URL (for MinIO, etc.)")
+    p.add_argument("--storage-base-path", default=None, dest="storage_base_path",
+                   help="Prefix path within bucket")
+    p.add_argument("--storage-url", default=None, dest="storage_url",
+                   help="Base URL for URL storage backend")
+
     # serve
     p = sub.add_parser("serve", help="Start API server + dashboard")
     p.add_argument("data_dir", nargs="?", default=None,
@@ -2762,6 +3330,8 @@ def main():
         cmd_chat(args)
     elif args.command == "stats":
         cmd_stats(args)
+    elif args.command == "export":
+        cmd_export(args)
     elif args.command == "serve":
         cmd_serve(args)
     elif args.command == "api":

@@ -21,6 +21,7 @@
 - [`flatseek encrypt`](#flatseek-encrypt)
 - [`flatseek decrypt`](#flatseek-decrypt)
 - [`flatseek delete`](#flatseek-delete)
+- [`flatseek export`](#flatseek-export)
 - [`flatseek dedup`](#flatseek-dedup)
 - [`flatseek pack`](#flatseek-pack)
 - [`flatseek unpack`](#flatseek-unpack)
@@ -66,6 +67,7 @@ The Flatseek CLI (`flatseek`) manages the full lifecycle: build, query, serve, a
 | `encrypt` | Encrypt index in-place (ChaCha20-Poly1305) |
 | `decrypt` | Decrypt index in-place |
 | `delete` | Delete index directory (parallel rm -rf) |
+| `export` | Stream docs (filtered by query) to JSONL or CSV |
 | `dedup` | Remove duplicate docs from index |
 | `pack` | Pack index directory into portable `.fsk` file |
 | `unpack` | Unpack `.fsk` file into index directory |
@@ -382,6 +384,115 @@ flatseek stats <data_dir>
 ```bash
 flatseek stats ./data
 ```
+
+---
+
+## `flatseek export`
+
+Stream documents from the index to **JSONL** (default) or **CSV**, optionally
+filtered by a Lucene-like query. Supports resume from checkpoint so an
+interrupted run can be safely re-run.
+
+#### Syntax
+
+```
+flatseek export <data_dir> [options]
+```
+
+`<data_dir>` may be either a directory index (the output of `flatseek build`)
+or a `.fsk` / `.flatseek` / `.flat` flat file.
+
+#### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-o`, `--output` `PATH` | stdout | Write to file (default: stdout for piping) |
+| `-f`, `--format` `{jsonl,csv}` | `jsonl` | Output format |
+| `-q`, `--query` `Q` | (none → all docs) | Lucene-like query filter |
+| `-c`, `--columns` `col1,col2,...` | all columns | Subset of columns to export |
+| `-n`, `--limit` `N` | no cap | Maximum number of rows to export |
+| `--passphrase` `PASS` | prompted | Passphrase for encrypted indexes |
+| `--quiet` | off | Suppress progress messages (only matters with `-o`) |
+| `--resume` / `--no-resume` (`--force-restart`) | on | Resume from checkpoint / start fresh |
+| `--storage-backend` `{local,s3,vercel-blob,url}` | `local` | Read from remote storage |
+| `--storage-bucket`, `--storage-region`, `--storage-endpoint`, `--storage-base-path`, `--storage-url` | — | Remote storage config |
+
+#### Examples
+
+```bash
+# Full dump to JSONL
+flatseek export ./data -o all.jsonl
+
+# Filtered by query
+flatseek export ./data --query 'country:ID AND status:active' -o id_active.jsonl
+
+# CSV with column subset + limit
+flatseek export ./data --format csv --columns name,score,active --limit 1000 -o top.csv
+
+# Pipe to jq
+flatseek export ./data --query 'amount:>1000000' --columns tx_id,amount,sender | jq -c .
+
+# Read from .fsk flat file
+flatseek export ./data/index.fsk -o from_fsk.jsonl
+
+# Encrypted index
+flatseek export ./data --passphrase mysecret -o decrypted.jsonl
+
+# Remote storage
+flatseek export /data --storage-backend s3 --storage-bucket my-bucket --storage-region us-east-1
+```
+
+#### Behavior
+
+- **Streaming, OOM-safe.** Docs are read chunk-by-chunk from disk; peak memory
+  is bounded by the chunk size (≈ 8 MB) regardless of total export size.
+- **No query → export all.** Without `--query`, every document in the index
+  is exported (in storage / `_id` order).
+- **Output target.** With `-o PATH`, data is written to the file and progress
+  (row count) goes to stderr. Without `-o`, data is streamed to stdout and
+  stderr is silent (except for the final summary line) so the output is
+  pipeable to `jq`, `csvkit`, `awk`, etc.
+- **JSONL** is one-pass streamable — one JSON object per line, no header.
+- **CSV** does a two-pass: pass 1 collects the union of column keys (cheap —
+  only keys, not values), pass 2 writes the header + rows. Nested values
+  (lists/dicts) are JSON-encoded into the cell. Standard `csv.DictReader` can
+  re-parse the output.
+
+#### Resume / interrupt
+
+By default, re-running an export against an existing output file picks up
+where the previous run stopped:
+
+- A sidecar checkpoint file `{output}.flatseek-export-checkpoint.json` records
+  `last_doc_id`, `exported_count`, the query, format, and column set.
+- On resume, the new run skips every doc whose `_id <= last_doc_id` and
+  appends the rest.
+- SIGINT (Ctrl-C) and SIGTERM flush the checkpoint before exiting — re-run
+  the same command to resume.
+- The checkpoint is removed automatically on successful completion.
+- **Stdout exports cannot be resumed** (stdout is not replayable). The flag is
+  silently ignored for stdout.
+- `--force-restart` (`--no-resume`) discards the existing output and checkpoint.
+
+Mismatch handling on resume:
+
+| Checkpoint has… | Resume action |
+|-----------------|---------------|
+| Same query, same format, same columns | Resume from `last_doc_id` |
+| Different query | **Error**, exit code 2 — suggests `--force-restart` |
+| Different format | **Error**, exit code 2 |
+| Different `--columns` | **Warning** + continue (early rows in the file may use the original column set) |
+
+#### Notes
+
+- **Don't run two exports to the same `-o` path concurrently.** The second run
+  will find the first run's checkpoint and skip docs that haven't been written
+  yet, leading to gaps in the output.
+- `--columns` is mostly useful for JSONL (each row stays self-contained). For
+  CSV it's a soft constraint — extra columns from the index that aren't in
+  your list will still appear in the header if they show up in any row.
+- For very large exports, prefer JSONL + `jq` over CSV: JSONL streams without
+  the two-pass schema discovery.
 
 ---
 

@@ -45,6 +45,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on 20 MB synthetic indexes, checksum validation, corruption detection, and
   peak-memory bounds via `tracemalloc`.
 
+### Export — JSONL & CSV streaming with resume
+
+- **New subcommand `flatseek export`** streams documents from an index to
+  **JSONL** (default) or **CSV**, optionally filtered by the same Lucene-like
+  query syntax used by `search`. Reads chunks one at a time from disk, so
+  very large exports are OOM-safe (peak memory bounded by chunk size, not
+  total size).
+- **Output targets.** `-o PATH` writes to a file; omit `-o` to stream to
+  stdout (clean for piping to `jq`, `csvkit`, `awk`, …). Progress goes to
+  stderr only when writing to a file.
+- **No query → export all.** Without `--query`, every document in the index
+  is exported in storage order.
+- **Column subset** via `--columns col1,col2,…`. **Row cap** via `--limit N`.
+- **Resume / interrupt.** A sidecar checkpoint file
+  `{output}.flatseek-export-checkpoint.json` records `last_doc_id` plus the
+  query, format, and column set. Re-running the same command picks up where
+  it left off and appends only the missing rows. SIGINT/SIGTERM flush the
+  checkpoint before exiting. Stdout exports cannot be resumed (silently
+  ignored). `--force-restart` (`--no-resume`) discards existing output +
+  checkpoint.
+- **Mismatch handling.** Query or format mismatch with the checkpoint exits
+  with code 2 and points at `--force-restart`. Column mismatch emits a
+  warning and continues.
+- **Storage support.** Works on directory indexes, `.fsk` flat files
+  (`FlatseekFileStorageAdapter`), encrypted indexes (`--passphrase`), and
+  remote storage backends (S3 / Vercel Blob / URL — same flags as `search`).
+- Documented in `docs/cli.md` under `flatseek export`.
+- New test file `tests/test_export.py` covers JSONL/CSV, query, stdout,
+  columns, limit, CSV escaping, nested values, encrypted index, `.fsk`
+  flat file, resume from checkpoint, query/format mismatch, column
+  mismatch warning, `--force-restart`, stdout-no-resume, and `--quiet`.
+
 ## [0.1.6] - 2026-06-27
 
 ### Pack & Unpack — Portable `.fsk` Format
