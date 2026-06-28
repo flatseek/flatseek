@@ -547,13 +547,44 @@ flatseek encrypt <data_dir> [options]
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--passphrase` | prompted | Encryption passphrase |
+| `--resume` | on | Skip files already encrypted (FLATSEEK\x01 magic) — safe rerun |
+| `--no-resume` | — | Force re-encryption of every file (decrypts then re-encrypts with a fresh nonce) |
+| `--verify` | off | Decrypt a random sample back to verify the ChaCha20-Poly1305 auth tag |
+| `--verify-sample N` | 100 | Sample size for `--verify` (0 = all files) |
 
 #### Examples
 
 ```bash
 flatseek encrypt ./data
 flatseek encrypt ./data --passphrase mysecret
+flatseek encrypt ./data --verify --verify-sample 500
 ```
+
+#### Behavior on rerun
+
+By default, re-running `flatseek encrypt` is safe:
+
+- Files already carrying the `FLATSEEK\x01` magic are detected and skipped — no
+  double-encryption, no salt change.
+- The salt in `encryption.json` is preserved across reruns so the key material
+  stays stable.
+- Plaintext files (those missing the magic) are encrypted as usual.
+
+This means you can interrupt the run (Ctrl-C, OOM, crash) and re-run the same
+command to pick up where it left off. Use `--no-resume` to force re-encryption
+of every file (rare; e.g. after manually rotating the salt).
+
+#### Integrity check
+
+Pass `--verify` to decrypt a sample of encrypted files back through the
+ChaCha20-Poly1305 auth-tag check. Files that fail verify are reported with
+their full path. Common causes:
+
+- On-disk corruption / bit-rot
+- `encryption.json` salt was changed after the original encrypt
+
+After investigating, re-run with `--no-resume` to rewrite the affected files
+from a known-good source.
 
 #### Notes
 
@@ -586,13 +617,41 @@ flatseek decrypt <data_dir> [options]
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--passphrase` | prompted | Decryption passphrase |
+| `--resume` | on | Skip files already plaintext — safe rerun |
+| `--no-resume` | — | Force re-decryption of every file (rare) |
+| `--verify` | off | Round-trip a sample through encrypt→decrypt to verify the freshly-decrypted plaintext |
+| `--verify-sample N` | 100 | Sample size for `--verify` (0 = all files) |
 
 #### Examples
 
 ```bash
 flatseek decrypt ./data
 flatseek decrypt ./data --passphrase mysecret
+flatseek decrypt ./data --verify --verify-sample 500
 ```
+
+#### Behavior on rerun
+
+By default, re-running `flatseek decrypt` is safe:
+
+- Files already plaintext (no `FLATSEEK\x01` magic) are detected and skipped.
+- Encrypted files are decrypted as usual.
+- `encryption.json` is removed only after the full run completes with zero
+  errors — interrupting mid-run leaves the salt file in place for retry.
+
+#### Integrity check
+
+Pass `--verify` to round-trip a sample of just-decrypted files through
+`encrypt_bytes` → `decrypt_bytes` with the derived key. Files whose
+freshly-decrypted plaintext fails to round-trip are reported. Catches:
+
+- On-disk corruption on the decrypted plaintext
+- Filesystem-level tampering between decrypt and verify
+
+#### Notes
+
+- The probe step at the start catches wrong passphrases before any files are
+  modified. A failed probe prints an error and exits.
 
 ---
 

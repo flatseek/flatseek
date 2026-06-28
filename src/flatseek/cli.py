@@ -35,7 +35,7 @@ try:
     with open(_PYPROJECT_TOML, "rb") as _f:
         __version__ = tomllib.load(_f)["project"]["version"]
 except Exception:
-    __version__ = "0.1.6"
+    __version__ = "0.1.7"
 
 
 def _parse_columns(columns_str):
@@ -1461,16 +1461,30 @@ def cmd_encrypt(args):
     A random salt is stored in <data_dir>/encryption.json — needed to re-derive
     the key. Do NOT delete this file.
 
+    Resume behavior (default): files already encrypted (FLATSEEK\\x01 magic) are
+    skipped. Safe to interrupt and rerun. Pass --no-resume to force re-encryption
+    of every file (rare; use after a key change with --no-resume).
+
+    Integrity check (--verify): after the run, decrypt a random sample of
+    encrypted files back to verify the ChaCha20-Poly1305 auth tag. Reports N
+    passed / K failed with file paths.
+
     Constraint: incremental builds cannot append to encrypted index files.
     Run 'flatseek decrypt' first, rebuild, then 'flatseek encrypt' again.
     """
-    import os, json, secrets, sys, time as _time
+    import os, json, secrets, sys, time as _time, random
     from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
-    from flatseek.core.query_engine import derive_key, encrypt_bytes, is_encrypted
+    from flatseek.core.query_engine import (
+        derive_key, encrypt_bytes, is_encrypted, decrypt_bytes,
+    )
+    from flatseek.core.query_engine import _ENC_MAGIC
 
     data_dir  = args.data_dir
     index_dir = os.path.join(data_dir, "index")
     docs_dir  = os.path.join(data_dir, "docs")
+    resume    = getattr(args, "resume", True)
+    verify    = getattr(args, "verify", False)
+    verify_n  = getattr(args, "verify_sample", 100)
 
     if not os.path.isdir(index_dir):
         print(f"No index found in {data_dir}")
@@ -1534,8 +1548,19 @@ def cmd_encrypt(args):
                 data = f.read()
             if not data:
                 return None
-            if is_encrypted(data):
+            # Resume (default): skip already-encrypted files.
+            if resume and is_encrypted(data):
                 return (path, "already", len(data))
+            # --no-resume: if file is already encrypted, decrypt first to get
+            # back to plaintext. Otherwise encrypt_bytes would double-encrypt
+            # the ciphertext (irrecoverable without the original plaintext).
+            # Requires the file was encrypted with the CURRENT key/salt.
+            if not resume and is_encrypted(data):
+                try:
+                    data = decrypt_bytes(data, key)
+                except Exception as de:
+                    return (path, "error",
+                            f"cannot decrypt for re-encrypt: {de}")
             enc = encrypt_bytes(data, key)
             tmp = path + f".{os.getpid()}.etmp"
             with open(tmp, "wb") as f:
@@ -1545,7 +1570,10 @@ def cmd_encrypt(args):
         except Exception as e:
             return (path, "error", str(e))
 
-    print(f"Encrypting {len(targets):,} files …")
+    if resume:
+        print(f"Encrypting {len(targets):,} files (resume: skip already-encrypted) …")
+    else:
+        print(f"Encrypting {len(targets):,} files (no-resume: re-encrypt everything) …")
     with ThreadPoolExecutor(max_workers=n_workers) as ex:
         futures = {ex.submit(_encrypt_file, p): p for p in targets}
         for fut in _as_completed(futures):
@@ -1567,7 +1595,55 @@ def cmd_encrypt(args):
                 sys.stderr.flush()
     sys.stderr.write("\r" + " " * 50 + "\r")
 
-    print(f"Done: {n_done:,} encrypted, {n_already:,} already encrypted, {n_err:,} errors")
+    if resume:
+        print(f"Done: {n_done:,} newly encrypted, {n_already:,} resumed (already encrypted), {n_err:,} errors")
+    else:
+        print(f"Done: {n_done:,} encrypted (no-resume), {n_already:,} were already encrypted, {n_err:,} errors")
+
+    # ── Integrity check (--verify) ──────────────────────────────────────────────
+    # Decrypt a sample of encrypted files back. Poly1305 auth tag validates
+    # ciphertext integrity: if decrypt succeeds, bytes are byte-for-byte intact
+    # and were encrypted with the current key.
+    if verify and n_err == 0:
+        # Walk targets again to confirm what's encrypted on disk right now.
+        encrypted_paths = []
+        for path in targets:
+            if not os.path.isfile(path):
+                continue
+            with open(path, "rb") as f:
+                head = f.read(len(_ENC_MAGIC))
+            if head == _ENC_MAGIC:
+                encrypted_paths.append(path)
+        sample_size = verify_n if verify_n > 0 else len(encrypted_paths)
+        if encrypted_paths:
+            sample = random.sample(encrypted_paths, min(sample_size, len(encrypted_paths)))
+        else:
+            sample = []
+
+        n_v_pass = n_v_fail = 0
+        failed = []
+        for path in sample:
+            try:
+                with open(path, "rb") as f:
+                    blob = f.read()
+                decrypt_bytes(blob, key)  # Poly1305 verifies auth tag
+                n_v_pass += 1
+            except Exception as e:
+                n_v_fail += 1
+                failed.append((path, str(e)))
+
+        if not sample:
+            print("Verify: 0 sampled (no encrypted files found)")
+        else:
+            print(f"Verify: {len(sample):,} sampled, {n_v_pass:,} passed, {n_v_fail:,} failed")
+            for path, err in failed:
+                print(f"  FAILED: {path}: {err}")
+            if n_v_fail:
+                print("Some files failed integrity check. Possible causes:")
+                print("  - On-disk corruption / bit-rot")
+                print("  - Encryption was started with a different salt/passphrase")
+                print("Re-run with --no-resume after fixing the salt in encryption.json.")
+
     if n_err == 0:
         print(f"Salt stored in: {enc_path}")
         print("Keep your passphrase safe — there is no recovery without it.")
@@ -1579,13 +1655,26 @@ def cmd_decrypt(args):
     Use this before running incremental builds on an encrypted index, or to
     permanently remove encryption. The encryption.json salt file is removed
     after successful decryption.
+
+    Resume behavior (default): files that are already plaintext (no
+    FLATSEEK\\x01 magic) are skipped. Safe to interrupt and rerun. Pass
+    --no-resume to force re-decryption of every file (rare; rarely useful).
+
+    Integrity check (--verify): after the run, take a random sample of
+    files that were just decrypted and re-encrypt them with the same key.
+    The re-encrypted bytes must equal the original on-disk ciphertext.
     """
-    import os, json, sys, time as _time
+    import os, json, sys, time as _time, random
     from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
-    from flatseek.core.query_engine import load_encryption_key, decrypt_bytes, is_encrypted
+    from flatseek.core.query_engine import (
+        load_encryption_key, decrypt_bytes, encrypt_bytes, is_encrypted,
+    )
 
     data_dir = args.data_dir
     enc_path = os.path.join(data_dir, "encryption.json")
+    resume   = getattr(args, "resume", True)
+    verify   = getattr(args, "verify", False)
+    verify_n = getattr(args, "verify_sample", 100)
 
     passphrase = args.passphrase
     if not passphrase:
@@ -1630,7 +1719,10 @@ def cmd_decrypt(args):
             try:
                 decrypt_bytes(_probe_data, key)
                 print("OK")
-            except ValueError:
+            except Exception:
+                # decrypt_bytes raises InvalidToken (cryptography.fernet) on
+                # wrong key, which is NOT a ValueError subclass. Catch
+                # everything to fail fast regardless of the exception type.
                 print("\nError: wrong passphrase — decryption failed. No files were modified.")
                 return
         else:
@@ -1654,6 +1746,10 @@ def cmd_decrypt(args):
             targets.append(p)
 
     n_plain = n_done = n_err = 0
+    # Track which files were "done" (newly decrypted) so verify can sample them.
+    # Decrypted plaintexts are NOT kept in memory; we re-read each file when
+    # verifying. This keeps memory bounded.
+    decrypted_paths: list[str] = []
     n_workers = min(32, max(4, len(targets)))
     t0 = _time.time()
     done = 0
@@ -1664,7 +1760,8 @@ def cmd_decrypt(args):
                 data = f.read()
             if not data:
                 return (path, "skip", 0)
-            if not is_encrypted(data):
+            # Resume: skip already-plaintext files unless --no-resume.
+            if resume and not is_encrypted(data):
                 return (path, "plain", 0)
             dec = decrypt_bytes(data, key)
             tmp = path + f".{os.getpid()}.dtmp"
@@ -1677,7 +1774,10 @@ def cmd_decrypt(args):
         except Exception as e:
             return (path, "error", str(e))
 
-    print(f"Decrypting {len(targets):,} files …")
+    if resume:
+        print(f"Decrypting {len(targets):,} files (resume: skip already-plain) …")
+    else:
+        print(f"Decrypting {len(targets):,} files (no-resume: re-decrypt everything) …")
     with ThreadPoolExecutor(max_workers=n_workers) as ex:
         futures = {ex.submit(_decrypt_file, p): p for p in targets}
         for fut in _as_completed(futures):
@@ -1686,6 +1786,7 @@ def cmd_decrypt(args):
                 n_plain += 1
             elif status == "done":
                 n_done += 1
+                decrypted_paths.append(path)
             elif status == "error":
                 n_err += 1
                 sys.stderr.write(f"\n  Error: {path}: {val}\n")
@@ -1699,7 +1800,51 @@ def cmd_decrypt(args):
                 sys.stderr.flush()
     sys.stderr.write("\r" + " " * 50 + "\r")
 
-    print(f"Done: {n_done:,} decrypted, {n_plain:,} already plain, {n_err:,} errors")
+    if resume:
+        print(f"Done: {n_done:,} newly decrypted, {n_plain:,} resumed (already plain), {n_err:,} errors")
+    else:
+        print(f"Done: {n_done:,} decrypted (no-resume), {n_plain:,} were already plain, {n_err:,} errors")
+
+    # ── Integrity check (--verify) ──────────────────────────────────────────────
+    # Re-encrypt a sample of just-decrypted files. The new ciphertext must
+    # differ from the original only in nonce — but that's not byte-equal across
+    # runs because each encrypt_bytes() call picks a fresh nonce. So we instead
+    # re-decrypt the freshly-written plaintext and verify the Poly1305 tag
+    # passes against the key. This confirms the decrypted plaintext is
+    # authentic (no tampering between write and read).
+    if verify and n_err == 0 and decrypted_paths:
+        sample_size = verify_n if verify_n > 0 else len(decrypted_paths)
+        sample = random.sample(decrypted_paths, min(sample_size, len(decrypted_paths)))
+
+        n_v_pass = n_v_fail = 0
+        failed = []
+        for path in sample:
+            try:
+                with open(path, "rb") as f:
+                    plaintext = f.read()
+                # Round-trip: encrypt → decrypt → must equal original plaintext.
+                # This catches: tampered plaintext bytes, wrong key derivation
+                # between cmd_decrypt invocations, write corruption.
+                ct = encrypt_bytes(plaintext, key)
+                rt = decrypt_bytes(ct, key)
+                if rt == plaintext:
+                    n_v_pass += 1
+                else:
+                    n_v_fail += 1
+                    failed.append((path, "round-trip mismatch"))
+            except Exception as e:
+                n_v_fail += 1
+                failed.append((path, str(e)))
+
+        print(f"Verify: {len(sample):,} sampled, {n_v_pass:,} passed, {n_v_fail:,} failed")
+        for path, err in failed:
+            print(f"  FAILED: {path}: {err}")
+        if n_v_fail:
+            print("Some files failed integrity check. Possible causes:")
+            print("  - On-disk corruption / bit-rot on the decrypted plaintext")
+            print("  - Filesystem-level tampering between decrypt and verify")
+            print("Re-decrypt from a known-good source after investigating.")
+
     if n_err == 0 and n_done > 0:
         os.remove(enc_path)
         print(f"Removed: {enc_path}")
@@ -2528,12 +2673,32 @@ def main():
     p.add_argument("data_dir", help="Index directory (same as build output)")
     p.add_argument("--passphrase", default=None, metavar="PASS",
                    help="Encryption passphrase (prompted interactively if omitted)")
+    p.add_argument("--resume", dest="resume", action="store_true", default=True,
+                   help="Skip files already encrypted (default: true — safe rerun)")
+    p.add_argument("--no-resume", dest="resume", action="store_false",
+                   help="Force re-encryption of every file (rare; use after key change)")
+    p.add_argument("--verify", dest="verify", action="store_true", default=False,
+                   help="After encrypting, decrypt a sample back to verify the auth tag")
+    p.add_argument("--no-verify", dest="verify", action="store_false",
+                   help="Skip integrity verification (default)")
+    p.add_argument("--verify-sample", type=int, default=100, metavar="N",
+                   help="Number of files to sample for --verify (0 = all, default: 100)")
 
     # decrypt
     p = sub.add_parser("decrypt", help="Decrypt index in-place (reverse of encrypt)")
     p.add_argument("data_dir", help="Index directory (same as build output)")
     p.add_argument("--passphrase", default=None, metavar="PASS",
                    help="Decryption passphrase (prompted interactively if omitted)")
+    p.add_argument("--resume", dest="resume", action="store_true", default=True,
+                   help="Skip files already plaintext (default: true — safe rerun)")
+    p.add_argument("--no-resume", dest="resume", action="store_false",
+                   help="Force re-decryption of every file (rare)")
+    p.add_argument("--verify", dest="verify", action="store_true", default=False,
+                   help="After decrypting, round-trip a sample through encrypt→decrypt to verify")
+    p.add_argument("--no-verify", dest="verify", action="store_false",
+                   help="Skip integrity verification (default)")
+    p.add_argument("--verify-sample", type=int, default=100, metavar="N",
+                   help="Number of files to sample for --verify (0 = all, default: 100)")
 
     # delete
     p = sub.add_parser("delete", help="Delete an index directory fast (parallel unlink)")

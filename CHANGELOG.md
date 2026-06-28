@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.7] - 2026-06-28
+
+### Resume & Integrity — encrypt/decrypt
+
+- **`flatseek encrypt/decrypt` now safely resumes an interrupted run.**
+  By default, re-running on a partially-encrypted directory skips
+  already-processed files via the `FLATSEEK\x01` magic-header detection.
+  The salt in `encryption.json` is preserved across reruns, so key
+  material stays stable and previously-encrypted files remain readable.
+- **`--no-resume`** flag forces re-encryption of every file. For files that
+  are already encrypted, this first decrypts with the current key then
+  re-encrypts with a fresh nonce (no double-encryption corruption).
+- **`--verify`** flag: after the run, decrypts a random sample of
+  encrypted files back to verify the ChaCha20-Poly1305 auth tag. Reports
+  N passed / K failed with file paths. `--verify-sample N` controls the
+  sample size (default 100; 0 = all files).
+- **`cmd_decrypt` probe step** now catches `cryptography.fernet.InvalidToken`
+  on wrong passphrase (previously only `ValueError` was caught, which let
+  `InvalidToken` bubble up uncaught and crash the CLI).
+
+### Streaming pack/unpack — OOM-safe on very large indexes
+
+- **`flatseek pack`** now streams sections incrementally to the output file.
+  Each section's bytes pass through a single `sha256` hasher + 4 MB write
+  chunk, never accumulating in memory. Total pack peak memory is bounded by
+  `CHUNK_SIZE × ~2` (≈ 8 MB) regardless of total output size.
+- **`flatseek unpack`** now reads just the offset-table prefix of each
+  section, then seeks to each file's absolute offset in the `.fsk` and
+  copies its bytes directly to disk. No `section_data` accumulation, no
+  `write_tasks` list. Peak memory is bounded by `max(file_size) × ~2`
+  (per-file AEAD still requires whole-file reads).
+- **`pack._validate`** also streams — hashes each section in 4 MB blocks.
+- **File format unchanged** — same 1024-byte header layout, same section
+  descriptors, same checksum semantics. Existing `.fsk` files still work.
+- **Pre-existing bug fix:** duplicate `_validate` method shadowed the real
+  validation with a no-op stub. Removed; real checksum verification now runs.
+- New test file `tests/test_pack_streaming.py` covers byte-exact roundtrip
+  on 20 MB synthetic indexes, checksum validation, corruption detection, and
+  peak-memory bounds via `tracemalloc`.
+
 ## [0.1.6] - 2026-06-27
 
 ### Pack & Unpack — Portable `.fsk` Format
