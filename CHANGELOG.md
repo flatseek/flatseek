@@ -5,6 +5,139 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.8] - 2026-06-29
+
+### New: `flatseek verify` — chunk-level integrity check
+
+- **`flatseek verify <path>`** walks every doc chunk (read → decrypt →
+  decompress → parse) and reports load failures. Supports both index
+  directories and single-file archives (`.fsk` / `.flatseek` / `.flat`),
+  in plaintext or encrypted form.
+- Useful for diagnosing encryption interrupted mid-run, on-disk bit-rot,
+  compression-format mismatch, and partial plaintext in an encrypted index.
+- Options: `--passphrase` for encrypted sources, `--mode {all,sample}` +
+  `--sample-size N` for spot checks, `--show N` to control how many
+  corrupt chunks are listed.
+- Exits with code 0 on success, 2 on any chunk failure.
+- New test file `tests/test_verify.py` (11 cases) covers all 4
+  source/encryption combinations, extension aliases, wrong-passphrase
+  detection, and sample mode.
+
+### New: `flatseek slice` — extract a query-matched subset as a new index
+
+- **`flatseek slice <source> <query> -o <output>`** materializes a new
+  standalone flatseek index containing only the docs matching a Lucene
+  query. Use cases: per-region index partitioning, privacy-filtered
+  sub-indexes for individual customers, demo subsets.
+- **Output format** auto-detected from extension: `.fsk` /
+  `.flatseek` / `.flat` → single file; anything else → directory mirror.
+- **Streaming** — groups matching IDs by chunk_start, then reads one chunk
+  at a time via `qe._iter_chunks(match_chunks=…)`. Memory bounded by
+  `chunk_size × n_workers + 1` regardless of source size.
+- **doc_ids preserved** — a doc with id 42 in the source has id 42 in
+  the slice. Downstream joins and lookups keep working trivially.
+- **Encryption inheritance**: encrypted source → encrypted output with a
+  fresh salt (cryptographically independent from source). Override with
+  `--force-plaintext` or `--out-passphrase NEW` (re-key with new
+  passphrase + new salt).
+- **Atomic write**: writes to a temp directory first, then renames to
+  the final path on success. A mid-flight crash leaves no partial output.
+- **Empty result** is a clean exit — no output written (no empty `.fsk`
+  or directory that looks valid but has no data).
+- **V1 limitations**: text-search only. Doc-values (`dv/<field>/*`) are
+  NOT regenerated, so range queries on numeric fields won't work in
+  the slice. `index/<bucket>/terms.set` files are NOT pre-built
+  (lazy-built on first query for each bucket, with a small first-hit
+  latency penalty). Both are documented follow-ups.
+- New test file `tests/test_slice.py` (10 cases) covers plaintext +
+  encrypted × dir + .fsk, force-plaintext override, doc-id preservation,
+  posting-list filter correctness, AND query, empty result, and FTS
+  prefix queries.
+
+### Bug fixes — `QueryEngine` init-in-wrong-place pattern
+
+Two attributes were being initialized in `clear_doc_cache()` instead of
+`__init__()`, breaking any code path that called the referencing method
+on a fresh QE that hadn't yet run an export-style pagination loop:
+
+- **`_wal_posting_cache`** — set in `clear_doc_cache`, written by
+  `_read_wal_postings`. Caused `AttributeError: 'QueryEngine' object
+  has no attribute '_wal_posting_cache'` on the first live-search
+  query against an ongoing build (WAL present, no prior
+  `clear_doc_cache` call).
+- **`_profile` and `_phase_times`** — set in `clear_doc_cache`, read by
+  `_timed_phase` (used inside the wildcard-verification path of
+  `query()`). Caused `AttributeError: 'QueryEngine' object has no
+  attribute '_profile'` from the API search route when a query
+  contained a wildcard (e.g. `name:user*`).
+- Both attributes moved to `__init__`. `clear_doc_cache` no longer
+  initializes them and its docstring updated to call out which caches
+  it does NOT touch.
+- New regression test `tests/test_wal_search.py` (3 cases) locks in
+  fresh-QE initialization for `_wal_posting_cache`. The FTS prefix
+  test in `tests/test_slice.py` exercises the `_profile` path.
+
+### Bug fix — `cmd_verify` for `.fsk` sources
+
+- The original `cmd_verify` had two broken `.fsk` paths:
+  - **Path resolution** reconstructed doc paths from `_file_offsets`
+    keys with the wrong prefix format, leading to
+    `FileNotFoundError: File not found in flatseek: docs/docs_*.zlib`
+    for every chunk. Replaced with `storage._list_docs_recursive()`
+    (the canonical source of paths inside the archive).
+  - **QueryEngine crash on encrypted `.fsk`**: encrypted `.fsk`
+    stores `stats.json` as a JSON string wrapping hex-encoded
+    ciphertext, so `json.loads(...)` returns a `str` instead of a
+    `dict`, crashing `QueryEngine.__init__` on `self.stats.get(...)`.
+    `cmd_verify` no longer constructs a QE for `.fsk` — verify
+    doesn't need one, it just iterates the docs section.
+- Encrypted **index directory** also broken: `_apply_passphrase()`
+    derived the key and stored it on the QE but didn't return it,
+    so the local `enc_key` variable stayed `None` at chunk-read time
+    and every encrypted chunk reported as "incorrect header check".
+    Fix: `_apply_passphrase` now returns the derived key.
+- New tests in `tests/test_verify.py` exercise all four
+  source/encryption combinations for `verify`.
+
+### Performance — `FlatseekFileStorageAdapter._iter_chunks(match_chunks=…)`
+
+- Added optional `match_chunks` parameter. Chunks not in the keep set
+  are skipped **before** the seek+read+decrypt+decompress step on
+  `.fsk` sources. Critical for sparse queries on large encrypted
+  `.fsk`: a query matching 10 chunks out of 1000 would otherwise spend
+  ~99% of wall time reading chunks with no matches.
+- `qe._iter_chunks` already plumbed this through; `cmd_export`
+  (memory-safe streaming query iterator) and `cmd_slice` both benefit.
+
+### `flatseek export` — memory-safe streaming (already in main, but
+documented for the v0.1.8 release line)
+
+- `_export_stream_query` rewritten to use
+  `qe._iter_chunks(match_chunks=…)` plus a thread pool with bounded
+  memory (`n_workers + 1` chunks in flight max). Replaces the prior
+  pagination approach which loaded every chunk touched in a page into
+  `_doc_cache`, OOM-killing the process on large result sets.
+
+### Tests
+
+- `tests/test_verify.py` (new, 11 cases)
+- `tests/test_slice.py` (new, 10 cases)
+- `tests/test_wal_search.py` (new, 3 cases — regression for
+  `_wal_posting_cache`)
+- `tests/test_term_offset_index.py` (new, ~205 lines — exercises the
+  `_build_term_offset_index` lazy optimization, currently unused in
+  production pending a silent-regression debug; left in place as a
+  characterization test)
+- `tests/test_export.py` extended (+221 lines) for the streaming
+  rewrite coverage.
+
+### Total
+
+- 126 tests pass, no regressions.
+- 4 new commands (well, 2 new + 2 commands made actually work).
+- Version bumped across `pyproject.toml`, `__init__.py`,
+  `cli.py`, `client.py`, `api/main.py`.
+
 ## [0.1.7] - 2026-06-28
 
 ### Resume & Integrity — encrypt/decrypt

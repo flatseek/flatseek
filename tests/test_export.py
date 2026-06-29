@@ -452,3 +452,224 @@ class TestExportResume:
             ))
         # No "[EXPORT]" progress markers when --quiet.
         assert "[EXPORT]" not in err.getvalue()
+
+
+# ── Tests: OOM safety ──────────────────────────────────────────────────────────
+
+
+class TestExportSkipEmptyChunks:
+    """Streaming export must pass `match_chunks` to `_iter_chunks` so the
+    storage adapter skips non-matched chunks BEFORE reading them from
+    disk. This is the critical optimization for large encrypted .fsk —
+    without it, a sparse query matching 10 chunks out of 1000 spends ~99%
+    of wall time reading chunks that have no matches.
+
+    Regression for the slow-export issue: API (which only fetches the
+    chunks it needs) was ~10x faster than the streaming export that
+    iterated every chunk just to skip most.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="flatseek_export_skip_"))
+        self.records = _make_records(50)
+        self.data_dir = _build_index(self.tmpdir / "data", self.records)
+        yield
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_export_skips_non_matched_chunks_before_read(self):
+        """Verify that export only LOADS chunks that have matches — non-matched
+        chunks are never read. Without this, every chunk in the bucket would
+        be seek+read+decrypt+decompressed just to be filtered out.
+
+        The optimization now goes through `_load_chunk(cs, cache=False)` per
+        matched chunk (parallelized via ThreadPoolExecutor). Spy on
+        `_load_chunk` and verify it was called only for the matched chunks.
+        """
+        from flatseek.cli import _export_stream_query
+        from flatseek.core.query_engine import QueryEngine
+
+        qe = QueryEngine(str(self.data_dir))
+
+        # active:true → 25 of 50 docs, all in chunk 0.
+        matched_set = {
+            did for did in range(50) if self.records[did]["active"] == "true"
+        }
+        expected_matched_chunks = {qe._chunk_start(did) for did in matched_set}
+
+        # Spy on _load_chunk to count calls and the chunk_starts accessed.
+        load_calls = {"chunks": []}
+        original_load = qe._load_chunk
+
+        def spy_load(start, cache=True):
+            load_calls["chunks"].append(start)
+            return original_load(start, cache=cache)
+
+        qe._load_chunk = spy_load
+
+        # Drive the streaming export.
+        docs = list(_export_stream_query(qe, "active:true", cols=None, limit=None))
+        assert len(docs) == 25
+
+        # The exporter should have loaded ONLY chunks that have matches.
+        loaded = set(load_calls["chunks"])
+        # All loaded chunks must be in the matched set (no false-positive
+        # chunk reads).
+        assert loaded <= expected_matched_chunks, (
+            f"Export loaded {loaded - expected_matched_chunks} non-matched "
+            f"chunks: {loaded - expected_matched_chunks}. Only "
+            f"{expected_matched_chunks} should be read."
+        )
+        # All matched chunks must be loaded (no false-negatives).
+        assert loaded == expected_matched_chunks, (
+            f"Export loaded {loaded} but expected {expected_matched_chunks}. "
+            f"Some matched chunks were skipped."
+        )
+
+
+class TestExportParallelPreRead:
+    """Streaming export must use ThreadPoolExecutor to pre-read matched chunks
+    concurrently — this is the speedup for large encrypted .fsk where each
+    chunk is ~300-700ms of read+decrypt+decompress.
+
+    Without parallelism: N matched chunks × ~500ms = sequential. With
+    8 workers: N/8 × 500ms. For 1000 chunks: 500s → 60s. 8x speedup.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="flatseek_export_par_"))
+        # Use enough records + multiple terms to force matches across
+        # multiple chunks (chunk_size=100K by default, so 50 records all
+        # fit in chunk 0; for the test we just need a small dataset to
+        # verify parallel behavior, not raw speedup).
+        self.records = _make_records(50)
+        self.data_dir = _build_index(self.tmpdir / "data", self.records)
+        yield
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_export_uses_threadpool_for_chunk_reads(self):
+        """Spy on `_load_chunk` to verify multiple chunks are submitted
+        to a ThreadPoolExecutor (rather than read serially).
+
+        We use a slow spy (sleeps 200ms) so serial reads would be slow
+        and parallel reads would be fast. If the export went serial,
+        wall time would be ≥ N × 200ms. With parallel, it's ~⌈N/workers⌉
+        × 200ms. We assert wall time is well under the serial bound.
+        """
+        import time as _time
+        from flatseek.cli import _export_stream_query
+        from flatseek.core.query_engine import QueryEngine
+
+        qe = QueryEngine(str(self.data_dir))
+
+        # Mock _load_chunk to add a delay so serial vs parallel is observable.
+        # active:true matches docs in chunk 0; for the parallel test we
+        # build a synthetic set of matched chunks via the spy.
+        load_calls = {"n": 0, "concurrent": 0, "max_concurrent": 0}
+
+        def slow_load(start, cache=True):
+            load_calls["n"] += 1
+            load_calls["concurrent"] += 1
+            load_calls["max_concurrent"] = max(
+                load_calls["max_concurrent"], load_calls["concurrent"]
+            )
+            try:
+                # Inject a delay so serial reads would compound.
+                _time.sleep(0.05)  # 50ms per chunk
+                # Build a fake chunk with one doc for each matched chunk.
+                # Without this, the export would still read real data,
+                # but we want to control timing precisely.
+                return {0: {"_id": start, "active": "true"}}
+            finally:
+                load_calls["concurrent"] -= 1
+
+        # Force export to believe there are many matched chunks. Monkey-patch
+        # execute to return a large set spread across many chunks.
+        from flatseek.core import query_parser
+        original_execute = query_parser.execute
+
+        def fake_execute(node, qe_, doc_ids=None):
+            # Return IDs spread across 16 chunks to force parallel reads.
+            return set(range(0, 16 * 100_000, 100_000 // 8))  # 16 distinct chunk_starts
+
+        qe._load_chunk = slow_load
+        query_parser.execute = fake_execute
+        try:
+            t0 = _time.perf_counter()
+            docs = list(_export_stream_query(qe, "*", cols=None, limit=128))
+            wall = _time.perf_counter() - t0
+        finally:
+            query_parser.execute = original_execute
+
+        # We should have read ~16 chunks. Serial would be 16 × 50ms = 800ms.
+        # Parallel with 8 workers should be ~2 × 50ms = 100ms (plus overhead).
+        assert load_calls["n"] >= 16, (
+            f"Expected to read ≥16 chunks, only read {load_calls['n']}"
+        )
+        # Strict speedup check: parallel should be < 60% of serial.
+        serial_estimate = load_calls["n"] * 0.05
+        assert wall < serial_estimate * 0.6, (
+            f"Export reads look serial: {load_calls['n']} chunks in {wall:.2f}s "
+            f"(serial would be ~{serial_estimate:.2f}s). ThreadPool not used "
+            f"or worker count too low."
+        )
+        # We also should have seen >1 concurrent read at some point.
+        assert load_calls["max_concurrent"] >= 2, (
+            f"Max concurrent chunk reads = {load_calls['max_concurrent']} — "
+            f"ThreadPool not running chunks in parallel. Need ≥2 for "
+            f"parallel speedup."
+        )
+
+
+class TestExportNoOom:
+    """Regression: long pagination exports must not grow `_doc_cache`
+    unboundedly. Each `qe.query()` page reads fresh chunks; without
+    `clear_doc_cache()` between pages, every chunk ever read stays in
+    memory forever, OOM-killing the process on big result sets.
+
+    We can't easily build a 100M-row index in a unit test, so we mock the
+    pagination loop: invoke `_export_stream_query` repeatedly against
+    an engine whose `_load_chunk` populates `_doc_cache` for a fresh
+    chunk each iteration. Verify cache size stays bounded.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="flatseek_export_oom_"))
+        self.records = _make_records(50)
+        self.data_dir = _build_index(self.tmpdir / "data", self.records)
+        yield
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_export_query_does_not_populate_doc_cache(self):
+        """The streaming `_export_stream_query` reads chunks via
+        `_iter_chunks()` (which bypasses `_load_chunk` / `_doc_cache`),
+        so the cache must NOT be populated by export — that's the OOM fix.
+
+        Regression test: previously export used `qe.query()` pagination which
+        called `_load_chunk` for every chunk touched, ballooning `_doc_cache`
+        and OOM-killing big exports.
+        """
+        from flatseek.cli import _export_stream_query
+        from flatseek.core.query_engine import QueryEngine
+
+        qe = QueryEngine(str(self.data_dir))
+        before = len(qe._doc_cache)
+
+        # Drive the streaming export to completion.
+        docs = list(_export_stream_query(qe, "active:true", cols=None, limit=None))
+
+        # active:true matches 25 of 50 records. Result correctness first.
+        assert len(docs) == 25
+        assert all(d.get("active") == "true" for d in docs)
+
+        # The cache must NOT grow — `_iter_chunks` is the path, not `_load_chunk`.
+        # (Even if a stale entry existed before the export, the export itself
+        # does not add to it.)
+        assert len(qe._doc_cache) == before, (
+            f"Streaming export populated _doc_cache (added {len(qe._doc_cache) - before} "
+            f"entries). Should use _iter_chunks which bypasses _doc_cache. "
+            f"This is the OOM regression — fix is to stream via _iter_chunks "
+            f"instead of paginating via qe.query()."
+        )

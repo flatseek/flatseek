@@ -1099,24 +1099,51 @@ class FlatseekFileStorageAdapter(StorageAdapter):
             self._manifest = {}
             return
 
-        # Handle encrypted manifest files stored as base64
+        # Handle encrypted manifest files stored as base64 (old format) OR
+        # as hex-encoded encrypted bytes (new format used by FlatseekPacker
+        # since v0.1.6 when `enc_key` is provided). The new format stores
+        # each metadata file's encrypted bytes as a hex string at the key
+        # (e.g. `manifest_data["stats"] = raw.hex()`). The hex string starts
+        # with the FLATSEEK\x01 encryption magic ("464c41545345454b01...").
+        #
+        # If we leave these as strings, downstream `json.loads(read_bytes(
+        # "stats.json"))` returns a str, not a dict — QueryEngine.__init__
+        # crashes on `self.stats.get(...)`. Decrypt eagerly here.
+        _ENC_HEX_MAGIC = "464c41545345454b01"  # FLATSEEK\x01 in hex
         for key, value in list(parsed.items()):
             if key == "_encryption_b64":
                 continue  # internal metadata, not a manifest file
-            if isinstance(value, dict) and "__b64" in value:
+            if isinstance(value, str) and value.startswith(_ENC_HEX_MAGIC):
+                # New format: hex-encoded encrypted blob.
+                # Catch broad Exception here: wrong-key InvalidToken, bad
+                # hex (ValueError), malformed UTF-8/JSON, etc. We don't want
+                # manifest open to fail just because the user gave a wrong
+                # passphrase — let the actual data-access path surface that
+                # error with a clearer message.
+                try:
+                    encrypted_blob = bytes.fromhex(value)
+                    decrypted = self._decrypt_if_needed(encrypted_blob, SID_MANIFEST)
+                    parsed[key] = json.loads(decrypted.decode("utf-8"))
+                except Exception:
+                    pass  # keep as-is if decrypt/parse fails
+            elif isinstance(value, dict) and "__b64" in value:
                 # Decrypt if we have a key
                 encrypted_blob = _b64.b64decode(value["__b64"])
-                decrypted = self._decrypt_if_needed(encrypted_blob, SID_MANIFEST)
                 try:
+                    decrypted = self._decrypt_if_needed(encrypted_blob, SID_MANIFEST)
                     parsed[key] = json.loads(decrypted.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    parsed[key] = value  # keep as-is if decrypt fails
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                    # Includes cryptography InvalidToken on wrong key — we
+                    # deliberately don't fail manifest open here, so the
+                    # caller can later surface the error when it tries to
+                    # actually USE the (encrypted) data files.
+                    parsed[key] = value
             elif isinstance(value, dict) and value.get("__b64"):
                 encrypted_blob = _b64.b64decode(value["__b64"])
-                decrypted = self._decrypt_if_needed(encrypted_blob, SID_MANIFEST)
                 try:
+                    decrypted = self._decrypt_if_needed(encrypted_blob, SID_MANIFEST)
                     parsed[key] = json.loads(decrypted.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
                     parsed[key] = value
 
         self._manifest = parsed
@@ -1337,12 +1364,20 @@ class FlatseekFileStorageAdapter(StorageAdapter):
                 results.append(full_path)
         return sorted(results)
 
-    def _iter_chunks(self):
+    def _iter_chunks(self, match_chunks=None):
         """Yield (chunk_start, chunk_dict) for every chunk file in the flatseek archive.
 
         Overrides QueryEngine's _iter_chunks so it uses the flatseek offset table
         directly instead of going through storage.listdir (which can't represent
         the flat docs/ section structure with our prefix-stripped keys).
+
+        Args:
+            match_chunks: Optional set of chunk_start values to KEEP. Chunks
+                not in this set are skipped BEFORE the seek+read+decrypt+
+                decompress+parse step — the file is never opened. Critical for
+                streaming export on large encrypted .fsk: a sparse query
+                matching 10 chunks out of 1000 would otherwise spend ~99% of
+                wall time reading chunks that have no matches.
         """
         import re
         from flatseek.core.query_engine import _decompress_doc, _doc_loads, decrypt_bytes
@@ -1361,6 +1396,13 @@ class FlatseekFileStorageAdapter(StorageAdapter):
             return 0
 
         for path in sorted(files, key=chunk_key):
+            # Compute chunk_start and apply match_chunks filter BEFORE
+            # touching the file. Saves the seek+read+decrypt+decompress for
+            # chunks that aren't in the keep set — for 100M-row encrypted .fsk
+            # with sparse query, this saves up to ~99% of I/O time.
+            cs = chunk_key(path)
+            if match_chunks is not None and cs not in match_chunks:
+                continue
             try:
                 blob = self.read_bytes(path)
                 # Decrypt individual encrypted files before decompressing

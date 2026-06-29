@@ -35,7 +35,7 @@ try:
     with open(_PYPROJECT_TOML, "rb") as _f:
         __version__ = tomllib.load(_f)["project"]["version"]
 except Exception:
-    __version__ = "0.1.7"
+    __version__ = "0.1.8"
 
 
 def _parse_columns(columns_str):
@@ -810,18 +810,25 @@ def _get_flatseek_enc_key(flatseek_path: Path, args) -> bytes | None:
 
 
 def _apply_passphrase(qe, args):
-    """If --passphrase given (or index is encrypted), derive key and call set_key()."""
+    """If --passphrase given (or index is encrypted), derive key and call set_key().
+
+    Returns the derived key (bytes) on success, or None if the index is not
+    encrypted. Callers that need the key for their own decryption should use
+    the return value rather than re-deriving — otherwise the user would be
+    prompted twice.
+    """
     from flatseek.core.query_engine import load_encryption_key
     passphrase = getattr(args, "passphrase", None)
     if not passphrase:
         import os, json
         enc_path = os.path.join(args.data_dir, "encryption.json")
         if not os.path.isfile(enc_path):
-            return   # not encrypted, nothing to do
+            return None   # not encrypted, nothing to do
         import getpass
         passphrase = getpass.getpass(f"Passphrase for {args.data_dir}: ")
     key = load_encryption_key(args.data_dir, passphrase)
     qe.set_key(key)
+    return key
 
 
 def cmd_search(args):
@@ -1027,26 +1034,109 @@ def _export_stream_all(qe, cols, limit):
 
 
 def _export_stream_query(qe, query_str, cols, limit):
-    """Yield docs matching a query, paginated, capped at limit."""
-    page = 0
+    """Yield docs matching a query, capped at limit.
+
+    Memory-safe streaming implementation: pre-computes the matching set once,
+    then iterates chunks lazily via `qe._iter_chunks()` (which bypasses
+    `_doc_cache` — chunks are read fresh each time and discarded). One
+    chunk in memory at a time, regardless of how many chunks have matches.
+
+    The previous pagination approach (`qe.query(page=N, page_size=10K)`)
+    called `_load_chunk` for every chunk touched in a page, populating
+    `_doc_cache` with all of them — so a sparse query touching 10K chunks
+    in one page loaded 10K chunks × ~100 MB each into memory, OOM-killing
+    the process before the next page could even start.
+    """
+    from collections import defaultdict
+    from flatseek.core.query_parser import parse, execute
+
+    ast = parse(query_str)
+    if ast is None:
+        return
+
+    matching_set = execute(ast, qe)
+    if not matching_set:
+        return
+
+    # Group matching IDs by chunk_start. Bounded by selectivity — sparse
+    # queries still get a small group_by dict (one entry per touched chunk).
+    by_chunk: dict[int, set] = defaultdict(set)
+    for did in matching_set:
+        by_chunk[qe._chunk_start(did)].add(did)
+    del matching_set  # free the sorted set — we have the per-chunk groups now
+
     yielded = 0
-    while True:
-        try:
-            result = qe.query(query_str, page=page, page_size=_EXPORT_BATCH)
-        except SyntaxError as e:
-            print(f"Query syntax error: {e}", file=sys.stderr)
-            sys.exit(1)
-        docs = result["results"]
-        if not docs:
-            return
-        for doc in docs:
+    # Parallel pre-read with bounded memory. Cold-cache chunk reads are
+    # dominated by I/O + decrypt + decompress + parse — for encrypted
+    # .fsk, each chunk is ~300-700ms. With N workers, wall time scales
+    # as N_chunk_count / N_workers.
+    #
+    # Memory bound: we process chunks in chunk_start order via Future.
+    # result() directly (not as_completed + dict). At any time at most
+    # n_workers+1 chunks are in memory (n_workers prefetched + 1 being
+    # processed). Earlier OOM came from holding ALL chunks in a dict
+    # before processing — fixed by streaming consumption below.
+    #
+    # cache=False to avoid racing writes on `_doc_cache` from multiple
+    # threads. The atomic cache read still happens (warm cache → instant
+    # hit), we just don't populate it from this path.
+    import os as _os
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+
+    matched_chunk_starts = sorted(by_chunk.keys())
+    n_workers = min(_os.cpu_count() or 4, len(matched_chunk_starts), 8)
+
+    def _read_one_chunk(cs: int):
+        return qe._load_chunk(cs, cache=False)
+
+    if n_workers > 1 and len(matched_chunk_starts) > 1:
+        # Parallel path. Submit ALL futures upfront, then consume in
+        # chunk_start order via cs_to_future[cs].result(). This bounds
+        # memory to n_workers+1 chunks max (the in-flight workers' results
+        # are held by the executor until the with-block exits, but the GC
+        # of `del chunk` keeps our process-level footprint bounded too).
+        with _TPE(max_workers=n_workers) as ex:
+            cs_to_future = {
+                cs: ex.submit(_read_one_chunk, cs)
+                for cs in matched_chunk_starts
+            }
+            for cs in matched_chunk_starts:
+                if limit is not None and yielded >= limit:
+                    return
+                chunk = cs_to_future[cs].result()
+                if not chunk:
+                    continue
+                relevant = by_chunk.get(cs)
+                for did in sorted(chunk):
+                    if did not in relevant:
+                        continue
+                    if limit is not None and yielded >= limit:
+                        return
+                    doc = {"_id": did, **chunk[did]}
+                    qe._collapse_expanded_fields(doc)
+                    yield _export_project(doc, cols)
+                    yielded += 1
+                del chunk
+    else:
+        # Serial path for trivial case (≤1 chunk) — avoids thread-pool
+        # overhead for the common single-match export.
+        for cs in matched_chunk_starts:
             if limit is not None and yielded >= limit:
                 return
-            yield _export_project(doc, cols)
-            yielded += 1
-        if len(docs) < _EXPORT_BATCH:
-            return
-        page += 1
+            chunk = _read_one_chunk(cs)
+            if not chunk:
+                continue
+            relevant = by_chunk.get(cs)
+            for did in sorted(chunk):
+                if did not in relevant:
+                    continue
+                if limit is not None and yielded >= limit:
+                    return
+                doc = {"_id": did, **chunk[did]}
+                qe._collapse_expanded_fields(doc)
+                yield _export_project(doc, cols)
+                yielded += 1
+            del chunk
 
 
 def _export_dumps():
@@ -2379,6 +2469,723 @@ def cmd_decrypt(args):
         print(f"Removed: {enc_path}")
 
 
+def cmd_verify(args):
+    """Walk every doc chunk and report how many load successfully.
+
+    For each chunk we attempt the full read path: open file → decrypt (if
+    encrypted) → decompress → parse JSON. A chunk that fails any of these
+    is reported as corrupt. Works for both index directories and
+    single-file (.fsk / .flatseek / .flat) archives.
+
+    Useful for diagnosing:
+      - Encryption interrupted mid-run (some chunks valid, some not)
+      - Bit-rot / on-disk corruption
+      - Compression-format mismatch (zlib vs zstd vs raw)
+
+    Note: uses its own per-chunk walk (NOT `qe._load_chunk`) so the silent
+    skip on errors in `_load_chunk` doesn't mask failures. For verify we
+    WANT the error to surface.
+    """
+    import time as _time
+    import glob as _glob
+    import re as _re
+    from flatseek.core.query_engine import _decompress_doc, _doc_loads, decrypt_bytes
+
+    data_path = Path(args.data_dir)
+    is_flat_file = data_path.is_file() and (
+        str(data_path).endswith((".fsk", ".flatseek", ".flat"))
+    )
+
+    enc_key = None
+    storage = None
+    if is_flat_file:
+        enc_key = _get_flatseek_enc_key(data_path, args)
+        from flatseek.flatseek_file import FlatseekFileStorageAdapter
+        storage = FlatseekFileStorageAdapter(data_path, enc_key=enc_key)
+    elif getattr(args, "storage_backend", None):
+        from flatseek.core.storage import StorageConfig, create_storage_adapter
+        config = StorageConfig(
+            backend=args.storage_backend,
+            bucket=getattr(args, "storage_bucket", "") or "",
+            region=getattr(args, "storage_region", "") or "",
+            endpoint_url=getattr(args, "storage_endpoint", "") or "",
+            base_path=getattr(args, "storage_base_path", "") or "",
+            url=getattr(args, "storage_url", "") or "",
+        )
+        storage = create_storage_adapter(config)
+
+    # For .fsk we don't construct a QueryEngine: the encrypted-pack layout
+    # stores stats.json as a JSON string wrapping hex-encoded encrypted bytes,
+    # which makes `json.loads(storage.read_bytes('stats.json'))` return a str
+    # (not a dict) and crashes QueryEngine.__init__ on `self.stats.get(...)`.
+    # Verify doesn't actually need a QE — we just iterate the docs section.
+    qe = None
+    if not is_flat_file:
+        from flatseek.core.query_engine import QueryEngine
+        qe = QueryEngine(args.data_dir, storage=storage)
+        if enc_key is not None:
+            qe.set_key(enc_key)
+        else:
+            # _apply_passphrase derives the key and stores it on the QE.
+            # Capture the return value too: cmd_verify needs `enc_key` for
+            # direct chunk decryption in `_try_load_chunk_path`. Without this,
+            # encrypted index dirs would have enc_key=None at chunk-read time
+            # and report every chunk as "incorrect header check" (because
+            # _decompress_doc would try to zlib-decompress the ciphertext).
+            derived = _apply_passphrase(qe, args)
+            if derived is not None:
+                enc_key = derived
+
+    show_n = getattr(args, "show", 20)
+    mode = getattr(args, "mode", "all")
+    sample_size = getattr(args, "sample_size", 100)
+
+    def _try_load_chunk_path(path: str):
+        """Read + decrypt + decompress + parse one chunk by full path,
+        surfacing errors (no silent skip).
+
+        Returns (chunk_dict_or_None, error_msg_or_None).
+        """
+        try:
+            with open(path, "rb") as f:
+                blob = f.read()
+            if enc_key is not None and blob.startswith(b"FLATSEEK\x01"):
+                blob = decrypt_bytes(blob, enc_key)
+            raw = _decompress_doc(blob)
+            return _doc_loads(raw), None
+        except Exception as e:
+            return None, f"{type(e).__name__}: {e}"
+
+    def _try_load_chunk_via_storage(rel_path: str):
+        """Read + decrypt + decompress + parse one chunk via the storage
+        adapter (FSK / S3 / etc). Same contract as _try_load_chunk_path.
+        """
+        try:
+            blob = storage.read_bytes(rel_path)
+            if enc_key is not None and blob.startswith(b"FLATSEEK\x01"):
+                blob = decrypt_bytes(blob, enc_key)
+            raw = _decompress_doc(blob)
+            return _doc_loads(raw), None
+        except Exception as e:
+            return None, f"{type(e).__name__}: {e}"
+
+    print(f"Verifying: {data_path}")
+    print(f"  mode: {mode}" + (f" (sample size: {sample_size})" if mode == "sample" else ""))
+
+    t0 = _time.perf_counter()
+    total = 0
+    ok = 0
+    bad_chunks: list[tuple[int, str]] = []
+
+    # Discover all chunk files. For local: glob (returns full paths).
+    # For FSK: use the adapter's _list_docs_recursive() — the canonical source
+    # of doc paths inside the archive (returns "docs/aa/bb/docs_NNNNNNNNNN.zlib"
+    # format, which matches what `read_bytes` expects). The earlier approach of
+    # reconstructing paths from `_file_offsets` failed when the packed archive
+    # used a different subdirectory layout (root-level "docs/" vs hex sharded
+    # "docs/aa/bb/"): the manual reconstruction produced a key that wasn't in
+    # `_file_offsets`, so verify tried `read_bytes("docs/docs_...zlib")` and
+    # got a FileNotFoundError for every chunk.
+    chunk_paths: list[tuple[int, str]] = []  # (chunk_start, full_path)
+    if is_flat_file:
+        for fsk_path in storage._list_docs_recursive():
+            m = _re.search(r"docs_(\d+)\.zlib$", fsk_path) or \
+                _re.search(r"chunks_(\d+)\.zlib$", fsk_path)
+            if m:
+                chunk_paths.append((int(m.group(1)), fsk_path))
+    else:
+        files = _glob.glob(os.path.join(qe.docs_dir, "**", "*.zlib"),
+                            recursive=True)
+        if not files:
+            files = _glob.glob(os.path.join(qe.docs_dir, "chunks_*.zlib"))
+        for path in files:
+            m = _re.search(r"docs_(\d+)\.zlib$", path) or \
+                _re.search(r"chunks_(\d+)\.zlib$", path)
+            if m:
+                chunk_paths.append((int(m.group(1)), path))
+
+    chunk_paths = sorted(set(chunk_paths), key=lambda x: x[0])
+    if mode == "sample":
+        chunk_paths = chunk_paths[:max(1, sample_size)]
+
+    for cs, path in chunk_paths:
+        total += 1
+        chunk, err = (_try_load_chunk_via_storage(path) if is_flat_file
+                      else _try_load_chunk_path(path))
+        if chunk:
+            ok += 1
+        else:
+            bad_chunks.append((cs, err or "unknown error"))
+
+    elapsed = _time.perf_counter() - t0
+    failed = total - ok
+    pct = (ok / total * 100) if total else 0.0
+
+    print(f"  chunks checked: {total:,}")
+    print(f"  ok:            {ok:,}  ({pct:.2f}%)")
+    print(f"  failed:        {failed:,}")
+    print(f"  elapsed:       {elapsed:.1f}s")
+
+    if bad_chunks:
+        print(f"\nFirst {min(show_n, len(bad_chunks))} corrupt chunks:")
+        for cs, reason in bad_chunks[:show_n]:
+            print(f"  chunk_start={cs}: {reason}")
+        if len(bad_chunks) > show_n:
+            print(f"  ... and {len(bad_chunks) - show_n} more (use --show N to see more)")
+        print("\nLikely causes:")
+        print("  - Encryption interrupted mid-run — some chunks valid, some not")
+        print("  - On-disk bit-rot / corruption")
+        print("  - Compression-format mismatch (chunk not zlib, expected zlib)")
+        print("  - Plain-text chunks in an encrypted index (encryption never ran)")
+        print("\nTo recover: decrypt the index, rebuild from source, then re-encrypt.")
+        sys.exit(2)
+    else:
+        print("\nAll chunks OK.")
+        sys.exit(0)
+
+
+# ── slice ─────────────────────────────────────────────────────────────────────
+#
+# Local helpers used only by cmd_slice. Kept inline so this command stays
+# self-contained — moving them to flatseek.core.builder would mean exporting
+# implementation details (the doc_path layout, the index-bin file format)
+# that other callers don't need.
+
+_DOC_CHUNK_SIZE = 100_000  # must match builder.DOC_CHUNK_SIZE + query_engine._chunk_start
+
+
+def _slice_doc_path(docs_root: Path, chunk_start: int) -> Path:
+    """Mirror of builder.IndexBuilder._doc_path: docs/{aa}/{bb}/docs_{N:010d}.zlib
+
+    aa = (chunk_idx >> 8) & 0xFF, bb = chunk_idx & 0xFF, where
+    chunk_idx = chunk_start // DOC_CHUNK_SIZE. Same layout used by `_iter_chunks`
+    and `FlatseekPacker.pack`, so sub-index chunks are interchangeable with
+    ones written by `flatseek build`.
+    """
+    n  = chunk_start // _DOC_CHUNK_SIZE
+    aa = f"{(n >> 8) & 0xFF:02x}"
+    bb = f"{n & 0xFF:02x}"
+    return docs_root / aa / bb / f"docs_{chunk_start:010d}.zlib"
+
+
+def cmd_slice(args):
+    """Write a new index containing only docs matching a Lucene query.
+
+    Output is written to a temp directory first (so a crash mid-flight
+    leaves no partial output). At the end the temp is atomically renamed
+    to either:
+      - a directory (when --output doesn't end in .fsk/.flatseek/.flat), or
+      - a .fsk single file (after packing via FlatseekPacker).
+
+    Memory: streaming — we group the matching set by chunk_start, then
+    stream one chunk at a time via qe._iter_chunks(match_chunks=...).
+
+    doc_ids are preserved from the source (no remap): a doc with id 42
+    in the source has id 42 in the slice. This makes downstream joins
+    and lookups trivial, at the cost of slightly larger posting-list
+    delta encodings (varint gaps instead of dense sequential).
+
+    Encryption: by default, an encrypted source produces an encrypted
+    slice with a fresh salt (cryptographically independent from source).
+    Override with --force-plaintext (no encryption) or --out-passphrase
+    NEW (re-key with new passphrase + new salt).
+
+    V1 limitations (text-search only):
+      - dv/<field>/* is NOT regenerated. Range queries on numeric fields
+        won't work in the slice. Use flatseek build from a CSV for that.
+      - index/<bucket>/terms.set is NOT regenerated. First search on a
+        cold bucket has a small latency penalty (set is rebuilt lazily).
+    """
+    import json as _json
+    import time as _time
+    import tempfile as _tempfile
+    import shutil as _shutil
+    from collections import defaultdict
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    data_path = Path(args.data_dir)
+    is_flat_file = data_path.is_file() and (
+        str(data_path).endswith((".fsk", ".flatseek", ".flat"))
+    )
+    output_path = Path(args.output).resolve()
+    out_is_flat = str(output_path).endswith((".fsk", ".flatseek", ".flat"))
+    passphrase    = getattr(args, "passphrase", None)
+    out_pass      = getattr(args, "out_passphrase", None)
+    force_pt      = getattr(args, "force_plaintext", False)
+    n_workers     = getattr(args, "workers", None) or min(8, os.cpu_count() or 2)
+
+    # ── 1. Open source ────────────────────────────────────────────────────────
+    enc_key = None
+    storage = None
+    if is_flat_file:
+        enc_key = _get_flatseek_enc_key(data_path, args)
+        from flatseek.flatseek_file import FlatseekFileStorageAdapter
+        storage = FlatseekFileStorageAdapter(data_path, enc_key=enc_key)
+    elif getattr(args, "storage_backend", None):
+        from flatseek.core.storage import StorageConfig, create_storage_adapter
+        config = StorageConfig(
+            backend=args.storage_backend,
+            bucket=getattr(args, "storage_bucket", "") or "",
+            region=getattr(args, "storage_region", "") or "",
+            endpoint_url=getattr(args, "storage_endpoint", "") or "",
+            base_path=getattr(args, "storage_base_path", "") or "",
+            url=getattr(args, "storage_url", "") or "",
+        )
+        storage = create_storage_adapter(config)
+    else:
+        # Local dir — use storage adapter for uniform access path
+        from flatseek.core.storage import LocalStorageAdapter
+        storage = LocalStorageAdapter(data_path)
+
+    from flatseek.core.query_engine import QueryEngine
+    qe = QueryEngine(str(data_path), storage=storage)
+    if enc_key is not None:
+        qe.set_key(enc_key)
+    elif not is_flat_file:
+        # _apply_passphrase derives from encryption.json if present; it
+        # returns the key on success or None for plaintext indexes.
+        derived = _apply_passphrase(qe, args)
+        if derived is not None:
+            enc_key = derived
+
+    # Detect source encryption state from the live QE (storage manifest
+    # + encryption.json at the source root). Encrypted if either is set.
+    src_encrypted = False
+    src_salt: bytes | None = None
+    if enc_key is not None:
+        src_encrypted = True
+    # Peek at encryption.json on local dirs (the QE doesn't expose salt)
+    if not is_flat_file and (data_path / "encryption.json").exists():
+        try:
+            meta = _json.loads((data_path / "encryption.json").read_text())
+            src_salt = bytes.fromhex(meta["salt"])
+            src_encrypted = True
+        except Exception:
+            pass
+
+    # ── 2. Resolve matching set ───────────────────────────────────────────────
+    from flatseek.core.query_parser import parse, execute
+    ast = parse(args.query)
+    if ast is None:
+        print("Error: empty or invalid query.")
+        sys.exit(1)
+    matching = execute(ast, qe)
+    if not matching:
+        print("Query matched 0 documents — nothing to slice.")
+        # Don't create an empty output; that's a footgun (looks valid but
+        # has no data). Exit cleanly with code 0.
+        return
+
+    src_count = len(matching)
+    print(f"Slice query matched {src_count:,} docs from {data_path}")
+
+    # Group by chunk_start — needed both for the docs iterator and for
+    # `_iter_chunks(match_chunks=...)` to skip uninteresting chunks before
+    # paying I/O + decrypt cost on .fsk sources.
+    by_chunk: dict[int, set] = defaultdict(set)
+    for did in matching:
+        by_chunk[qe._chunk_start(did)].add(did)
+    del matching  # free the flat set; we now only need by_chunk
+
+    # ── 3. Temp output dir ────────────────────────────────────────────────────
+    tmp_root = Path(_tempfile.mkdtemp(prefix="flatseek_slice_"))
+    tmp_docs  = tmp_root / "docs"
+    tmp_index = tmp_root / "index"
+    tmp_dv    = tmp_root / "dv"
+    tmp_docs.mkdir(parents=True, exist_ok=True)
+    tmp_index.mkdir(parents=True, exist_ok=True)
+    # dv/ is intentionally NOT created — v1 doesn't regenerate doc-values.
+
+    t0 = _time.time()
+    from flatseek.core.builder import _compress_doc, _doc_dumps
+
+    # ── 4. Stream-filter docs ─────────────────────────────────────────────────
+    n_written_chunks = 0
+    n_written_docs = 0
+    matched_chunk_starts = sorted(by_chunk.keys())
+
+    # Parallel chunk reads, bounded memory: at most n_workers+1 chunks in
+    # flight at once (n_workers prefetched + 1 being processed). Same shape
+    # as _export_stream_query.
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+    n_read_workers = min(n_workers, len(matched_chunk_starts), 8)
+
+    def _read_chunk(cs: int):
+        return qe._load_chunk(cs, cache=False)
+
+    if n_read_workers > 1 and len(matched_chunk_starts) > 1:
+        with _TPE(max_workers=n_read_workers) as ex:
+            cs_to_future = {cs: ex.submit(_read_chunk, cs)
+                            for cs in matched_chunk_starts}
+            for cs in matched_chunk_starts:
+                chunk = cs_to_future[cs].result()
+                if not chunk:
+                    continue
+                relevant = by_chunk.get(cs, set())
+                filtered = {str(did): chunk[did]
+                            for did in chunk if did in relevant}
+                del chunk
+                if not filtered:
+                    continue
+                target = _slice_doc_path(tmp_docs, cs)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(_compress_doc(_doc_dumps(filtered)))
+                n_written_chunks += 1
+                n_written_docs   += len(filtered)
+    else:
+        for cs in matched_chunk_starts:
+            chunk = _read_chunk(cs)
+            if not chunk:
+                continue
+            relevant = by_chunk.get(cs, set())
+            filtered = {str(did): chunk[did]
+                        for did in chunk if did in relevant}
+            del chunk
+            if not filtered:
+                continue
+            target = _slice_doc_path(tmp_docs, cs)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(_compress_doc(_doc_dumps(filtered)))
+            n_written_chunks += 1
+            n_written_docs   += len(filtered)
+
+    print(f"  Wrote {n_written_docs:,} docs to {n_written_chunks:,} chunks")
+
+    # ── 5. Rewrite posting lists (parallel) ────────────────────────────────────
+    # Collect bucket bin files. For local: glob the index dir. For .fsk:
+    # iterate `storage._file_offsets` and filter to entries that look like
+    # bucket bins (key ends with ".bin" and contains a "/" — the
+    # hex-sharded layout `aa/bb/idx*.bin`). The keys are stored WITHOUT
+    # the `index/` prefix (the section prefix is stripped at offset-table
+    # load time), so a `startswith("index/")` check would miss them all —
+    # that's exactly the bug that left `.fsk` slices with empty posting
+    # lists.
+    if is_flat_file:
+        bin_files = []
+        for rel in storage._file_offsets:
+            if rel.endswith(".bin") and "/" in rel:
+                bin_files.append(rel)
+    else:
+        bin_files = [str(p) for p in (data_path / "index").rglob("*.bin")]
+
+    # We rewrite to tmp_index using the SAME relative path layout as the
+    # source (index/aa/bb/idx.bin or idx_segNNNN.bin), so the new index is
+    # indistinguishable from one written by `flatseek build`.
+    total_terms_removed = 0
+    total_postings_removed = 0
+    if bin_files:
+        # Build flat matching set once (closure-shared across all workers)
+        flat_matching: set[int] = set()
+        for s in by_chunk.values():
+            flat_matching |= s
+
+        def _rewrite_one(bin_path: str) -> tuple[int, int, int]:
+            """Returns (files_written, terms_removed, postings_removed)."""
+            import zlib, struct as _struct
+            from flatseek.core.builder import encode_doclist
+            from flatseek.core.query_engine import decode_doclist
+
+            # Read via the storage adapter for .fsk sources (the bin isn't
+            # a real file on disk); via direct open() for local dirs.
+            try:
+                if is_flat_file:
+                    raw = storage.read_bytes(bin_path)
+                else:
+                    with open(bin_path, "rb") as fh:
+                        raw = fh.read()
+            except (OSError, PermissionError):
+                return 0, 0, 0
+            if not raw:
+                return 0, 0, 0
+
+            is_compressed = (len(raw) >= 2 and raw[0] == 0x78
+                             and raw[1] in (0x01, 0x5e, 0x9c, 0xda))
+            try:
+                data = zlib.decompress(raw) if is_compressed else raw
+            except zlib.error:
+                return 0, 0, 0
+
+            out = bytearray()
+            offset = 0
+            changed = False
+            terms_removed = postings_removed = 0
+
+            while offset < len(data):
+                if offset + 2 > len(data): break
+                term_len = _struct.unpack_from("<H", data, offset)[0]; offset += 2
+                if offset + term_len > len(data): break
+                term_b = data[offset:offset + term_len]; offset += term_len
+                if offset + 4 > len(data): break
+                pl_len = _struct.unpack_from("<I", data, offset)[0]; offset += 4
+                if offset + pl_len > len(data): break
+                doclist_raw = data[offset:offset + pl_len]; offset += pl_len
+
+                ids = decode_doclist(doclist_raw)
+                filtered = [d for d in ids if d in flat_matching]
+                if len(filtered) == len(ids):
+                    out += _struct.pack("<H", term_len) + term_b + _struct.pack("<I", pl_len) + doclist_raw
+                else:
+                    changed = True
+                    postings_removed += len(ids) - len(filtered)
+                    if not filtered:
+                        terms_removed += 1
+                        continue
+                    new_dl = encode_doclist(filtered)
+                    out += _struct.pack("<H", term_len) + term_b + _struct.pack("<I", len(new_dl)) + new_dl
+
+            if not changed:
+                return 0, 0, 0
+
+            new_data = zlib.compress(bytes(out), 9) if is_compressed else bytes(out)
+            # Compute mirror path: relative to the source index dir root.
+            # For local sources the bin path is "<data>/index/aa/bb/idx*.bin";
+            # for .fsk sources it's a storage-relative "index/aa/bb/idx*.bin".
+            # Path.relative_to handles both: it strips the longest matching
+            # Compute mirror path: relative to the source index dir root.
+            # For local sources the bin path is "<data>/index/aa/bb/idx*.bin";
+            # for .fsk sources it's a storage-relative "index/aa/bb/idx*.bin".
+            # Path.relative_to handles both: it strips the longest matching
+            # prefix and leaves just the relative part under `index/`.
+            src_index_root = (data_path / "index") if not is_flat_file else Path(".")
+            rel = Path(bin_path).relative_to(src_index_root)
+            target = tmp_index / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp = str(target) + f".{os.getpid()}.slice.tmp"
+            with open(tmp, "wb") as fh:
+                fh.write(new_data)
+            os.replace(tmp, target)
+            return 1, terms_removed, postings_removed
+
+        def _copy_unchanged(bin_path: str) -> int:
+            """When no postings were removed in a bin, copy it to the output
+            unchanged. The sub-index needs ALL original bins (preserving
+            bucket layout) so query routing finds them; we just leave their
+            contents alone when they happen to be entirely within matching."""
+            try:
+                if is_flat_file:
+                    raw = storage.read_bytes(bin_path)
+                else:
+                    with open(bin_path, "rb") as fh:
+                        raw = fh.read()
+            except (OSError, PermissionError):
+                return 0
+            if not raw:
+                return 0
+            src_index_root = (data_path / "index") if not is_flat_file else Path(".")
+            rel = Path(bin_path).relative_to(src_index_root)
+            target = tmp_index / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(raw)
+            return 1
+
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            # First pass: rewrite bins that changed (parallel).
+            # Track which bin each future belongs to via {fut: bin_path} map.
+            fut_to_path: dict = {}
+            for p in bin_files:
+                fut = ex.submit(_rewrite_one, p)
+                fut_to_path[fut] = p
+            changed_bins: set[str] = set()
+            done = 0
+            for fut in as_completed(list(fut_to_path)):
+                bin_path = fut_to_path[fut]
+                wrote, tr, pr = fut.result()
+                if wrote:
+                    changed_bins.add(bin_path)
+                total_terms_removed    += tr
+                total_postings_removed += pr
+                done += 1
+                if done % 2000 == 0 or done == len(bin_files):
+                    _log(f"  Posting lists: {done:,}/{len(bin_files):,} bins scanned "
+                         f"({total_postings_removed:,} postings removed, "
+                         f"{total_terms_removed:,} terms dropped)")
+
+            # Second pass: copy unchanged bins (parallel). Without this, a
+            # bin whose postings all happen to be in matching (e.g. a bin
+            # containing only common terms that were matched) wouldn't appear
+            # in the sub-index, and queries on those terms would 0-hit even
+            # though the data is there.
+            unchanged = [p for p in bin_files if p not in changed_bins]
+            if unchanged:
+                copied = 0
+                copy_futs = [ex.submit(_copy_unchanged, p) for p in unchanged]
+                for fut in as_completed(copy_futs):
+                    copied += fut.result()
+
+    print(f"  Posting lists: {len(bin_files):,} bins scanned, "
+          f"{total_postings_removed:,} postings removed, "
+          f"{total_terms_removed:,} terms dropped")
+
+    # ── 6. Copy non-filtered metadata verbatim ────────────────────────────────
+    # column_map.json and manifest.json describe the schema; the slice has
+    # the same columns as the source. encryption.json is regenerated below
+    # by the encryption step (if requested).
+    for meta_name in ("column_map.json", "manifest.json"):
+        if is_flat_file:
+            # For .fsk, both files exist inside the manifest section. We
+            # already extracted them via the QE init. The storage adapter
+            # exposes them via _file_offsets.
+            try:
+                raw = storage.read_bytes(meta_name)
+                (tmp_root / meta_name).write_bytes(raw)
+            except Exception:
+                pass
+        else:
+            src_meta = data_path / meta_name
+            if src_meta.exists():
+                _shutil.copy2(src_meta, tmp_root / meta_name)
+
+    # ── 7. Regenerate stats.json ──────────────────────────────────────────────
+    def _dir_size_mb(d: Path) -> float:
+        total = 0
+        for p in d.rglob("*"):
+            if p.is_file():
+                try:
+                    total += p.stat().st_size
+                except OSError:
+                    pass
+        return round(total / 1024**2, 2)
+
+    # Preserve schema + chunk-size hints from the source; only counts/sizes
+    # change. Falls back to minimal stats if source had no stats.json
+    # (degenerate case — only possible with a hand-built index).
+    src_stats_path = (storage.read_bytes("stats.json") if is_flat_file
+                      else (data_path / "stats.json").read_bytes() if (data_path / "stats.json").exists()
+                      else None)
+    src_stats: dict = {}
+    if src_stats_path:
+        try:
+            src_stats = _json.loads(src_stats_path)
+        except Exception:
+            pass
+
+    # Index files count: source had N bucket bin files; after rewrite the
+    # count is the same (we rewrite, not delete — even fully-empty bins
+    # remain so the bucket layout is stable).
+    new_index_mb = _dir_size_mb(tmp_index)
+    new_docs_mb  = _dir_size_mb(tmp_docs)
+    new_stats = {
+        "total_docs":     n_written_docs,
+        "rows_indexed":   n_written_docs,
+        "total_entries":  src_stats.get("total_entries", 0) - total_postings_removed,
+        "doc_chunk_size": src_stats.get("doc_chunk_size", _DOC_CHUNK_SIZE),
+        "index_files":    src_stats.get("index_files", len(bin_files)),
+        "index_size_mb":  new_index_mb,
+        "docs_size_mb":   new_docs_mb,
+        "total_size_mb":  round(new_index_mb + new_docs_mb, 2),
+        "columns":        src_stats.get("columns", []),
+        "_slice_source":  str(data_path),
+        "_slice_query":   args.query,
+    }
+    (tmp_root / "stats.json").write_text(_json.dumps(new_stats, indent=2))
+
+    # ── 8. Encryption (optional) ──────────────────────────────────────────────
+    want_encrypt = (src_encrypted and not force_pt) or bool(out_pass)
+    out_key: bytes | None = None
+    if want_encrypt:
+        # Decide passphrase + salt for the output
+        if out_pass:
+            new_passphrase = out_pass
+        else:
+            # Inherit from source: re-prompt for passphrase if not given as flag
+            new_passphrase = passphrase
+            if new_passphrase is None:
+                import getpass as _gp
+                if sys.stdin.isatty():
+                    new_passphrase = _gp.getpass("Passphrase for slice output: ")
+                else:
+                    print("Error: source is encrypted and no --passphrase or "
+                          "--out-passphrase given in non-interactive mode.")
+                    _shutil.rmtree(tmp_root, ignore_errors=True)
+                    sys.exit(1)
+
+        # Always use a NEW salt for the output, even if we inherited the
+        # passphrase from the source — this keeps the two indexes
+        # cryptographically independent (rotating one doesn't reveal anything
+        # about the other, even if the same passphrase was used).
+        import secrets as _secrets
+        new_salt = _secrets.token_bytes(32)
+        from flatseek.core.query_engine import derive_key
+        out_key = derive_key(new_passphrase, new_salt)
+
+        # Write encryption.json (cmd_encrypt-compatible schema)
+        enc_meta = {
+            "salt": new_salt.hex(),
+            "algorithm": "ChaCha20-Poly1305",
+            "kdf": "PBKDF2-HMAC-SHA256",
+            "iterations": 600_000,
+        }
+        (tmp_root / "encryption.json").write_text(_json.dumps(enc_meta, indent=2))
+
+        # Encrypt every doc and metadata file in place. Mirrors cmd_encrypt's
+        # per-file loop, parameterized so we don't have to drive it through
+        # the full cmd_encrypt() entry point (which would re-print banners).
+        from flatseek.core.query_engine import encrypt_bytes, is_encrypted
+        n_enc = 0
+        targets: list[Path] = []
+        for root_dir in (tmp_docs, tmp_index):
+            for p in root_dir.rglob("*"):
+                if p.is_file() and p.suffix in (".zlib", ".bin"):
+                    targets.append(p)
+        for meta_name in ("stats.json", "column_map.json", "manifest.json"):
+            p = tmp_root / meta_name
+            if p.exists():
+                targets.append(p)
+
+        for p in targets:
+            data = p.read_bytes()
+            if not data or is_encrypted(data):
+                continue
+            enc = encrypt_bytes(data, out_key)
+            tmp = str(p) + f".{os.getpid()}.etmp"
+            with open(tmp, "wb") as fh:
+                fh.write(enc)
+            os.replace(tmp, p)
+            n_enc += 1
+        print(f"  Encrypted {n_enc:,} files (new salt, ChaCha20-Poly1305)")
+
+    # ── 9. Finalize output ────────────────────────────────────────────────────
+    # Ensure output_path's parent exists.
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if out_is_flat:
+        # Pack temp dir → output_path.tmp → atomic rename
+        from flatseek.flatseek_file import FlatseekPacker
+        tmp_fsk = output_path.with_suffix(output_path.suffix + ".tmp")
+        packer = FlatseekPacker(tmp_root, tmp_fsk, enc_key=out_key)
+        packer.pack()
+        os.replace(tmp_fsk, output_path)
+        _shutil.rmtree(tmp_root, ignore_errors=True)
+        final_path = output_path
+    else:
+        # Atomic rename of the temp directory onto the output path.
+        if output_path.exists():
+            if output_path.is_dir():
+                _shutil.rmtree(output_path)
+            else:
+                output_path.unlink()
+        os.replace(tmp_root, output_path)
+        final_path = output_path
+
+    elapsed = _time.time() - t0
+    src_size_mb = _dir_size_mb(data_path) if not is_flat_file else None
+    out_size_mb = _dir_size_mb(final_path) if not out_is_flat else \
+                  round(final_path.stat().st_size / 1024**2, 2)
+    enc_label = "encrypted" if want_encrypt else "plaintext"
+    print(f"\n✓ Sliced {n_written_docs:,} docs in {elapsed:.1f}s → {final_path}")
+    if src_size_mb is not None:
+        print(f"  Source size: {src_size_mb:.1f} MB → Output size: {out_size_mb:.1f} MB "
+              f"(encryption: {enc_label})")
+    else:
+        print(f"  Output size: {out_size_mb:.1f} MB (encryption: {enc_label})")
+
+
+def _log(msg: str) -> None:
+    """Internal: write a progress line to stderr without newline."""
+    sys.stderr.write(f"\r{msg}   ")
+    sys.stderr.flush()
+
+
 def cmd_delete(args):
     """Delete an index directory fast using parallel rm -rf on subdirectory chunks.
 
@@ -3235,6 +4042,28 @@ def main():
     p.add_argument("-w", "--workers", type=int, default=None, metavar="N",
                    help="Parallel workers (default: min(8, cpu_count))")
 
+    # verify
+    p = sub.add_parser("verify",
+                       help="Walk every doc chunk and report load failures (index dir or .fsk)")
+    p.add_argument("data_dir",
+                   help="Index directory (or .fsk / .flatseek / .flat file)")
+    p.add_argument("--passphrase", default=None, metavar="PASS",
+                   help="Decryption passphrase for encrypted indexes")
+    p.add_argument("--show", type=int, default=20, metavar="N",
+                   help="Show first N corrupt chunk_starts (default: 20)")
+    p.add_argument("--storage-backend", default=None, choices=["local", "s3", "vercel-blob", "url"],
+                   dest="storage_backend", help="Storage backend (default: local)")
+    p.add_argument("--storage-bucket", default=None, dest="storage_bucket")
+    p.add_argument("--storage-region", default=None, dest="storage_region")
+    p.add_argument("--storage-endpoint", default=None, dest="storage_endpoint")
+    p.add_argument("--storage-base-path", default=None, dest="storage_base_path")
+    p.add_argument("--storage-url", default=None, dest="storage_url")
+    p.add_argument("--mode", default="all", choices=["all", "sample"],
+                   help="Check all chunks or just a sample (default: all)")
+    p.add_argument("--sample-size", type=int, default=100, metavar="N",
+                   dest="sample_size",
+                   help="Sample size for --mode=sample (default: 100)")
+
     # encrypt
     p = sub.add_parser("encrypt",
                        help="Encrypt index in-place with ChaCha20-Poly1305 (run after build/compress)")
@@ -3267,6 +4096,28 @@ def main():
                    help="Skip integrity verification (default)")
     p.add_argument("--verify-sample", type=int, default=100, metavar="N",
                    help="Number of files to sample for --verify (0 = all, default: 100)")
+
+    # slice — extract a query-matched subset as a new index (dir or .fsk)
+    p = sub.add_parser("slice",
+                       help="Write a new index containing only docs matching a Lucene query")
+    p.add_argument("data_dir",
+                   help="Source index directory or .fsk / .flatseek / .flat file")
+    p.add_argument("query",
+                   help='Lucene query, e.g. "program:raydium AND amount:>1000"')
+    p.add_argument("-o", "--output", required=True, metavar="PATH",
+                   help="Output path. '.fsk' / '.flatseek' / '.flat' → single file; "
+                        "anything else → directory.")
+    p.add_argument("--passphrase", default=None, metavar="PASS",
+                   help="Source passphrase (required when source is encrypted)")
+    p.add_argument("--out-passphrase", default=None, dest="out_passphrase", metavar="PASS",
+                   help="Encrypt the output index with this new passphrase + new salt "
+                        "(default: inherit source encryption, fresh salt)")
+    p.add_argument("--force-plaintext", action="store_true", default=False,
+                   dest="force_plaintext",
+                   help="Write plaintext output even when the source is encrypted")
+    p.add_argument("-w", "--workers", type=int, default=None, metavar="N", dest="workers",
+                   help="Parallel workers for posting-list rewrite "
+                        "(default: min(8, cpu_count))")
 
     # delete
     p = sub.add_parser("delete", help="Delete an index directory fast (parallel unlink)")
@@ -3344,6 +4195,10 @@ def main():
         cmd_encrypt(args)
     elif args.command == "decrypt":
         cmd_decrypt(args)
+    elif args.command == "verify":
+        cmd_verify(args)
+    elif args.command == "slice":
+        cmd_slice(args)
     elif args.command == "delete":
         cmd_delete(args)
     elif args.command == "dedup":

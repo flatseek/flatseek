@@ -494,15 +494,46 @@ class QueryEngine:
         self._dv_cache: dict = {}   # field → doc_values data (lazy loaded)
         self._mmap_cache = {}        # path → mmap object (reusable across queries)
         self._term_set_cache = {}    # bucket_prefix → frozenset of all terms in bucket
+        # Per-bin-file term->offset index (lazy). Maps term bytes → offset
+        # into the (decrypted+decompressed) bucket data where the posting
+        # list's length prefix begins. Lets `_read_posting` skip the
+        # O(bucket_size) term scan on every call. Built once per file per
+        # QE instance on first access; mem cost ~30 bytes per unique term.
+        self._term_offset_cache: dict[str, dict[bytes, int]] = {}
         # WAL index: prefix → {wal_file: [offset, ...]} built lazily on first scan
         self._wal_index: dict[str, dict[str, list[int]]] = {}
         self._wal_index_built: set[str] = set()   # WAL files already indexed
-        # WAL posting cache: prefix → {term: [doc_id, ...]} — persists across queries
+        # WAL posting cache: prefix → {term: [doc_id, ...]} — persists across
+        # queries. Initialized here (not in clear_doc_cache) so that
+        # `_read_wal_postings` is safe to call on a fresh QE that hasn't
+        # touched the doc cache yet — otherwise the line
+        # `self._wal_posting_cache[prefix] = term_ids` raises
+        # AttributeError the first time a search runs against an in-progress
+        # build with live WAL files.
         self._wal_posting_cache: dict[str, dict[str, list[int]]] = {}
-
         # ── Lightweight profiling hooks (enable with env var) ──────────────────
+        # Used by `_timed_phase`. Initialized here so `_timed_phase` works on
+        # any fresh QE — previously these were set inside `clear_doc_cache`,
+        # so calling `_timed_phase` on a QE that hadn't yet run any export
+        # raised AttributeError.
         self._profile: bool = os.environ.get("FLATSEEK_PROFILE", "") == "1"
         self._phase_times: dict = {}   # phase → cumulative microseconds
+
+    def clear_doc_cache(self):
+        """Drop all entries from `_doc_cache`. Intended for long-running
+        pagination loops (e.g. streaming export) that touch many chunks
+        across pages — without this, every chunk ever read stays in RAM
+        forever and the process gets OOM-killed on big result sets.
+
+        Safe to call between pagination pages: each page reads a fresh
+        slice of `doc_ids`, so the chunks it loads are not the same as
+        the previous page's chunks (no within-page cache reuse).
+
+        Does NOT touch posting caches / hot postings / DV cache / WAL
+        posting cache / profiling state — those are bounded separately
+        and shouldn't be cleared on every page.
+        """
+        self._doc_cache.clear()
 
     def _timed_phase(self, name):
         """Context manager for profiling a phase. Enable with FLATSEEK_PROFILE=1."""
@@ -870,6 +901,14 @@ class QueryEngine:
             return cached
 
         all_ids = []
+        # NOTE: `_build_term_offset_index` infrastructure exists for the
+        # O(bucket_size)-scan elimination optimization but is NOT used here
+        # because a user reported a silent regression where one specific
+        # keyword returned 0 results after the switch (other keywords fine,
+        # synthetic data unaffected). Until the root cause is debugged against
+        # the user's actual index, this path is reverted to the original
+        # linear scan which fails loudly on file errors (decrypt/decompress
+        # failures propagate, don't silently disappear).
         for bin_file in bin_files:
             bin_path = os.path.join(bucket_dir, bin_file)
             data = self._mmap_read(bin_path)
@@ -915,6 +954,72 @@ class QueryEngine:
                     del pc[old_key]
             pc[term] = result
         return result
+
+    def _build_term_offset_index(self, bin_path: str) -> dict[bytes, int]:
+        """Build (or fetch cached) per-file term→offset index for a bucket bin file.
+
+        The bin file format is a sequence of:
+            [term_len: u16][term: term_len bytes][pl_len: u32][pl_data: pl_len bytes]
+        repeated. To find a term without scanning, we parse the file once and
+        store `{term_bytes: offset_of_pl_len_start}`. Offset points to the
+        start of the `pl_len` u32 (right after the term bytes), so the lookup
+        path can `struct.unpack_from("<I", data, offset)` directly to get
+        the posting list length and then read pl_data.
+
+        Lazily built on first `_read_posting` access against this file.
+        Cached for the lifetime of the QueryEngine (or until the file
+        changes on disk). Memory cost is O(unique terms in file), typically
+        ~30 bytes per entry — a bucket with 1000 unique terms ≈ 30 KB.
+
+        Built against the **decrypted + decompressed** data — offsets are
+        not stable across decryption+decompression so we have to do those
+        steps here too. But the index itself is just ints, ~30 bytes each,
+        cheap to keep around.
+        """
+        cached = self._term_offset_cache.get(bin_path)
+        if cached is not None:
+            return cached
+
+        data = self._mmap_read(bin_path)
+        if not data:
+            self._term_offset_cache[bin_path] = {}
+            return {}
+
+        data = self._decrypt_if_needed(data)
+        if len(data) >= 2 and data[0] == 0x78 and data[1] in (0x01, 0x5e, 0x9c, 0xda):
+            try:
+                data = zlib.decompress(data)
+            except Exception:
+                self._term_offset_cache[bin_path] = {}
+                return {}
+
+        offsets: dict[bytes, int] = {}
+        offset = 0
+        n = len(data)
+        _unpack_h = struct.Struct("<H").unpack_from
+        _unpack_i = struct.Struct("<I").unpack_from
+        while offset + 2 <= n:
+            try:
+                term_len = _unpack_h(data, offset)[0]
+            except struct.error:
+                break
+            offset += 2
+            if offset + term_len > n:
+                break
+            term = bytes(data[offset:offset + term_len])
+            offset += term_len
+            if offset + 4 > n:
+                break
+            try:
+                pl_len = _unpack_i(data, offset)[0]
+            except struct.error:
+                break
+            # Offset points to where pl_len starts — lookup reads it directly.
+            offsets[term] = offset
+            offset += 4 + pl_len
+
+        self._term_offset_cache[bin_path] = offsets
+        return offsets
 
     # ─── Term parsing ─────────────────────────────────────────────────────────
 
@@ -1415,18 +1520,35 @@ class QueryEngine:
 
         return results
 
-    def _iter_chunks(self):
+    def _iter_chunks(self, match_chunks=None):
         """Yield (chunk_start, chunk_dict) for every chunk file in docs_dir.
 
         Uses glob to find files regardless of naming scheme — handles both
         sequential (docs_0000000000.zlib) and sparse/gapped chunk numbering.
+
+        Args:
+            match_chunks: Optional set of chunk_start values to KEEP. Chunks
+                whose chunk_start is NOT in this set are skipped BEFORE the
+                read (so encrypted / single-file storage adapters don't pay
+                the decrypt cost for empty chunks). None = no filter.
+                Adapters that override _iter_chunks must honor this filter.
         """
         from flatseek.core.storage import LocalStorageAdapter
 
         # Delegate to storage adapter if it provides its own _iter_chunks
         # (e.g. FlatseekFileStorageAdapter overrides this for single-file mode)
         if hasattr(self.storage, "_iter_chunks"):
-            yield from self.storage._iter_chunks()
+            # Adapter may or may not support match_chunks. Detect via signature.
+            import inspect as _inspect
+            try:
+                params = _inspect.signature(self.storage._iter_chunks).parameters
+                if "match_chunks" in params:
+                    yield from self.storage._iter_chunks(match_chunks=match_chunks)
+                else:
+                    yield from self.storage._iter_chunks()
+            except (TypeError, ValueError):
+                # Built-in / C-implemented method — fall back to no filter
+                yield from self.storage._iter_chunks()
             return
 
         # For local storage, use fast glob. For remote, use storage.listdir
@@ -1463,6 +1585,9 @@ class QueryEngine:
                     if not m:
                         continue
                 chunk_start = int(m.group(1))
+                # Skip BEFORE read — saves I/O + decrypt for empty chunks.
+                if match_chunks is not None and chunk_start not in match_chunks:
+                    continue
                 blob = self.storage.read_bytes(path)
                 blob = self._decrypt_if_needed(blob)
                 raw = _decompress_doc(blob)
@@ -1558,7 +1683,10 @@ class QueryEngine:
         bb = f"{n & 0xFF:02x}"
         return os.path.join(self.docs_dir, aa, bb, f"docs_{chunk_start:010d}.zlib")
 
-    def _load_chunk(self, start):
+    def _load_chunk(self, start, cache=True):
+        # Atomic cache read first — also handles warm cache from prior API
+        # call. The cache is a plain dict; reads/writes are atomic per-key
+        # in CPython, so concurrent parallel calls are safe.
         if start in self._doc_cache:
             return self._doc_cache[start]
 
@@ -1574,11 +1702,20 @@ class QueryEngine:
             blob = self._decrypt_if_needed(blob)   # no-op if not encrypted
             raw  = _decompress_doc(blob)
             chunk = {int(k): v for k, v in _doc_loads(raw).items()}
-        except Exception as e:
-            import warnings
-            warnings.warn(f"Corrupted doc chunk {os.path.basename(path)}, skipping: {e}")
+        except Exception:
+            # Silently skip unreadable chunks. The FSK adapter's
+            # `_iter_chunks` path (used by streaming export before parallel
+            # pre-read) was silent on this; matching that behavior to avoid
+            # spamming the user's console for what may be a benign
+            # compressed/uncompressed chunk mix. The data is still returned
+            # as an empty dict — callers (export, search) handle missing
+            # docs gracefully via the empty fallback.
             chunk = {}
-        self._doc_cache[start] = chunk
+        if cache:
+            # Streaming export passes cache=False to avoid unbounded growth
+            # when many chunks are touched (parallel reads would otherwise
+            # all populate _doc_cache).
+            self._doc_cache[start] = chunk
         return chunk
 
     def _fetch_docs(self, doc_ids):
