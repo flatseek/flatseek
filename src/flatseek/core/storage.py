@@ -1103,9 +1103,19 @@ def create_storage_adapter(
 
     # Auto-detect .flatseek files (including .flat alias)
     if path is not None:
+        is_url = isinstance(path, str) and (
+            path.startswith("http://") or path.startswith("https://")
+        )
+        ends_with_fsk = str(path).endswith((".fsk", ".flatseek", ".flat"))
+        if is_url and ends_with_fsk:
+            # HTTP URL pointing at a .fsk file — use RangeFile-backed
+            # FlatseekFileStorageAdapter (no full download). This is
+            # the path that lets Flatlens serve a multi-GB .fsk hosted
+            # on HF/S3 without downloading the whole archive.
+            from flatseek.flatseek_file import FlatseekFileStorageAdapter
+            return FlatseekFileStorageAdapter(path)
         p = Path(path)
-        if p.is_file() and str(p).endswith((".fsk", ".flatseek", ".flat")):
-            # Import here to avoid circular dependency
+        if p.is_file() and ends_with_fsk:
             from flatseek.flatseek_file import FlatseekFileStorageAdapter
             return FlatseekFileStorageAdapter(p)
 
@@ -1124,6 +1134,14 @@ def create_storage_adapter(
             base_path=config.base_path,
         )
     elif config.backend == "url":
+        # If the URL points at a .fsk archive, use RangeFile-backed
+        # FlatseekFileStorageAdapter (no full download). Otherwise fall
+        # back to URLStorageAdapter (directory mode) for HuggingFace
+        # dataset repos etc.
+        if config.url and config.url.split("?", 1)[0].rstrip("/").endswith(
+                (".fsk", ".flatseek", ".flat")):
+            from flatseek.flatseek_file import FlatseekFileStorageAdapter
+            return FlatseekFileStorageAdapter(config.url)
         return URLStorageAdapter(
             url=config.url,
             base_path=config.base_path,

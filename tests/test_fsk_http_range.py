@@ -249,3 +249,56 @@ class TestFskOverHTTPRange:
         assert not adp.is_manifest_locked()
         qe = QueryEngine("placeholder", storage=adp)
         assert qe.query("city:Jakarta")["total"] == 1
+
+    def test_create_storage_adapter_auto_detects_fsk_url(self):
+        """Regression: when a user passes an http://...foo.fsk URL via
+        ``create_storage_adapter(config)`` (e.g. the API path), the
+        factory must return FlatseekFileStorageAdapter with RangeFile
+        — NOT URLStorageAdapter (directory mode).
+
+        Without this, the URL adapter joins base_url + '/' + rel_path
+        and requests non-existent sub-paths of the .fsk file (404s).
+        """
+        from flatseek.core.storage import create_storage_adapter
+        from flatseek.flatseek_file import FlatseekFileStorageAdapter
+        from flatseek.core.storage import URLStorageAdapter
+
+        fsk = _build_and_pack(self.tmp)
+        with _HTTPServer(_RangeHTTPHandler) as srv:
+            srv.set_fsk(fsk)
+            url = f"http://127.0.0.1:{srv.port}/enc.fsk"
+            adp = create_storage_adapter(
+                path=url,
+                config=None,  # let it construct from env
+            )
+            # Must be the Range-based adapter, NOT directory-mode URL
+            assert isinstance(adp, FlatseekFileStorageAdapter), (
+                f"expected FlatseekFileStorageAdapter for .fsk URL, got "
+                f"{type(adp).__name__}"
+            )
+            assert not isinstance(adp, URLStorageAdapter)
+            # And the engine should work end-to-end
+            key = load_encryption_key(str(self.tmp / "data"), "pp")
+            adp.set_key(key)
+            qe = QueryEngine("placeholder", storage=adp)
+            assert qe.query("city:Jakarta")["total"] == 1
+
+    def test_url_backend_url_with_fsk_uses_range(self):
+        """When ``--storage-backend=url --storage-url=.../foo.fsk`` is
+        passed, the factory should still detect the .fsk extension
+        and use FlatseekFileStorageAdapter — not the directory-mode
+        URLStorageAdapter. This is the bug the user reported (404s on
+        sub-paths of the .fsk URL)."""
+        from flatseek.core.storage import create_storage_adapter, StorageConfig
+        from flatseek.flatseek_file import FlatseekFileStorageAdapter
+
+        fsk = _build_and_pack(self.tmp)
+        with _HTTPServer(_RangeHTTPHandler) as srv:
+            srv.set_fsk(fsk)
+            url = f"http://127.0.0.1:{srv.port}/enc.fsk"
+            config = StorageConfig(backend="url", url=url)
+            adp = create_storage_adapter(config=config)
+            assert isinstance(adp, FlatseekFileStorageAdapter), (
+                f"backend=url + .fsk URL should still detect FlatseekFile, "
+                f"got {type(adp).__name__}"
+            )

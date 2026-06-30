@@ -118,14 +118,31 @@ class IndexManager:
         return False
 
     def _get_bucket_storage(self, bucket_url: str) -> URLStorageAdapter:
-        """Get or create a URLStorageAdapter for the given bucket URL.
+        """Get or create a storage adapter for the given bucket URL.
 
         For encrypted bucket URLs, the adapter is NOT cached — each new session
         must re-probe and re-authenticate so cache isolation is enforced.
         Non-encrypted buckets use a shared cached adapter with global cache.
+
+        Special case: if the URL points at a single .fsk archive (e.g.
+        HuggingFace dataset hosting one packed index file), use
+        FlatseekFileStorageAdapter with HTTP Range instead of the
+        directory-mode URLStorageAdapter. The directory adapter joins
+        ``base_url + "/" + rel_path`` which would request non-existent
+        sub-paths of the .fsk file.
         """
         import logging
         logger = logging.getLogger(__name__)
+
+        # Auto-detect: .fsk URL → use FlatseekFileStorageAdapter (Range)
+        if bucket_url.split("?", 1)[0].rstrip("/").endswith(
+                (".fsk", ".flatseek", ".flat")):
+            from flatseek.flatseek_file import FlatseekFileStorageAdapter
+            logger.warning(
+                f"[_get_bucket_storage] {bucket_url} is a .fsk URL, using "
+                f"FlatseekFileStorageAdapter (HTTP Range, no full download)"
+            )
+            return FlatseekFileStorageAdapter(bucket_url)
 
         # For encrypted buckets, ALWAYS create a fresh adapter (no caching)
         # to ensure per-session cache isolation. The probe below determines this.
