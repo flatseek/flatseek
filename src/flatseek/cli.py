@@ -765,7 +765,13 @@ def cmd_plan(args):
 
 
 def _get_flatseek_enc_key(flatseek_path: Path, args) -> bytes | None:
-    """Read .flatseek manifest, prompt for passphrase if encrypted, derive key."""
+    """Read .flatseek manifest, prompt for passphrase if encrypted, derive key.
+
+    Passphrase resolution: --passphrase CLI flag → FLATSEEK_PASSPHRASE env
+    var → interactive getpass prompt (TTY only). For non-interactive scripts
+    on encrypted .fsk without any source, returns None and the caller
+    surfaces the locked-manifest error on actual data access.
+    """
     import base64 as _b64
     import json as _json
     from flatseek.core.query_engine import load_encryption_key
@@ -791,16 +797,13 @@ def _get_flatseek_enc_key(flatseek_path: Path, args) -> bytes | None:
     if not enc_b64:
         return None  # not encrypted
 
-    # Index is encrypted — need passphrase
-    import getpass as _getpass
-    passphrase = getattr(args, "passphrase", None)
+    passphrase = _resolve_flatseek_passphrase(args)
     if not passphrase:
-        # Non-interactive mode: don't block — let server start without key.
+        # Non-interactive mode or no source available — don't block.
         # API will report is_encrypted=true and prompt client for password.
-        import sys
         sys.stderr.write(
             f"WARNING: {flatseek_path} is encrypted — provide --passphrase to unlock at startup,\n"
-            f"         or authenticate via API (Flatlens will prompt).\n"
+            f"         set FLATSEEK_PASSPHRASE env var, or authenticate via API (Flatlens will prompt).\n"
         )
         return None
 
@@ -812,23 +815,101 @@ def _get_flatseek_enc_key(flatseek_path: Path, args) -> bytes | None:
 def _apply_passphrase(qe, args):
     """If --passphrase given (or index is encrypted), derive key and call set_key().
 
+    Passphrase resolution order (most explicit wins):
+      1. ``--passphrase`` CLI flag (highest priority — explicit user intent)
+      2. ``FLATSEEK_PASSPHRASE`` env var (avoids shell history leaks)
+      3. Interactive getpass prompt (only if stdin is a TTY; silent fail in
+         scripts/pipes so they get a clear error instead of hanging)
+      4. None if index is not encrypted (silently skip)
+
     Returns the derived key (bytes) on success, or None if the index is not
     encrypted. Callers that need the key for their own decryption should use
     the return value rather than re-deriving — otherwise the user would be
     prompted twice.
     """
     from flatseek.core.query_engine import load_encryption_key
-    passphrase = getattr(args, "passphrase", None)
+    passphrase = _resolve_passphrase(args)
     if not passphrase:
         import os, json
         enc_path = os.path.join(args.data_dir, "encryption.json")
         if not os.path.isfile(enc_path):
             return None   # not encrypted, nothing to do
-        import getpass
-        passphrase = getpass.getpass(f"Passphrase for {args.data_dir}: ")
+        # Encrypted but no passphrase source available — fail loud rather
+        # than hang on getpass in non-interactive scripts.
+        print(
+            f"Error: {args.data_dir} is encrypted but no passphrase "
+            f"was provided. Pass --passphrase <P>, set FLATSEEK_PASSPHRASE, "
+            f"or run interactively from a TTY.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     key = load_encryption_key(args.data_dir, passphrase)
     qe.set_key(key)
     return key
+
+
+def _resolve_passphrase(args):
+    """Find the passphrase from CLI / env / interactive prompt.
+
+    Resolution order (first non-empty wins):
+      1. ``args.passphrase`` (--passphrase CLI flag)
+      2. ``FLATSEEK_PASSPHRASE`` env var — set this in your shell rc
+         (NOT in command line — visible in shell history) to avoid leaks.
+      3. Interactive ``getpass.getpass()`` prompt, only if stdin is a TTY.
+         Returns None silently if stdin is a pipe/script — caller should
+         detect this and surface a clear error.
+    """
+    # 1. CLI flag (highest priority — explicit user input)
+    passphrase = getattr(args, "passphrase", None)
+    if passphrase:
+        return passphrase
+
+    # 2. Env var (avoids shell history leak). Treat unset AND empty
+    #    AND pure-whitespace as "not provided" so users can clear the
+    #    var with `unset FLATSEEK_PASSPHRASE` or `FLATSEEK_PASSPHRASE=`.
+    env_pp = os.environ.get("FLATSEEK_PASSPHRASE", "").strip()
+    if env_pp:
+        return env_pp
+
+    # 3. Interactive prompt (TTY only)
+    if sys.stdin.isatty():
+        try:
+            import getpass
+            return getpass.getpass("Passphrase: ")
+        except (EOFError, KeyboardInterrupt):
+            print()  # newline after Ctrl-C/D
+            return None
+
+    return None
+
+
+def _resolve_flatseek_passphrase(args):
+    """Like ``_resolve_passphrase`` but for the .fsk flat-file path
+    (``_get_flatseek_enc_key``).
+
+    Returns the passphrase string (always non-None if the .fsk is encrypted,
+    else None). For encrypted .fsk without any source, prompts only when
+    stdin is a TTY — for non-interactive scripts the caller falls back to
+    the existing "no key" path (which raises the clear locked-manifest
+    error on access).
+    """
+    # 1. CLI flag
+    passphrase = getattr(args, "passphrase", None)
+    if passphrase:
+        return passphrase
+    # 2. Env var
+    env_pp = os.environ.get("FLATSEEK_PASSPHRASE", "").strip()
+    if env_pp:
+        return env_pp
+    # 3. Interactive (TTY only)
+    if sys.stdin.isatty():
+        try:
+            import getpass
+            return getpass.getpass("Passphrase for .fsk: ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+    return None
 
 
 def cmd_search(args):
@@ -863,7 +944,8 @@ def cmd_search(args):
             if enc_key is None:
                 locked_msg += (
                     "\n  No passphrase was provided."
-                    "\n  Fix: re-run with --passphrase <PASSPHRASE>."
+                    "\n  Fix: re-run with --passphrase <PASSPHRASE>, or set"
+                    "\n       FLATSEEK_PASSPHRASE in your shell (avoids history leak)."
                 )
             else:
                 locked_msg += (
@@ -2145,7 +2227,7 @@ def cmd_encrypt(args):
     else:
         salt = secrets.token_bytes(32)
 
-    passphrase = args.passphrase
+    passphrase = _resolve_passphrase(args)
     if not passphrase:
         import getpass
         passphrase = getpass.getpass("Passphrase: ")
@@ -2320,7 +2402,7 @@ def cmd_decrypt(args):
     verify   = getattr(args, "verify", False)
     verify_n = getattr(args, "verify_sample", 100)
 
-    passphrase = args.passphrase
+    passphrase = _resolve_passphrase(args)
     if not passphrase:
         import getpass
         passphrase = getpass.getpass("Passphrase: ")
@@ -4207,7 +4289,7 @@ def main():
     p.add_argument("-n", "--limit", type=int, default=None, metavar="N",
                    help="Maximum number of rows to export (default: no cap)")
     p.add_argument("--passphrase", default=None, metavar="PASS",
-                   help="Passphrase for encrypted indexes")
+                   help="Passphrase for encrypted indexes. Also reads $FLATSEEK_PASSPHRASE env var, or prompts interactively (TTY only).")
     p.add_argument("--quiet", dest="quiet", action="store_true", default=False,
                    help="Suppress progress messages (only matters with -o)")
     p.add_argument("--resume", dest="resume", action="store_true", default=True,
@@ -4259,7 +4341,7 @@ def main():
     p.add_argument("--storage-base-path", default=None, dest="storage_base_path",
                    help="Base path within storage")
     p.add_argument("--passphrase", default=None, dest="passphrase",
-                   help="Passphrase for encrypted .fsk files")
+                   help="Passphrase for encrypted .fsk files. Also reads $FLATSEEK_PASSPHRASE env var, or prompts interactively (TTY only).")
 
     # api
     p = sub.add_parser("api", help="Start API server only (no dashboard)")
@@ -4287,7 +4369,7 @@ def main():
     p.add_argument("--storage-base-path", default=None, dest="storage_base_path",
                    help="Base path within storage")
     p.add_argument("--passphrase", default=None, dest="passphrase",
-                   help="Passphrase for encrypted .fsk files")
+                   help="Passphrase for encrypted .fsk files. Also reads $FLATSEEK_PASSPHRASE env var, or prompts interactively (TTY only).")
 
     # dashboard
     p = sub.add_parser("dashboard",
