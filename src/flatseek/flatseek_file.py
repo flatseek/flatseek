@@ -1287,8 +1287,20 @@ class FlatseekFileStorageAdapter(StorageAdapter):
         """
         # Handle manifest files (stats.json, column_map.json, manifest.json) —
         # these are parsed once into self._manifest at open time, so no I/O here.
-        # If the field is "locked" (couldn't be decrypted — no key or wrong
-        # key), raise a clear error pointing the user at the right fix.
+        # Handle manifest files (stats.json, column_map.json, manifest.json) —
+        # these are parsed once into self._manifest at open time, so no I/O here.
+        #
+        # IMPORTANT: if a field is "locked" (couldn't be decrypted — no key
+        # or wrong key), we return a JSON placeholder instead of raising.
+        # The API contract is that `is_encrypted()` returns True and the
+        # caller is expected to either (a) prompt the user for a passphrase
+        # via `_authenticate` (Flatlens flow), or (b) surface a clear error
+        # at the command level (CLI pre-flight check).
+        # Raising here would break that flow — the API would never get
+        # the chance to ask the client for a password.
+        #
+        # Callers that want strict behavior should pre-check
+        # `is_manifest_locked()` and surface their own error.
         _manifest_keys = {
             "stats.json": "stats",
             "column_map.json": "columns",
@@ -1296,10 +1308,20 @@ class FlatseekFileStorageAdapter(StorageAdapter):
         }
         if rel_path in _manifest_keys:
             field = _manifest_keys[rel_path]
-            if field in self._locked_manifest_fields:
-                raise self._locked_error(rel_path)
-            if field in self._manifest:
+            if field in self._manifest and not (
+                    field in self._locked_manifest_fields):
                 return json.dumps(self._manifest[field], indent=2).encode("utf-8")
+            # Locked: return a placeholder so the API/search can still
+            # detect "encrypted" state via is_manifest_locked() without
+            # crashing here. The values are intentionally garbage — callers
+            # should NEVER use this result for actual data; it's only a
+            # fallback to keep storage-adapter-based code paths alive.
+            placeholder = {
+                "_locked": True,
+                "_reason": "manifest encrypted; FLATSEEK_PASSPHRASE needed",
+                "total_docs": 0,
+            }
+            return json.dumps(placeholder).encode("utf-8")
 
         # Strip section prefix — offsets store stripped paths
         stripped = self._strip_prefix(rel_path)

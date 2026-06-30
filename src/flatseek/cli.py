@@ -942,31 +942,18 @@ def cmd_search(args):
         from flatseek.flatseek_file import FlatseekFileStorageAdapter
         storage = FlatseekFileStorageAdapter(data_path, enc_key=enc_key)
 
-        # Pre-flight: if the manifest is locked (encrypted and no key /
-        # wrong key), surface a friendly error here instead of letting
-        # it bubble as a cryptic AttributeError or raw FileNotFoundError.
-        # Skip if the user didn't provide a passphrase at all — for plain
-        # .fsk sources we want this to be a no-op.
+        # If the manifest is locked (encrypted + no key / wrong key), the
+        # storage adapter returns a placeholder stats so the search can
+        # still proceed without crashing — returns 0 results. The API path
+        # uses is_encrypted() to trigger a 403 + Flatlens password prompt.
+        # For CLI, the user just sees 0 hits and learns they need a key.
         if storage.is_manifest_locked():
-            locked_msg = "\n".join([
-                f"Cannot search encrypted .fsk without unlocking its manifest.",
-                f"  Locked fields: {', '.join(sorted(storage.locked_fields())) or '(manifest unreadable)'}",
-            ])
-            if enc_key is None:
-                locked_msg += (
-                    "\n  No passphrase was provided."
-                    "\n  Fix: re-run with --passphrase <PASSPHRASE>, or set"
-                    "\n       FLATSEEK_PASSPHRASE in your shell (avoids history leak)."
-                )
-            else:
-                locked_msg += (
-                    "\n  A key was provided but the manifest did not decrypt"
-                    "\n  (likely the WRONG passphrase)."
-                    "\n  Fix: re-run with the correct passphrase."
-                    "\n  Lost the passphrase? The .fsk cannot be recovered — re-build from source."
-                )
-            print(locked_msg, file=sys.stderr)
-            sys.exit(2)
+            print(
+                f"WARNING: {data_path} is encrypted and no passphrase was "
+                f"provided (or wrong). Search will return 0 results until "
+                f"you pass --passphrase <P> or set FLATSEEK_PASSPHRASE.",
+                file=sys.stderr,
+            )
     elif getattr(args, "storage_backend", None):
         config = StorageConfig(
             backend=args.storage_backend,

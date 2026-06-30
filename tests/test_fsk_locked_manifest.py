@@ -75,41 +75,52 @@ class TestEncryptedFskLockedManifest:
         assert adp.is_manifest_locked() is False
         assert adp.locked_fields() == set()
 
-    def test_read_stats_raises_clear_error_when_locked(self):
-        """read_bytes('stats.json') should raise a helpful error, not
-        the cryptic 'str' object has no attribute 'get' crash."""
-        adp = FlatseekFileStorageAdapter(self.fsk, enc_key=None)
-        with pytest.raises(FileNotFoundError) as exc:
-            adp.read_bytes("stats.json")
-        msg = str(exc.value)
-        assert "manifest is locked" in msg
-        assert "--passphrase" in msg
-        # Should NOT contain the cryptic Python error
-        assert "AttributeError" not in msg
-        assert "'str' object has no attribute 'get'" not in msg
+    def test_read_stats_returns_placeholder_when_locked(self):
+        """read_bytes('stats.json') must NOT raise when manifest is locked.
 
-    def test_read_stats_raises_clear_error_for_wrong_key(self):
-        """Wrong key → error message says the key was wrong + recovery hint."""
-        wrong_key = load_encryption_key(str(self.tmp / "data"), _WRONG_PASS)
-        adp = FlatseekFileStorageAdapter(self.fsk, enc_key=wrong_key)
-        with pytest.raises(FileNotFoundError) as exc:
-            adp.read_bytes("stats.json")
-        msg = str(exc.value)
-        assert "manifest is locked" in msg
-        assert "wrong passphrase" in msg or "did not decrypt" in msg
-        # Helpful hint about recovery
-        assert "re-build" in msg or "correct passphrase" in msg
+        The API contract is: is_encrypted() is the source of truth for
+        the lock state, and the API search route returns 403 + prompts
+        the Flatlens client for a password. Raising from _get_file_bytes
+        would crash the API before it can send the 403.
 
-    def test_query_engine_with_locked_manifest_surfaces_clear_error(self):
-        """QueryEngine.__init__ should fail with a clear error when the
-        storage adapter has locked manifest, not the cryptic AttributeError
-        that used to fire when self.stats was actually a string."""
+        For the storage adapter, the right behavior is: return a small
+        placeholder JSON so the adapter surface stays usable. Callers
+        that care about lock state should pre-check is_manifest_locked().
+        """
         adp = FlatseekFileStorageAdapter(self.fsk, enc_key=None)
-        with pytest.raises(FileNotFoundError) as exc:
-            QueryEngine(str(self.fsk), storage=adp)
-        msg = str(exc.value)
-        assert "manifest is locked" in msg
-        assert "AttributeError" not in msg
+        # Should NOT raise — the API and CLI search paths need this to succeed
+        raw = adp.read_bytes("stats.json")
+        import json
+        parsed = json.loads(raw)
+        # The placeholder marks itself as locked so downstream code can detect
+        assert parsed.get("_locked") is True
+        assert "encrypted" in parsed.get("_reason", "").lower() or \
+               "passphrase" in parsed.get("_reason", "").lower()
+
+    def test_read_stats_works_normally_for_correct_key(self):
+        """With the right key, read_bytes returns real stats (not placeholder)."""
+        key = load_encryption_key(str(self.tmp / "data"), _PASSPHRASE)
+        adp = FlatseekFileStorageAdapter(self.fsk, enc_key=key)
+        import json
+        parsed = json.loads(adp.read_bytes("stats.json"))
+        assert parsed.get("_locked") is None
+        # Real stats have meaningful fields
+        assert "total_docs" in parsed
+
+    def test_query_engine_with_locked_manifest_succeeds_with_placeholder(self):
+        """QueryEngine init should succeed (not raise) even with locked
+        manifest. The actual query() call is expected to raise via
+        _decrypt_if_needed — but that's the API route's contract
+        (the search route checks is_encrypted() first and returns 403,
+        so .query() is never called without a key in the normal flow).
+        What matters here is that init + lock detection work."""
+        adp = FlatseekFileStorageAdapter(self.fsk, enc_key=None)
+        # Should not raise
+        qe = QueryEngine(str(self.fsk), storage=adp)
+        # is_encrypted() reports True for downstream API routes
+        assert adp.is_manifest_locked() is True
+        # Placeholder stats means no real data is queryable
+        assert qe.stats.get("_locked") is True
 
     def test_query_engine_with_correct_key_works(self):
         """Sanity check: with the correct key, the encrypted .fsk
