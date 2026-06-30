@@ -849,6 +849,31 @@ def cmd_search(args):
         enc_key = _get_flatseek_enc_key(data_path, args)
         from flatseek.flatseek_file import FlatseekFileStorageAdapter
         storage = FlatseekFileStorageAdapter(data_path, enc_key=enc_key)
+
+        # Pre-flight: if the manifest is locked (encrypted and no key /
+        # wrong key), surface a friendly error here instead of letting
+        # it bubble as a cryptic AttributeError or raw FileNotFoundError.
+        # Skip if the user didn't provide a passphrase at all — for plain
+        # .fsk sources we want this to be a no-op.
+        if storage.is_manifest_locked():
+            locked_msg = "\n".join([
+                f"Cannot search encrypted .fsk without unlocking its manifest.",
+                f"  Locked fields: {', '.join(sorted(storage.locked_fields())) or '(manifest unreadable)'}",
+            ])
+            if enc_key is None:
+                locked_msg += (
+                    "\n  No passphrase was provided."
+                    "\n  Fix: re-run with --passphrase <PASSPHRASE>."
+                )
+            else:
+                locked_msg += (
+                    "\n  A key was provided but the manifest did not decrypt"
+                    "\n  (likely the WRONG passphrase)."
+                    "\n  Fix: re-run with the correct passphrase."
+                    "\n  Lost the passphrase? The .fsk cannot be recovered — re-build from source."
+                )
+            print(locked_msg, file=sys.stderr)
+            sys.exit(2)
     elif getattr(args, "storage_backend", None):
         config = StorageConfig(
             backend=args.storage_backend,

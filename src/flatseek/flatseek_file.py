@@ -978,12 +978,73 @@ class FlatseekFileStorageAdapter(StorageAdapter):
         self._manifest: dict = {}  # Parsed manifest data
         self._enc_key: bytes | None = enc_key  # ChaCha20 key for encrypted indexes
         self._is_encrypted: bool = False  # set after manifest is parsed
+        # Names of manifest fields (e.g. "stats", "columns") that are still
+        # encrypted — could not be decrypted because no key or wrong key
+        # was provided. Used to raise a clear error when the caller asks
+        # for those fields, instead of crashing downstream with
+        # `'str' object has no attribute 'get'` (a string instead of dict).
+        self._locked_manifest_fields: set[str] = set()
         self._fh = None  # open file handle, set in _open()
         self._open()
 
     def set_key(self, enc_key: bytes):
-        """Set the encryption key for an encrypted index."""
+        """Set the encryption key for an encrypted index.
+
+        After calling this with the correct passphrase, re-run
+        `is_manifest_locked()` to see if any fields unlocked. If the
+        fields were locked due to wrong-key, calling `set_key()` with the
+        right one is necessary (manifest values were never decrypted).
+        Note: re-running set_key() does NOT re-parse the manifest — for
+        that, the caller would need to re-open the adapter.
+        """
         self._enc_key = enc_key
+
+    def is_manifest_locked(self) -> bool:
+        """True iff any of stats.json / column_map.json / manifest.json
+        could not be decrypted (no key or wrong key was provided).
+
+        Use to check before invoking read_bytes("stats.json") to give the
+        user a friendlier error message tailored to their context.
+        """
+        return bool(self._locked_manifest_fields)
+
+    def locked_fields(self) -> set[str]:
+        """Names of manifest fields still encrypted (couldn't decrypt).
+        Returns the full set so the caller can decide which to mention.
+        """
+        return set(self._locked_manifest_fields)
+
+    def _locked_error(self, rel_path: str) -> FileNotFoundError:
+        """Build a clear error for an encrypted manifest field.
+
+        Replaces the cryptic `'str' object has no attribute 'get'` that
+        used to fire when a caller asked for `stats.json` from an
+        encrypted .fsk without first decrypting the manifest (no key or
+        wrong key). The new error tells the user exactly what's locked
+        and how to fix it.
+        """
+        fields = sorted(self._locked_manifest_fields)
+        lines = [
+            f"Cannot read {rel_path}: manifest is locked (encrypted).",
+            f"  Locked fields: {', '.join(fields) if fields else '(unknown)'}",
+        ]
+        if not self._enc_key:
+            lines.append(
+                "  No key was provided to unlock the manifest."
+            )
+            lines.append(
+                "  Fix: pass --passphrase <PASSPHRASE> at serve/search time, "
+                "or set FLATSEEK_FSK_KEY env var (base64)."
+            )
+        else:
+            lines.append(
+                "  A key was provided but decryption failed (likely the wrong passphrase)."
+            )
+            lines.append(
+                "  Fix: re-run with the correct passphrase. If you lost it, "
+                "the index cannot be recovered — re-build from source."
+            )
+        return FileNotFoundError("\n".join(lines))
 
     def _open(self):
         """Read header and build offset tables.
@@ -1097,6 +1158,7 @@ class FlatseekFileStorageAdapter(StorageAdapter):
             parsed = json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError):
             self._manifest = {}
+            self._locked_manifest_fields = set()
             return
 
         # Handle encrypted manifest files stored as base64 (old format) OR
@@ -1106,37 +1168,41 @@ class FlatseekFileStorageAdapter(StorageAdapter):
         # (e.g. `manifest_data["stats"] = raw.hex()`). The hex string starts
         # with the FLATSEEK\x01 encryption magic ("464c41545345454b01...").
         #
-        # If we leave these as strings, downstream `json.loads(read_bytes(
-        # "stats.json"))` returns a str, not a dict — QueryEngine.__init__
-        # crashes on `self.stats.get(...)`. Decrypt eagerly here.
+        # If decryption fails (no key, wrong key, corrupted blob), we
+        # record the field as "locked" and keep the raw hex string. The
+        # storage adapter's `read_bytes()` will raise a clear error when
+        # the caller asks for that field — telling them they need a
+        # passphrase (or to fix the wrong one) instead of crashing
+        # downstream with `'str' object has no attribute 'get'`.
         _ENC_HEX_MAGIC = "464c41545345454b01"  # FLATSEEK\x01 in hex
+        locked_fields: set[str] = set()
         for key, value in list(parsed.items()):
             if key == "_encryption_b64":
                 continue  # internal metadata, not a manifest file
             if isinstance(value, str) and value.startswith(_ENC_HEX_MAGIC):
                 # New format: hex-encoded encrypted blob.
-                # Catch broad Exception here: wrong-key InvalidToken, bad
-                # hex (ValueError), malformed UTF-8/JSON, etc. We don't want
-                # manifest open to fail just because the user gave a wrong
-                # passphrase — let the actual data-access path surface that
-                # error with a clearer message.
+                if not self._enc_key:
+                    # No key provided — manifest value stays locked. Mark
+                    # so the storage adapter can raise an informative
+                    # error instead of returning a raw hex string.
+                    locked_fields.add(key)
+                    continue
                 try:
                     encrypted_blob = bytes.fromhex(value)
                     decrypted = self._decrypt_if_needed(encrypted_blob, SID_MANIFEST)
                     parsed[key] = json.loads(decrypted.decode("utf-8"))
                 except Exception:
-                    pass  # keep as-is if decrypt/parse fails
+                    # Wrong key, malformed UTF-8/JSON, bad hex — treat as
+                    # locked so the caller gets a clear error.
+                    locked_fields.add(key)
             elif isinstance(value, dict) and "__b64" in value:
-                # Decrypt if we have a key
                 encrypted_blob = _b64.b64decode(value["__b64"])
                 try:
                     decrypted = self._decrypt_if_needed(encrypted_blob, SID_MANIFEST)
                     parsed[key] = json.loads(decrypted.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
-                    # Includes cryptography InvalidToken on wrong key — we
-                    # deliberately don't fail manifest open here, so the
-                    # caller can later surface the error when it tries to
-                    # actually USE the (encrypted) data files.
+                    # Includes cryptography InvalidToken on wrong key.
+                    locked_fields.add(key)
                     parsed[key] = value
             elif isinstance(value, dict) and value.get("__b64"):
                 encrypted_blob = _b64.b64decode(value["__b64"])
@@ -1144,9 +1210,11 @@ class FlatseekFileStorageAdapter(StorageAdapter):
                     decrypted = self._decrypt_if_needed(encrypted_blob, SID_MANIFEST)
                     parsed[key] = json.loads(decrypted.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                    locked_fields.add(key)
                     parsed[key] = value
 
         self._manifest = parsed
+        self._locked_manifest_fields = locked_fields
 
         # Check if manifest section itself is encrypted, or if _encryption_b64
         # is present (new format: plaintext manifest but encrypted sections).
@@ -1219,12 +1287,19 @@ class FlatseekFileStorageAdapter(StorageAdapter):
         """
         # Handle manifest files (stats.json, column_map.json, manifest.json) —
         # these are parsed once into self._manifest at open time, so no I/O here.
-        if rel_path == "stats.json" and "stats" in self._manifest:
-            return json.dumps(self._manifest["stats"], indent=2).encode("utf-8")
-        if rel_path == "column_map.json" and "columns" in self._manifest:
-            return json.dumps(self._manifest["columns"], indent=2).encode("utf-8")
-        if rel_path == "manifest.json" and "manifest" in self._manifest:
-            return json.dumps(self._manifest["manifest"], indent=2).encode("utf-8")
+        # If the field is "locked" (couldn't be decrypted — no key or wrong
+        # key), raise a clear error pointing the user at the right fix.
+        _manifest_keys = {
+            "stats.json": "stats",
+            "column_map.json": "columns",
+            "manifest.json": "manifest",
+        }
+        if rel_path in _manifest_keys:
+            field = _manifest_keys[rel_path]
+            if field in self._locked_manifest_fields:
+                raise self._locked_error(rel_path)
+            if field in self._manifest:
+                return json.dumps(self._manifest[field], indent=2).encode("utf-8")
 
         # Strip section prefix — offsets store stripped paths
         stripped = self._strip_prefix(rel_path)
