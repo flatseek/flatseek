@@ -764,13 +764,20 @@ def cmd_plan(args):
     plan(csv_src, output_dir, n_workers=args.workers, delimiter=args.sep, columns=columns)
 
 
-def _get_flatseek_enc_key(flatseek_path: Path, args) -> bytes | None:
-    """Read .flatseek manifest, prompt for passphrase if encrypted, derive key.
+def _get_flatseek_enc_key(flatseek_path: Path, args, *, allow_prompt: bool = True) -> bytes | None:
+    """Read .flatseek manifest, derive key if passphrase is available.
 
     Passphrase resolution: --passphrase CLI flag → FLATSEEK_PASSPHRASE env
-    var → interactive getpass prompt (TTY only). For non-interactive scripts
-    on encrypted .fsk without any source, returns None and the caller
-    surfaces the locked-manifest error on actual data access.
+    var → (optional) interactive getpass prompt.
+
+    ``allow_prompt=False`` is used by ``cmd_serve`` so the server starts
+    immediately even from a TTY — the user's Flatlens client will prompt
+    for the password via the API auth flow, not the CLI. This avoids
+    blocking server startup when a CLI user accidentally runs
+    ``flatseek serve`` from a TTY without setting FLATSEEK_PASSPHRASE.
+
+    Returns None when no key source is available. The caller surfaces
+    the locked-manifest error on actual data access if needed.
     """
     import base64 as _b64
     import json as _json
@@ -797,10 +804,10 @@ def _get_flatseek_enc_key(flatseek_path: Path, args) -> bytes | None:
     if not enc_b64:
         return None  # not encrypted
 
-    passphrase = _resolve_flatseek_passphrase(args)
+    passphrase = _resolve_flatseek_passphrase(args, allow_prompt=allow_prompt)
     if not passphrase:
-        # Non-interactive mode or no source available — don't block.
-        # API will report is_encrypted=true and prompt client for password.
+        # No source — don't block. Server (if serving) will surface
+        # is_encrypted=true and Flatlens prompts the client for password.
         sys.stderr.write(
             f"WARNING: {flatseek_path} is encrypted — provide --passphrase to unlock at startup,\n"
             f"         set FLATSEEK_PASSPHRASE env var, or authenticate via API (Flatlens will prompt).\n"
@@ -883,15 +890,19 @@ def _resolve_passphrase(args):
     return None
 
 
-def _resolve_flatseek_passphrase(args):
+def _resolve_flatseek_passphrase(args, *, allow_prompt: bool = True):
     """Like ``_resolve_passphrase`` but for the .fsk flat-file path
     (``_get_flatseek_enc_key``).
 
-    Returns the passphrase string (always non-None if the .fsk is encrypted,
-    else None). For encrypted .fsk without any source, prompts only when
-    stdin is a TTY — for non-interactive scripts the caller falls back to
-    the existing "no key" path (which raises the clear locked-manifest
-    error on access).
+    Passphrase resolution (highest priority first):
+      1. ``args.passphrase`` (--passphrase CLI flag)
+      2. ``FLATSEEK_PASSPHRASE`` env var
+      3. Interactive ``getpass`` prompt — ONLY if ``allow_prompt=True``
+         AND stdin is a TTY. ``cmd_serve`` passes ``allow_prompt=False``
+         so the server starts immediately even from a TTY (Flatlens will
+         prompt the client via the API auth flow instead).
+
+    Returns the passphrase string, or None if no source was available.
     """
     # 1. CLI flag
     passphrase = getattr(args, "passphrase", None)
@@ -901,8 +912,8 @@ def _resolve_flatseek_passphrase(args):
     env_pp = os.environ.get("FLATSEEK_PASSPHRASE", "").strip()
     if env_pp:
         return env_pp
-    # 3. Interactive (TTY only)
-    if sys.stdin.isatty():
+    # 3. Interactive (TTY only, and only if caller allows)
+    if allow_prompt and sys.stdin.isatty():
         try:
             import getpass
             return getpass.getpass("Passphrase for .fsk: ")
@@ -3864,12 +3875,15 @@ def cmd_serve(args):
     data_dir = getattr(args, "data_option", None) or args.data_dir
     data_dir = os.path.abspath(data_dir) if data_dir else os.getcwd()
     _os.environ["FLATSEEK_DATA_DIR"] = data_dir
-    # Detect single-file mode (.fsk) and derive encryption key if needed
+    # Detect single-file mode (.fsk) and derive encryption key if needed.
+    # IMPORTANT: never prompt here — `flatseek serve` must start
+    # immediately even from a TTY. If the .fsk is encrypted and no key
+    # is available, the API will report is_encrypted=true and Flatlens
+    # will prompt the client via the auth flow.
     if _os.path.isfile(data_dir) and data_dir.endswith((".fsk", ".flatseek", ".flat")):
         _os.environ["FLATSEEK_SINGLE_FILE"] = data_dir
-        # Derive encryption key from passphrase and store as base64 in env
         if not _os.environ.get("FLATSEEK_FSK_KEY"):
-            enc_key = _get_flatseek_enc_key(Path(data_dir), args)
+            enc_key = _get_flatseek_enc_key(Path(data_dir), args, allow_prompt=False)
             if enc_key:
                 import base64 as _b64
                 _os.environ["FLATSEEK_FSK_KEY"] = _b64.b64encode(enc_key).decode("ascii")
