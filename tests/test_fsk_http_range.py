@@ -302,3 +302,36 @@ class TestFskOverHTTPRange:
                 f"backend=url + .fsk URL should still detect FlatseekFile, "
                 f"got {type(adp).__name__}"
             )
+
+    def test_list_url_indices_handles_fsk_storage(self):
+        """Regression: ``_list_url_indices`` in api/deps.py used
+        ``storage._original_url`` (URLStorageAdapter-only attr) and
+        crashed with AttributeError when the storage was a
+        FlatseekFileStorageAdapter (which doesn't have it).
+
+        This used to break the API path: ``GET /_indices?bucket=.../x.fsk``
+        raised AttributeError before reaching the 200 response. Now the
+        helper detects the .fsk URL and returns a single-element list
+        with the file stem as the index name.
+        """
+        from flatseek.core.storage import create_storage_adapter
+        from flatseek.flatseek_file import FlatseekFileStorageAdapter
+
+        fsk = _build_and_pack(self.tmp)
+        with _HTTPServer(_RangeHTTPHandler) as srv:
+            srv.set_fsk(fsk)
+            url = f"http://127.0.0.1:{srv.port}/wiki.fsk"
+            adp = create_storage_adapter(path=url)
+            assert isinstance(adp, FlatseekFileStorageAdapter)
+
+            # Simulate the API path that called list_indices. We just
+            # need to make sure _list_url_indices doesn't crash on the
+            # .fsk-URL case.
+            from flatseek.api.deps import IndexManager
+            mgr = IndexManager()
+            mgr._storage = adp
+            # Should NOT raise AttributeError for missing _original_url
+            result = mgr._list_url_indices(adp)
+            assert result == ["wiki"], (
+                f"expected single index 'wiki' for wiki.fsk, got {result}"
+            )

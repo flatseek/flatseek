@@ -325,19 +325,39 @@ class IndexManager:
         3. Bucket repo: base_url is a HuggingFace bucket (repoType=bucket)
            → HF API tree/ doesn't return top-level dirs; use the web UI URL
            (https://huggingface.co/buckets/owner/repo/) to extract index names
+        4. Single .fsk archive: skip directory-walk entirely — there's
+           exactly one index (the .fsk file itself).
         """
         from flatseek.core.storage import URLStorageAdapter
+        from flatseek.flatseek_file import FlatseekFileStorageAdapter
+
+        # ── Single .fsk archive: skip multi-index detection ─────────────────
+        # .fsk is one file → one index, named after the file stem.
+        if isinstance(storage, FlatseekFileStorageAdapter):
+            # If the URL ended in something.fsk, use the stem. If the
+            # .fsk was passed as a local path earlier, fall through to
+            # the existing single-file handling below.
+            url = getattr(storage, "_url", None) or str(getattr(storage, "path", ""))
+            if url and url.split("?", 1)[0].rstrip("/").endswith(
+                    (".fsk", ".flatseek", ".flat")):
+                from pathlib import PurePosixPath
+                stem = PurePosixPath(url.split("?", 1)[0]).stem
+                return [stem]
 
         # ── Bucket repos: use web UI URL to find index names ───────────────────
         # Buckets use /resolve/{index_name} URL pattern, not /resolve/main
         # HF API tree/ returns cached/upload metadata, not top-level index dirs
         # Solution: hit the web UI URL (https://huggingface.co/buckets/owner/repo/)
         # which returns HTML with links to each index tree page
-        if "huggingface.co" in storage._original_url and "/buckets/" in storage._original_url:
+        # `storage._original_url` is a URLStorageAdapter-specific attribute;
+        # guard with getattr so FlatseekFileStorageAdapter (which doesn't
+        # have it) doesn't crash this code path.
+        original_url = getattr(storage, "_original_url", None) or ""
+        if "huggingface.co" in original_url and "/buckets/" in original_url:
             try:
                 import httpx
                 # Use the original URL (without /resolve/) to get HTML listing
-                web_url = storage._original_url.rstrip("/")
+                web_url = original_url.rstrip("/")
                 resp = httpx.get(web_url, timeout=30.0, follow_redirects=True)
                 if resp.status_code == 200:
                     html = resp.text
