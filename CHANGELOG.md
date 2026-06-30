@@ -5,6 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.8] - 2026-06-30
+
+### Bug fixes & polish on top of v0.1.8
+
+These accumulated on top of the original v0.1.8 release; kept in 0.1.8
+to avoid a 0.1.9 bump for what are mostly bug fixes + perf.
+
+#### Encryption: clearer errors, never block serve
+
+- **Locked-manifest detection.** When an encrypted `.fsk` is opened
+  without the right passphrase, the storage adapter now reports
+  `is_manifest_locked()` and `locked_fields()`. `cmd_search` prints a
+  WARNING and returns 0 results instead of crashing with
+  `AttributeError: 'str' object has no attribute 'get'`. The API still
+  returns 403 from the search route and prompts Flatlens for the
+  password — the original "Flatlens prompts" flow is preserved.
+- **`flatseek serve` never blocks on passphrase prompt.** A
+  `--passphrase`/`FLATSEEK_PASSPHRASE`/TTY prompt would have hung
+  server startup if the operator didn't pre-unlock. Now the server
+  starts immediately, prints a WARNING, and lets Flatlens prompt the
+  client at request time.
+- **Passphrase resolution chain.** All commands now look for the
+  passphrase in priority order: `--passphrase` CLI flag →
+  `FLATSEEK_PASSPHRASE` env var → interactive `getpass` prompt (TTY
+  only). The env-var path lets users set it once in their shell rc
+  (`export FLATSEEK_PASSPHRASE='…'`) and avoid the shell-history leak
+  of putting the secret on the command line.
+
+#### `flatseek slice` performance fixes (work on 1.5M-bin indexes)
+
+- **State file no longer bloats.** Previously the state file stored
+  the full list of `bins_written` (up to 75 MB for 1.5M bins) and
+  re-saved it every ~50 batches → O(N²) total work. State now stores
+  only counts; on resume the filesystem walk reconstructs what's done.
+  State file size: ~75 MB → ~12 KB.
+- **Skip empty bins.** Low-selectivity queries on high-cardinality
+  columns (e.g. `msg:error` on logs with 1.5M unique terms) left
+  ~99% of bins with zero surviving postings. We now skip writing
+  those bins entirely — query routing handles missing bucket files
+  correctly (their terms just don't appear in the index).
+- **zlib level 1 instead of 9.** For tiny bin files (<1KB typical)
+  size difference is <5% but compress speed is 3-5× faster.
+- **Combined 1-pass bin processing.** Previously the rewrite pass
+  was followed by a "copy verbatim" pass for unchanged bins; now
+  each worker task decides inline (rewrite vs copy vs skip).
+- **Batched bins per worker task.** Reduces ThreadPool task-scheduling
+  overhead on 1.5M+ bin workloads.
+
+Combined throughput: ~100 bins/sec → ~11,000 bins/sec on the same
+machine (113× speedup). For a 1.5M-bin slice: ~4 hours → ~3 minutes.
+
 ## [0.1.8] - 2026-06-29
 
 ### New: `flatseek verify` — chunk-level integrity check

@@ -764,8 +764,10 @@ def cmd_plan(args):
     plan(csv_src, output_dir, n_workers=args.workers, delimiter=args.sep, columns=columns)
 
 
-def _get_flatseek_enc_key(flatseek_path: Path, args, *, allow_prompt: bool = True) -> bytes | None:
+def _get_flatseek_enc_key(flatseek_source, args, *, allow_prompt: bool = True) -> bytes | None:
     """Read .flatseek manifest, derive key if passphrase is available.
+
+    ``flatseek_source`` can be a local ``Path`` or an HTTP URL string.
 
     Passphrase resolution: --passphrase CLI flag → FLATSEEK_PASSPHRASE env
     var → (optional) interactive getpass prompt.
@@ -783,17 +785,31 @@ def _get_flatseek_enc_key(flatseek_path: Path, args, *, allow_prompt: bool = Tru
     import json as _json
     from flatseek.core.query_engine import load_encryption_key
     from flatseek.flatseek_file import HEADER_SIZE, FlatseekHeader
+    from flatseek.core.storage import RangeFile
 
-    with open(flatseek_path, "rb") as f:
-        header_data = f.read(HEADER_SIZE)
-        header = FlatseekHeader.unpack(header_data)
-        for desc in header.sections:
-            if desc.section_id == 0x01:  # SID_MANIFEST
-                f.seek(desc.offset)
-                data = f.read(desc.size)
-                break
-        else:
-            return None
+    is_url = isinstance(flatseek_source, str) and (
+        flatseek_source.startswith("http://") or
+        flatseek_source.startswith("https://")
+    )
+    if is_url:
+        rf = RangeFile(flatseek_source)
+        header_data = rf.read(HEADER_SIZE)
+    else:
+        with open(flatseek_source, "rb") as f:
+            header_data = f.read(HEADER_SIZE)
+    header = FlatseekHeader.unpack(header_data)
+    for desc in header.sections:
+        if desc.section_id == 0x01:  # SID_MANIFEST
+            if is_url:
+                rf.seek(desc.offset)
+                data = rf.read(desc.size)
+            else:
+                with open(flatseek_source, "rb") as f:
+                    f.seek(desc.offset)
+                    data = f.read(desc.size)
+            break
+    else:
+        return None
 
     try:
         manifest = _json.loads(data.decode("utf-8"))
@@ -809,7 +825,7 @@ def _get_flatseek_enc_key(flatseek_path: Path, args, *, allow_prompt: bool = Tru
         # No source — don't block. Server (if serving) will surface
         # is_encrypted=true and Flatlens prompts the client for password.
         sys.stderr.write(
-            f"WARNING: {flatseek_path} is encrypted — provide --passphrase to unlock at startup,\n"
+            f"WARNING: {flatseek_source} is encrypted — provide --passphrase to unlock at startup,\n"
             f"         set FLATSEEK_PASSPHRASE env var, or authenticate via API (Flatlens will prompt).\n"
         )
         return None
@@ -932,15 +948,22 @@ def cmd_search(args):
     enc_key = None
 
     # Handle .flatseek files (including custom extensions like .flat)
+    # AND HTTP/HTTPS URLs that point to .fsk archives (no full download;
+    # uses HTTP Range requests for streaming).
     data_path = Path(args.data_dir)
-    is_flat_file = data_path.is_file() and (
+    is_url = isinstance(args.data_dir, str) and (
+        args.data_dir.startswith("http://") or args.data_dir.startswith("https://")
+    )
+    is_flat_file = (not is_url) and data_path.is_file() and (
         str(data_path).endswith((".fsk", ".flatseek", ".flat"))
     )
-    if is_flat_file:
+    if is_flat_file or is_url:
         # Read manifest to detect encryption
-        enc_key = _get_flatseek_enc_key(data_path, args)
+        # For URL: pass the URL string. For local: pass the Path.
+        source = args.data_dir if is_url else data_path
+        enc_key = _get_flatseek_enc_key(source, args)
         from flatseek.flatseek_file import FlatseekFileStorageAdapter
-        storage = FlatseekFileStorageAdapter(data_path, enc_key=enc_key)
+        storage = FlatseekFileStorageAdapter(source, enc_key=enc_key)
 
         # If the manifest is locked (encrypted + no key / wrong key), the
         # storage adapter returns a placeholder stats so the search can

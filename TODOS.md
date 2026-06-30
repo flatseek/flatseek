@@ -5,9 +5,9 @@ Each item has: status, brief description, why, and how to approach.
 
 ---
 
-## [ ] `.fsk` over HTTP Range — load .fsk directly from HF/S3 without full download
+## [x] `.fsk` over HTTP Range — load .fsk directly from HF/S3 without full download
 
-**Status**: Deferred (post v0.1.8)
+**Status**: Implemented (uncommitted locally, post v0.1.8)
 
 **Why**: HuggingFace datasets have a hard cap of ~100k files per repo. A
 flatseek index for millions of docs typically has 100k+ bin files alone

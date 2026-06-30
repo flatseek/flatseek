@@ -28,14 +28,21 @@ from flatseek.core.query_engine import load_encryption_key
 from flatseek.flatseek_file import FlatseekPacker
 
 
-_PORT_BASE = 18900  # ephemeral ports unlikely to clash
+import socket
 
 
 def _pick_port() -> int:
-    """Return a port number unique across test invocations."""
-    global _PORT_BASE
-    _PORT_BASE += 1
-    return _PORT_BASE
+    """Return a free ephemeral port.
+
+    Asks the OS for an unused port — avoids the port-conflict flakiness
+    of using a fixed offset (which can clash when multiple tests run
+    in the same pytest session).
+    """
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
 
 
 def _build_and_encrypt_dir(tmp: Path, csv_text: str = "a,b\nx,y\n") -> Path:

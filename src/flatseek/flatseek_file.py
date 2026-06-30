@@ -968,8 +968,26 @@ class FlatseekFileStorageAdapter(StorageAdapter):
     throughout the codebase.
     """
 
-    def __init__(self, flatseek_path: str | Path, enc_key: bytes | None = None):
-        self.path = Path(flatseek_path)
+    def __init__(self, source: str | Path, enc_key: bytes | None = None):
+        """Open a .flatseek file for reading.
+
+        ``source`` can be:
+          - a local filesystem path (e.g. ``/data/index.fsk``)
+          - an HTTP/HTTPS URL (e.g. ``https://huggingface.co/.../foo.fsk``).
+            When a URL is given, the adapter issues HTTP Range requests
+            instead of opening a local file, so the whole archive doesn't
+            need to be downloaded.
+        """
+        # Detect URL vs path. URLs start with http:// or https://
+        self._is_url = isinstance(source, str) and (
+            source.startswith("http://") or source.startswith("https://")
+        )
+        if self._is_url:
+            self.path = Path(source)  # for compatibility / error messages
+            self._url = source
+        else:
+            self.path = Path(source)
+            self._url = None
         self._header: Optional[FlatseekHeader] = None
         # file_offsets: key -> (section_id, abs_offset_in_file, size).
         # abs_offset is the byte offset within the .fsk file, so reads are a
@@ -984,7 +1002,7 @@ class FlatseekFileStorageAdapter(StorageAdapter):
         # for those fields, instead of crashing downstream with
         # `'str' object has no attribute 'get'` (a string instead of dict).
         self._locked_manifest_fields: set[str] = set()
-        self._fh = None  # open file handle, set in _open()
+        self._fh = None  # file handle (or RangeFile for URLs), set in _open()
         self._open()
 
     def set_key(self, enc_key: bytes):
@@ -1051,11 +1069,16 @@ class FlatseekFileStorageAdapter(StorageAdapter):
 
         Streaming-safe: only the header, manifest, and offset tables are read.
         No file payload is loaded — individual files are seek+read on demand.
+
+        For local paths, opens the file and keeps the handle open.
+        For URLs, uses RangeFile which translates seek+read into
+        HTTP Range requests on the remote .fsk — no full download.
         """
-        # The file handle is kept open for the lifetime of the adapter so
-        # _get_file_bytes / open_read can do per-file seek+read without
-        # re-opening on every call.
-        self._fh = open(self.path, "rb")
+        if self._is_url:
+            from flatseek.core.storage import RangeFile
+            self._fh = RangeFile(self._url)
+        else:
+            self._fh = open(self.path, "rb")
         try:
             f = self._fh
             # Read header
@@ -1120,8 +1143,15 @@ class FlatseekFileStorageAdapter(StorageAdapter):
     def close(self) -> None:
         """Close the underlying .fsk file handle. Idempotent."""
         fh = getattr(self, "_fh", None)
-        if fh is not None and not fh.closed:
-            fh.close()
+        if fh is not None:
+            # For real files: check .closed. For RangeFile: has its own
+            # .close() that no-ops (no persistent state to release).
+            is_closed = getattr(fh, "closed", None)
+            if is_closed is False or (is_closed is None and hasattr(fh, "close")):
+                try:
+                    fh.close()
+                except Exception:
+                    pass
         self._fh = None
 
     def __del__(self, _unraisable=("__del__",)):

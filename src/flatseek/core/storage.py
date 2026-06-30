@@ -878,6 +878,213 @@ class URLStorageAdapter(StorageAdapter):
         raise NotImplementedError("URLStorageAdapter is read-only")
 
 
+class RangeFile:
+    """File-like object that reads from a URL via HTTP Range requests.
+
+    Implements the seek + read protocol that ``FlatseekFileStorageAdapter``
+    uses internally (``self._fh.seek(...)`` then ``self._fh.read(n)``), so
+    the same adapter code can serve .fsk files from a remote URL (HF, S3,
+    Vercel Blob, GitHub releases, …) without downloading the whole file.
+
+    Strategy
+    --------
+    1. ``seek(pos)`` only updates the in-memory cursor (no HTTP).
+    2. ``read(n)`` issues one ``GET`` per missing 4 KB block, with
+       ``Range: bytes=<start>-<end>``. Cached blocks are reused.
+    3. The file size is probed lazily on first read (a small Range request
+       that returns either ``Content-Range: bytes X-Y/Z`` or ``416``).
+
+    Supported by all major providers that flatseek uses (Cloudflare-backed
+    HF, S3, Vercel Blob, GitHub releases). For providers that don't honor
+    Range, the adapter falls back to downloading the whole file once.
+
+    Thread safety: not thread-safe — create one RangeFile per
+    FlatseekFileStorageAdapter instance. Concurrent reads from multiple
+    threads would need locking (not currently used by the adapter).
+    """
+    BLOCK_SIZE = 4096
+
+    def __init__(self, url: str, *, timeout: float = 30.0,
+                 headers: dict | None = None):
+        self._url = url
+        self._pos = 0
+        self._size: int | None = None
+        self._timeout = timeout
+        self._headers = dict(headers or {})
+        # Block cache: block_idx → bytes
+        self._cache: dict[int, bytes] = {}
+        # When the server returns the whole file at once (status 200,
+        # not honoring Range), we keep it here and serve all reads from
+        # this buffer. Avoids multiple round-trips for non-Range servers.
+        self._full_data: bytes | None = None
+        # Total size, populated on first read
+        self._eof_hit = False  # True once we've seen a partial block
+
+    # ── File-like protocol ────────────────────────────────────────────
+    def seek(self, pos: int) -> int:
+        if pos < 0:
+            raise ValueError(f"negative seek: {pos}")
+        self._pos = pos
+        return pos
+
+    def tell(self) -> int:
+        return self._pos
+
+    def read(self, n: int = -1) -> bytes:
+        """Read up to ``n`` bytes from current position.
+
+        ``n=-1`` (or 0) reads until EOF.
+        """
+        # Fast path: if the server already returned the whole file in
+        # cache[0] (it didn't honor Range), serve straight from there.
+        if self._full_data is not None:
+            if n is None or n < 0:
+                n = len(self._full_data) - self._pos
+            chunk = self._full_data[self._pos:self._pos + n]
+            self._pos += len(chunk)
+            return chunk
+
+        if n is None or n < 0:
+            # Read everything: probe size first
+            if self._size is None:
+                self._probe_size()
+            n = max(0, (self._size or 0) - self._pos)
+        out = bytearray()
+        remaining = n
+        while remaining > 0:
+            block_idx, block_offset = divmod(self._pos, self.BLOCK_SIZE)
+            chunk = self._fetch_block(block_idx)
+            if chunk is None or chunk == b"":
+                break  # EOF
+            available = len(chunk) - block_offset
+            take = min(available, remaining)
+            if take <= 0:
+                break
+            out.extend(chunk[block_offset:block_offset + take])
+            self._pos += take
+            remaining -= take
+        return bytes(out)
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def close(self) -> None:
+        """No-op — the HTTP client holds no persistent state."""
+        self._cache.clear()
+
+    # ── Internals ────────────────────────────────────────────────────
+    def _probe_size(self) -> int:
+        """Determine the file's total size via a tiny Range request.
+
+        Some servers return ``Content-Length`` directly; we use a
+        0-byte Range request which is the most universally-supported
+        way to learn the total size.
+        """
+        import httpx
+        try:
+            resp = httpx.get(
+                self._url,
+                headers={**self._headers, "Range": "bytes=0-0"},
+                timeout=self._timeout,
+                follow_redirects=True,
+            )
+        except Exception as e:
+            raise IOError(f"RangeFile probe failed for {self._url}: {e}")
+        if resp.status_code == 200:
+            # Server didn't honor Range — full content
+            size = len(resp.content)
+            # Cache the whole file so subsequent reads don't need HTTP
+            self._full_data = resp.content
+            self._cache[0] = resp.content  # also keep for backward compat
+            self._eof_hit = True
+        elif resp.status_code == 206:
+            cr = resp.headers.get("Content-Range", "")
+            # Format: "bytes 0-0/<size>"
+            try:
+                size = int(cr.rsplit("/", 1)[1])
+            except (ValueError, IndexError):
+                # Fallback to Content-Length (single byte)
+                size = int(resp.headers.get("Content-Length", "0")) + 1
+            self._cache[0] = resp.content  # 1 byte
+        elif resp.status_code == 416:
+            # Range not satisfiable — empty file
+            size = 0
+        else:
+            resp.raise_for_status()
+            size = 0
+        self._size = size
+        return size
+
+    def _fetch_block(self, block_idx: int) -> bytes | None:
+        """Fetch a 4 KB block, with cache.
+
+        If we already cached a *partial* block (e.g., a 1-byte block
+        from the initial size probe), and the caller now wants the
+        full block, re-fetch the whole thing. This way the cache holds
+        the "largest version of this block we've seen so far".
+        """
+        if block_idx in self._cache and len(self._cache[block_idx]) >= self.BLOCK_SIZE:
+            return self._cache[block_idx]
+        if self._size == 0:
+            return b""
+        if self._eof_hit and block_idx * self.BLOCK_SIZE >= self._size:
+            return None  # we know we're past EOF
+
+        import httpx
+        start = block_idx * self.BLOCK_SIZE
+        end = start + self.BLOCK_SIZE - 1
+        try:
+            resp = httpx.get(
+                self._url,
+                headers={**self._headers, "Range": f"bytes={start}-{end}"},
+                timeout=self._timeout,
+                follow_redirects=True,
+            )
+        except Exception as e:
+            raise IOError(
+                f"RangeFile read failed at offset {start} from {self._url}: {e}"
+            )
+
+        if resp.status_code == 200:
+            # Server ignored Range and returned the whole file.
+            # Cache it as the full-data buffer so future reads serve
+            # straight from memory without more round-trips.
+            self._size = len(resp.content)
+            self._full_data = resp.content
+            self._eof_hit = True
+            return resp.content
+        if resp.status_code == 416:
+            # Range Not Satisfiable — past EOF
+            self._eof_hit = True
+            return b""
+        if resp.status_code == 206:
+            data = resp.content
+            # Cache the block
+            self._cache[block_idx] = data
+            # Update size from Content-Range (covers cases where we
+            # haven't probed first, e.g., for very large files)
+            if self._size is None:
+                cr = resp.headers.get("Content-Range", "")
+                try:
+                    self._size = int(cr.rsplit("/", 1)[1])
+                except (ValueError, IndexError):
+                    pass
+            return data
+        # 4xx/5xx — let the caller see the error
+        resp.raise_for_status()
+        return None  # unreachable, for type checkers
+
+    def size(self) -> int:
+        """Return total file size, probing if necessary."""
+        if self._size is None:
+            return self._probe_size()
+        return self._size
+        raise NotImplementedError("URLStorageAdapter is read-only")
+
+
 def create_storage_adapter(
     config: StorageConfig | None = None,
     path: str | Path | None = None,
