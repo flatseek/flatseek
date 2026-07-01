@@ -32,16 +32,31 @@ import socket
 
 
 def _pick_port() -> int:
-    """Return a free ephemeral port.
+    """Return a free ephemeral port (with retry on EADDRINUSE).
 
-    Asks the OS for an unused port — avoids the port-conflict flakiness
-    of using a fixed offset (which can clash when multiple tests run
-    in the same pytest session).
+    Two tests in the same pytest session can race on the OS-allocated
+    port (port 0 means "give me any free port", and the OS can return
+    the same port to both before the second test actually binds).
+    Retry with backoff if the chosen port is in use by the time we
+    try to start the server.
     """
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
+    import time
+    for attempt in range(20):
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        # Sanity-check the port isn't already used by another live socket
+        probe = socket.socket()
+        try:
+            probe.bind(("127.0.0.1", port))
+            probe.close()
+            return port
+        except OSError:
+            time.sleep(0.05 + 0.05 * attempt)
+            continue
+    # Give up after retries — let the caller deal with the eventual
+    # bind error rather than block forever
     return port
 
 
@@ -120,10 +135,15 @@ class TestServeUnblocksOnEncryptedSources:
         os.environ["PATH"] = self._saved_env.get("PATH", "/usr/bin:/bin")
 
     def teardown_method(self):
+        import time
         proc = getattr(self, "_proc", None)
         if proc and proc.poll() is None:
             proc.kill()
             proc.communicate()
+        # Give the OS time to release the port (TIME_WAIT can briefly
+        # hold the port — without this, the next test's _pick_port
+        # may return a port that uvicorn's old socket still owns).
+        time.sleep(0.5)
         os.environ.clear()
         os.environ.update(self._saved_env)
         shutil.rmtree(self.tmp, ignore_errors=True)

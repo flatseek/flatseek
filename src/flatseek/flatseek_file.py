@@ -1008,14 +1008,20 @@ class FlatseekFileStorageAdapter(StorageAdapter):
     def set_key(self, enc_key: bytes):
         """Set the encryption key for an encrypted index.
 
-        After calling this with the correct passphrase, re-run
-        `is_manifest_locked()` to see if any fields unlocked. If the
-        fields were locked due to wrong-key, calling `set_key()` with the
-        right one is necessary (manifest values were never decrypted).
-        Note: re-running set_key() does NOT re-parse the manifest — for
-        that, the caller would need to re-open the adapter.
+        If the manifest was previously locked (couldn't be decrypted at
+        open time because no key was available), re-read and re-parse
+        it now that we have a key. This is what makes the API
+        ``POST /_authenticate`` flow work for `.fsk` URL sources.
+
+        After this call, callers that previously saw `_locked=True` will
+        see the real manifest values and queries will return real results.
         """
         self._enc_key = enc_key
+        if self._locked_manifest_fields and enc_key is not None:
+            # Re-read the manifest section. The header is already in
+            # memory (self._header) and points us to the manifest bytes;
+            # just seek+read+decrypt+reparse.
+            self._reparse_manifest()
 
     def is_manifest_locked(self) -> bool:
         """True iff any of stats.json / column_map.json / manifest.json
@@ -1116,22 +1122,21 @@ class FlatseekFileStorageAdapter(StorageAdapter):
                         self._parse_manifest(data)
                     break
 
-            # Build offset tables for all sections
+            # Build offset tables for all sections.
             for desc in self._header.sections:
                 if desc.size == 0:
                     continue
                 if desc.section_id == SID_MANIFEST:
                     continue  # already parsed above
-                # Read the offset table (first 4 bytes = table length prefix)
+                # Read offset table: 4 bytes (length prefix) + table entries.
+                # Two-step read: get length first, then the full table.
                 f.seek(desc.offset)
                 tbl_len_raw = f.read(4)
                 if len(tbl_len_raw) < 4:
                     continue
                 tbl_len = struct.unpack("<I", tbl_len_raw)[0]
-                # Read full offset table (may be > 1MB for large indexes)
                 f.seek(desc.offset)
                 table_data = f.read(4 + tbl_len)
-                # Pass section file offset so each entry gets an absolute offset.
                 self._parse_section_offsets(desc.section_id, table_data, desc.offset)
         except Exception:
             # If anything fails during open, release the file handle so we
@@ -1245,6 +1250,33 @@ class FlatseekFileStorageAdapter(StorageAdapter):
 
         self._manifest = parsed
         self._locked_manifest_fields = locked_fields
+
+    def _reparse_manifest(self):
+        """Re-read and re-parse the manifest section.
+
+        Called by set_key() when the manifest was previously locked
+        (no key at open time) and we now have one. Reads the manifest
+        bytes via the existing file handle, decrypts if needed, and
+        re-runs _parse_manifest so the locked fields get unlocked.
+        """
+        if self._header is None or self._fh is None:
+            return
+        f = self._fh
+        for desc in self._header.sections:
+            if desc.section_id == 0x01:  # SID_MANIFEST
+                f.seek(desc.offset)
+                data = f.read(desc.size)
+                # If the section itself is encrypted, decrypt first
+                try:
+                    data.decode("utf-8")
+                except UnicodeDecodeError:
+                    if self._enc_key is None:
+                        return  # still locked, can't decrypt
+                    from flatseek.core.query_engine import is_encrypted, decrypt_bytes
+                    if is_encrypted(data):
+                        data = decrypt_bytes(data, self._enc_key)
+                self._parse_manifest(data)
+                return
 
         # Check if manifest section itself is encrypted, or if _encryption_b64
         # is present (new format: plaintext manifest but encrypted sections).

@@ -7,10 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.8] - 2026-06-30
 
+### Performance: RangeFile HTTP optimization for remote `.fsk`
+
+Serving a `.fsk` index from HuggingFace, S3, or any HTTP URL is now
+**5× faster** on open and **dramatically faster** on first query.
+
+Key changes to `RangeFile` (`core/storage.py`):
+
+- **`BLOCK_SIZE`: 4 KB → 256 KB.** Reading a 1.6 MB index offset table
+  now needs ~7 requests instead of ~425 (at 4 KB/block).
+- **Persistent `httpx.Client`** with HTTP/2 — single TCP/TLS connection,
+  request multiplexing. Previously each block fetch created a brand-new
+  client (new handshake every request).
+- **`MAX_CONCURRENT = 16`** concurrent block fetches via a thread pool,
+  exploiting HTTP/2 multiplexing. Server-side stream limits are respected
+  with automatic retry (up to 3×) on stream closure.
+- **Graceful HTTP/2 fallback** — if `h2` is not installed, falls back
+  to HTTP/1.1 with keep-alive (still better than per-request client
+  creation).
+
+**Performance on wikipedia.fsk (1.3 GB from HuggingFace):**
+
+| Metric | Before | After |
+|--------|--------|-------|
+| Open time | >20 s | ~4 s |
+| 1.6 MB index offset table | ~425 serial requests (~7 min) | ~7 concurrent requests (~2 s) |
+
+Requires `httpx[http2]` — updated in `pyproject.toml` dependencies.
+
+### Bug fix: `FlatseekFileStorageAdapter.listdir` for `index/` subdirs
+
+`_read_posting` relies on `listdir(bucket_dir)` to enumerate `.bin` files
+inside each index bucket. For local files this uses `os.listdir`; for
+remote `.fsk` (via `FlatseekFileStorageAdapter`) it previously returned
+an empty list because `listdir` wasn't correctly filtering the section-prefixed
+offset table keys. Now returns the correct file list — search over remote
+`.fsk` archives returns real results.
+
 ### Bug fixes & polish on top of v0.1.8
 
 These accumulated on top of the original v0.1.8 release; kept in 0.1.8
-to avoid a 0.1.9 bump for what are mostly bug fixes + perf.
+to avoid a patch-version churn for what are mostly bug fixes + perf.
 
 #### Encryption: clearer errors, never block serve
 

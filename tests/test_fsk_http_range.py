@@ -335,3 +335,41 @@ class TestFskOverHTTPRange:
             assert result == ["wiki"], (
                 f"expected single index 'wiki' for wiki.fsk, got {result}"
             )
+
+    def test_get_engine_works_for_fsk_url(self):
+        """Regression: IndexManager.get_engine(index, bucket_url=<.fsk>)
+        used to 404 because the isinstance check only matched
+        URLStorageAdapter. After my fix it also matches
+        FlatseekFileStorageAdapter, so the API's search route can
+        actually create a QueryEngine against a .fsk URL."""
+        from flatseek.api.deps import IndexManager
+        from flatseek.flatseek_file import FlatseekFileStorageAdapter
+
+        fsk = _build_and_pack(self.tmp)
+        with _HTTPServer(_RangeHTTPHandler) as srv:
+            srv.set_fsk(fsk)
+            url = f"http://127.0.0.1:{srv.port}/wiki.fsk"
+
+            mgr = IndexManager()
+            adp = mgr._get_bucket_storage(url)
+            # Should be a FlatseekFileStorageAdapter (not URLStorageAdapter)
+            assert isinstance(adp, FlatseekFileStorageAdapter)
+
+            # Now ask the API path to get an engine for "wiki" via this URL.
+            # Manifest is locked (no key provided) — engine.stats will be
+            # the placeholder. We need to set the key AFTER get_engine
+            # to match the API auth flow (POST /_authenticate sets the
+            # key on the engine, then subsequent search uses it).
+            engine = mgr.get_engine("wiki", bucket_url=url)
+            assert engine is not None
+            assert engine.stats.get("_locked") is True
+            # Set the key (simulating the POST /_authenticate round-trip)
+            key = load_encryption_key(str(self.tmp / "data"), "pp")
+            engine.storage.set_key(key)
+            engine._enc_key = key
+            # Now reload stats to get the real values
+            engine.reload_stats()
+            assert engine.stats.get("total_docs") == 2
+            # The query should also work
+            r = engine.query("city:Jakarta")
+            assert r["total"] == 1

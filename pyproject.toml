@@ -16,7 +16,7 @@ dependencies = [
     "fastapi",
     "uvicorn",
     "pydantic",
-    "httpx",
+    "httpx[http2]",
 ]
 
 authors = [
@@ -37,7 +37,7 @@ flatseek-api = "flatseek.api_server:run"
 dev = [
     "pytest>=7.0",
     "pytest-asyncio",
-    "httpx",
+    "httpx[http2]",
 ]
 chat = [
     "openai",

@@ -104,6 +104,40 @@ flatseek search ./data "machine learning" \
 
 The URL adapter is **read-only** — you can query public indexes hosted on GitHub Releases, HuggingFace, or any HTTP server that serves raw files.
 
+### Single `.fsk` file from HTTP (no full download)
+
+A `.fsk` archive (single packed index file) hosted on HuggingFace, S3, or any
+HTTP URL is served **directly via HTTP Range requests** — no full download needed.
+This is the recommended way to distribute large indexes on HuggingFace Datasets
+(repos have a ~100 k file cap; a `.fsk` is one file regardless of index size).
+
+```bash
+# Serve a .fsk directly — opens in ~4 s for a 1.3 GB file
+flatseek serve https://huggingface.co/buckets/flatseek/flatdata/resolve/wikipedia.fsk
+
+# Or via storage backend
+flatseek search ./data "wiki" \
+  --storage-backend url \
+  --storage-url "https://huggingface.co/buckets/flatseek/flatdata/resolve/wikipedia.fsk"
+```
+
+**How it works**: `FlatseekFileStorageAdapter` detects `.fsk` URLs and uses
+`RangeFile` — a seekable file-like backed by HTTP `Range: bytes=N-N` requests.
+Offset tables are prefetched concurrently (16 parallel requests, HTTP/2
+multiplexing). The 1.3 GB wikipedia.fsk opens in ~4 s instead of downloading
+the entire file.
+
+**Performance** (wikipedia.fsk, 1.3 GB from HuggingFace):
+
+| Operation | Time |
+|-----------|------|
+| Open (header + offset tables) | ~4 s |
+| First search query | ~10 s total (incl. open) |
+| Subsequent queries | near-instant (offset tables cached) |
+
+Requires `httpx[http2]` (HTTP/2 support). Falls back to HTTP/1.1 if `h2`
+is not installed.
+
 ### Encrypted Indexes
 
 When querying an encrypted index, include the `x-index-password` header:

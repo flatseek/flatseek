@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, AsyncGenerator, Any
 from fastapi import Depends, HTTPException, Query
 
 from flatseek.core.storage import StorageAdapter, create_storage_adapter, VercelBlobStorageAdapter, URLStorageAdapter
+from flatseek.flatseek_file import FlatseekFileStorageAdapter
 
 # Default data directory
 DEFAULT_DATA_DIR = os.environ.get("FLATSEEK_DATA_DIR", "data")
@@ -90,17 +91,18 @@ class IndexManager:
         if bucket_url:
             # For bucket URLs, check via storage adapter
             storage = self._get_bucket_storage(bucket_url)
+            # Special case: .fsk URL → the storage is FlatseekFileStorageAdapter
+            # which already tracks _is_encrypted from the manifest at open
+            # time. Don't try to read "encryption.json" (no such sub-path on
+            # a .fsk).
+            if isinstance(storage, FlatseekFileStorageAdapter):
+                return bool(getattr(storage, "_is_encrypted", False))
             # For URL storage, index IS the relative path within the bucket
             enc_path = "encryption.json"
-            import logging
-            logger2 = logging.getLogger(__name__)
-            logger2.warning(f"[deps] is_encrypted bucket_url={bucket_url} index={index} storage={storage}")
             try:
-                enc_data = storage.read_bytes(enc_path)
-                logger2.warning(f"[deps] is_encrypted read_bytes success, data={enc_data[:50]}")
+                storage.read_bytes(enc_path)
                 return True
-            except (FileNotFoundError, Exception) as e:
-                logger2.warning(f"[deps] is_encrypted read_bytes failed: {e}")
+            except (FileNotFoundError, Exception):
                 return False
 
         possible_paths = [
@@ -211,8 +213,10 @@ class IndexManager:
             else:
                 storage = None
 
-            if storage is not None and isinstance(storage, URLStorageAdapter):
-                # URL-based storage (HuggingFace, GitHub, etc.)
+            if storage is not None and isinstance(
+                    storage, (URLStorageAdapter, FlatseekFileStorageAdapter)
+            ):
+                # URL-based storage (HuggingFace, GitHub, generic .fsk URL, etc.)
                 try:
                     engine = QueryEngine(index, storage=storage)
                     # Never cache engines for encrypted bucket URLs — they hold

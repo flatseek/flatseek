@@ -563,7 +563,14 @@ class QueryEngine:
         """
         import json
         from flatseek.core.storage import LocalStorageAdapter
-        stats_path = os.path.join(self.data_dir, "stats.json")
+        from flatseek.flatseek_file import FlatseekFileStorageAdapter
+        # For .fsk sources, stats.json is at the root of the archive
+        # (data_dir is the virtual "index" dir, not where stats live).
+        # For directory sources, stats.json is at the data_dir root.
+        if isinstance(self.storage, FlatseekFileStorageAdapter):
+            stats_path = "stats.json"
+        else:
+            stats_path = os.path.join(self.data_dir, "stats.json")
         if self.storage.exists(stats_path):
             raw = self.storage.read_bytes(stats_path)
             # Decrypt if encrypted (starts with FLATSEEK\x01 magic).

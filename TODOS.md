@@ -7,50 +7,17 @@ Each item has: status, brief description, why, and how to approach.
 
 ## [x] `.fsk` over HTTP Range — load .fsk directly from HF/S3 without full download
 
-**Status**: Implemented (uncommitted locally, post v0.1.8)
+**Status**: Implemented in v0.1.8 (2026-06-30).
 
-**Why**: HuggingFace datasets have a hard cap of ~100k files per repo. A
-flatseek index for millions of docs typically has 100k+ bin files alone
-(hex-sharded `index/aa/bb/idx_w*.bin`), 10k+ doc chunks, docvalues, etc. —
-well over the cap. The `.fsk` single-file format solves this: one packed
-file, can be hosted on HF as a single release asset or in a dataset
-repo's `resolve/main/foo.fsk` path.
+**Result**: wikipedia.fsk (1.3 GB) open: >20 s → ~4 s. First query returns
+real results (667 hits for "article") instead of 0 hits. Key changes:
 
-**Problem**: Current remote storage adapters can't serve `.fsk` directly
-because `FlatseekFileStorageAdapter` needs random-access `seek()` (via
-`self._fh.seek(self._start + self._pos)` at `flatseek_file.py:862`), but
-`S3StorageAdapter.open_read` (`storage.py:229`), `URLStorageAdapter.open_read`
-(`storage.py:687`), and `VercelBlobStorageAdapter.open_read` (`storage.py:433`)
-all return `io.BytesIO(self.read_bytes(rel_path))` — full file into RAM.
-Defeats `.fsk`'s purpose for super-large indexes.
-
-Also: `create_storage_adapter(path=...)` only auto-detects `.fsk` for
-local paths (`storage.py:898-903` — needs `p.is_file()`).
-
-**Approach**: Use HTTP `Range: bytes=<start>-<end>` requests natively
-supported by HF (Cloudflare-backed) and S3:
-
-1. Add a `RemoteFlatseekStorageAdapter` (or generalize the existing
-   `FlatseekFileStorageAdapter` to take any seekable file-like).
-2. On `_open()`, fetch `Range: bytes=0-4095` to read header + offset
-   table.
-3. Each per-file read becomes
-   `GET /file.fsk Range: bytes=<offset>-<offset+size-1>` with the file's
-   ETag for conditional requests.
-4. Encrypt-on-the-fly per blob (manifest decrypts via the same Range path).
-
-**Effort**: ~200 lines.
-
-**Files to touch**:
-- `src/flatseek/core/storage.py` — new class next to `URLStorageAdapter`
-- `src/flatseek/flatseek_file.py` — generalize the seek path so it
-  works against both a real file handle and a Range-backed file-like
-- `src/flatseek/cli.py` — wire through `?storage-backend=url&storage-url=...fsk`
-  detection in `create_storage_adapter`
-
-**Trigger phrases** (for future search): "fsk url", "hf fsk", "single
-file from remote", "stream fsk from huggingface", "remote flatseek",
-"flatseek range request".
+- `RangeFile` now uses persistent `httpx.Client(http2=True)` with 256 KB
+  block size and 16 concurrent requests via ThreadPoolExecutor.
+- Graceful fallback to HTTP/1.1 if `h2` is not installed.
+- `FlatseekFileStorageAdapter.listdir` fixed for `index/` bucket subdirs
+  (was causing `_read_posting` to return empty results on remote .fsk).
+- `pyproject.toml`: `httpx` → `httpx[http2]`.
 
 ---
 
