@@ -23,6 +23,8 @@
 - [`flatseek delete`](#flatseek-delete)
 - [`flatseek export`](#flatseek-export)
 - [`flatseek dedup`](#flatseek-dedup)
+- [`flatseek slice`](#flatseek-slice)
+- [`flatseek verify`](#flatseek-verify)
 - [`flatseek pack`](#flatseek-pack)
 - [`flatseek unpack`](#flatseek-unpack)
 - [Index Directory Layout](#index-directory-layout)
@@ -69,6 +71,8 @@ The Flatseek CLI (`flatseek`) manages the full lifecycle: build, query, serve, a
 | `delete` | Delete index directory (parallel rm -rf) |
 | `export` | Stream docs (filtered by query) to JSONL or CSV |
 | `dedup` | Remove duplicate docs from index |
+| `slice` | Extract query-matched subset as new index |
+| `verify` | Chunk-level integrity check |
 | `pack` | Pack index directory into portable `.fsk` file |
 | `unpack` | Unpack `.fsk` file into index directory |
 
@@ -513,20 +517,33 @@ Start the FastAPI server + flatlens dashboard.
 flatseek serve [options]
 ```
 
+`<data>` can be a directory, a local `.fsk` file, or an HTTP URL pointing to a `.fsk` hosted on HuggingFace/S3/etc.
+
 #### Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-d`, `--data` | current directory | Data directory to serve |
+| `-d`, `--data` | current directory | Data directory, `.fsk` path, or HTTP URL |
 | `-p`, `--port` | `8000` | Port number |
 | `--host` | `0.0.0.0` | Host to bind |
 | `--no-reload` | `False` | Disable uvicorn auto-reload |
 | `--flatlens-dir` | auto-detect | Path to flatlens installation |
+| `--passphrase` | none | Passphrase for encrypted `.fsk` |
+| `--storage-*` | — | Storage backend options for remote data |
 
 #### Examples
 
 ```bash
+# Serve directory index
 flatseek serve -d ./data
+
+# Serve a single .fsk file
+flatseek serve data.fsk
+
+# Serve a .fsk from HuggingFace — opens in ~4 s (no full download)
+flatseek serve https://huggingface.co/buckets/flatseek/flatdata/resolve/wikipedia.fsk
+
+# Serve with port and no browser auto-open
 flatseek serve -d ./data -p 9000 --no-reload
 ```
 
@@ -852,6 +869,54 @@ flatseek dedup ./data
 
 ---
 
+## `flatseek slice`
+
+Extract a query-matched subset as a new standalone index. Use for per-region partitions, privacy-filtered sub-indexes, or demo subsets.
+
+#### What it does
+
+1. Scans every doc chunk, filtering by the given query
+2. Writes matching doc IDs to a new index directory (or `.fsk` if `-o` ends in `.fsk`)
+3. Streaming: memory bounded by `chunk_size × n_workers` regardless of source size
+
+#### Syntax
+
+```
+flatseek slice <source> <query> -o <output>
+```
+
+#### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-o`, `--output` `PATH` | (required) | Output path — `.fsk` extension → packed archive; otherwise → directory |
+| `-q`, `--query` `Q` | (required) | Lucene-like query to match docs |
+| `--passphrase` `PASS` | none | Passphrase for encrypted source |
+| `--force-plaintext` | off | Decrypt even if source is encrypted |
+| `--out-passphrase` `PASS` | same as source | Re-encrypt output with this passphrase |
+
+#### Examples
+
+```bash
+# Extract APAC region docs into a new directory index
+flatseek slice ./data --query 'region:APAC' -o apac_data
+
+# Extract into a packed .fsk file
+flatseek slice ./data --query 'status:active' -o active.fsk
+
+# Re-key with a different passphrase
+flatseek slice ./data --query 'user_id:<1000' -o subset.fsk --out-passphrase newsecret
+```
+
+#### Notes
+
+- **Streaming, OOM-safe** — reads one chunk at a time
+- **doc_ids preserved** — doc with id 42 in source has id 42 in output
+- **Encryption inheritance** — encrypted source → encrypted output with fresh salt; use `--out-passphrase` to set a new key
+- **Empty result** — clean exit, no output written
+
+---
+
 ## `flatseek pack`
 
 Pack an index directory into a single portable `.fsk` file. The output contains all index data in one archive — easy to share or move.
@@ -892,6 +957,47 @@ flatseek pack ./data -o ./data.fsk --passphrase mysecret
 - If source has `encryption.json` and `--passphrase` is given: sections are encrypted at pack time
 - If source is plaintext: packed file is plaintext unless `--passphrase` is used
 - Manifest is always stored as plaintext JSON — enables `_get_flatseek_enc_key()` to derive the key without circular dependency
+
+---
+
+## `flatseek verify`
+
+Check chunk-level integrity of an index. Walks every doc chunk (read → decrypt → decompress → parse) and reports failures.
+
+Supports both directory indexes and `.fsk` / `.flatseek` / `.flat` archives, plaintext or encrypted.
+
+#### Syntax
+
+```
+flatseek verify <path>
+```
+
+#### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--passphrase` `PASS` | prompted | Passphrase for encrypted indexes |
+| `--mode` `{all,sample}` | `all` | Check all chunks or sample |
+| `--sample-size` `N` | `100` | Number of chunks to sample |
+| `--show` `N` | `10` | How many corrupt chunks to list |
+
+#### Examples
+
+```bash
+# Verify entire index
+flatseek verify ./data
+
+# Spot check 50 random chunks
+flatseek verify ./data --mode sample --sample-size 50
+
+# Verify encrypted .fsk
+flatseek verify ./data/index.fsk --passphrase mysecret
+```
+
+#### Exit codes
+
+- `0` — all chunks valid
+- `2` — one or more chunks failed
 
 ---
 

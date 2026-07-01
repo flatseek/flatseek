@@ -105,7 +105,6 @@ flatseek pack ./data -o ./data.fsk
 # Serve API + dashboard from single portable index file
 flatseek serve data.fsk
 
-
 # → API:
 # http://localhost:8000
 
@@ -117,6 +116,15 @@ flatseek search ./data "program:raydium AND amount:>1000000"
 
 # Query from single portable file
 flatseek search data.fsk "program:raydium AND amount:>1000000"
+
+# Serve a .fsk directly from HuggingFace — no full download needed
+flatseek serve https://huggingface.co/buckets/flatseek/flatdata/resolve/wikipedia.fsk
+
+# Export filtered docs to JSONL (streaming, OOM-safe)
+flatseek export ./data --query 'status:active' -o active.jsonl
+
+# Slice out a subset matching a query into a new index
+flatseek slice ./data --query 'region:APAC' -o apac_data
 
 ```
 ---
@@ -132,6 +140,10 @@ flatseek search data.fsk "program:raydium AND amount:>1000000"
 - **Parallel indexing** — multi-worker builds
 - **Remote querying** — search HuggingFace datasets without downloading
 - **REST API** — Elasticsearch-compatible endpoints
+- **Single-file archive (`.fsk`)** — portable, cryptographically signed index file
+- **Export to JSONL/CSV** — streaming, with query filter and resume
+- **Slice** — extract a query-matched subset as a new index
+- **Serve from HTTP URL** — open `.fsk` from HuggingFace/S3 without full download
 
 See [docs/](docs/) for full details.
 
