@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.9] - 2026-07-03
+
+### Bug fix: `flatseek serve` hangs on non-TTY stdin
+
+`cmd_serve` called `input("  Install flatlens now? [Y/n] ")` which blocks
+forever when stdin is a pipe (no TTY). This caused all 4
+`serve_unblocks` regression tests to fail, and would also hang
+`flatseek serve` when run from systemd, scripts, or any non-interactive
+context.
+
+Fix: guard with `sys.stdin.isatty()` — non-TTY environments
+automatically skip the flatlens install prompt and proceed to server
+startup.
+
+### CI: pip install with `--no-cache-dir`
+
+Avoid cached package issues in CI by adding `--no-cache-dir` to all
+`pip install` commands in `.github/workflows/test.yml`.
+
 ## [0.1.8] - 2026-06-30
 
 ### Performance: RangeFile HTTP optimization for remote `.fsk`
