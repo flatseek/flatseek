@@ -205,8 +205,20 @@ class IndexManager:
 
             # Determine which storage to use
             if bucket_url:
-                # Per-request bucket URL → create URLStorageAdapter
-                storage = self._get_bucket_storage(bucket_url)
+                # Check if bucket_url is a HF dataset repo (not a direct .fsk URL)
+                # HF dataset repos have .fsk files at root level like public-dataset
+                original_url_lower = bucket_url.lower()
+                is_hf_dataset_repo = (
+                    "huggingface.co" in original_url_lower
+                    and "/datasets/" in original_url_lower
+                    and not bucket_url.rstrip("/").endswith((".fsk", ".flatseek", ".flat")))
+                if is_hf_dataset_repo:
+                    # Use FlatseekFileStorageAdapter pointing to the specific .fsk file
+                    fsk_url = f"{bucket_url.rstrip('/')}/resolve/main/{index}.fsk"
+                    storage = FlatseekFileStorageAdapter(fsk_url)
+                else:
+                    # Per-request bucket URL → create URLStorageAdapter
+                    storage = self._get_bucket_storage(bucket_url)
             elif isinstance(self._storage, URLStorageAdapter):
                 # Default URL storage
                 storage = self._storage
@@ -384,6 +396,31 @@ class IndexManager:
                 idx_name = storage.index_name
                 if idx_name:
                     return [idx_name]
+
+        # HuggingFace dataset repo with .fsk files directly in root (e.g. public-dataset repo)
+        # Use HF API to discover .fsk files
+        original_url = getattr(storage, "_original_url", "") or ""
+        if "huggingface.co" in original_url and "/datasets/" in original_url:
+            try:
+                import httpx
+                from pathlib import PurePosixPath
+                # Parse owner/repo from URL
+                parts = original_url.rstrip("/").split("/")
+                hf_idx = parts.index("huggingface.co")
+                owner = parts[hf_idx + 2]
+                repo = parts[hf_idx + 3]
+                api_url = f"https://huggingface.co/api/datasets/{owner}/{repo}/tree/main"
+                resp = httpx.get(api_url, timeout=30.0)
+                if resp.status_code == 200:
+                    files = resp.json()
+                    fsk_files = [
+                        f["path"] for f in files
+                        if f.get("type") == "file" and f["path"].endswith((".fsk", ".flatseek", ".flat"))
+                    ]
+                    if fsk_files:
+                        return [PurePosixPath(f).stem for f in fsk_files]
+            except Exception:
+                pass
 
         return []
 
