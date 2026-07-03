@@ -3877,6 +3877,7 @@ def _auto_install_flatlens(install_dir):
 
 def cmd_serve(args):
     """Start the API server with flatlens dashboard, serving data from current directory."""
+    import sys as _sys
     import uvicorn, webbrowser
 
     import os as _os
@@ -3941,7 +3942,10 @@ def cmd_serve(args):
         print("flatlens dashboard not found.")
         print(f"  Auto-install to: {_install_dir}")
         try:
-            ans = input("  Install flatlens now? [Y/n] ").strip().lower()
+            if _sys.stdin.isatty():
+                ans = input("  Install flatlens now? [Y/n] ").strip().lower()
+            else:
+                ans = "n"
         except (EOFError, KeyboardInterrupt):
             print()
             ans = "n"
