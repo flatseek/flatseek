@@ -1394,8 +1394,8 @@ async def is_index_encrypted(
     bucket: str | None = Query(None, description="URL storage bucket for remote indexes"),
 ):
     """Check if an index is encrypted."""
-    # Single-file mode, bucket URLs, and .fsk-in-directory mode:
-    # delegate to manager which has the full picture.
+    if not manager.index_exists(index):
+        raise HTTPException(404, f"Index not found: {index}")
     return {"index": index, "encrypted": manager.is_encrypted(index, bucket)}
 
 

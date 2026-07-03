@@ -173,7 +173,16 @@ class IndexManager:
             if os.path.isfile(enc_path):
                 return True
         return False
-        return False
+
+    def index_exists(self, index: str) -> bool:
+        """Check if an index exists in data_dir."""
+        if self._single_file_engine is not None:
+            return self._single_file_name == index
+        if not self._fsk_index_map:
+            self._discover_local_fsk()
+        if index in self._fsk_index_map:
+            return True
+        return os.path.isdir(os.path.join(self.data_dir, index, "index"))
 
     def _get_bucket_storage(self, bucket_url: str) -> URLStorageAdapter:
         """Get or create a storage adapter for the given bucket URL.
