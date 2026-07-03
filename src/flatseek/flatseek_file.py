@@ -1005,6 +1005,75 @@ class FlatseekFileStorageAdapter(StorageAdapter):
         self._fh = None  # file handle (or RangeFile for URLs), set in _open()
         self._open()
 
+    @staticmethod
+    def probe_encrypted(path: Path | str) -> bool:
+        """Probe whether a .fsk file is encrypted, without full initialization.
+
+        Reads the header (1024 bytes) and the manifest section descriptor to
+        find the manifest offset/size, then reads the first few bytes of the
+        manifest data. If it starts with the encryption magic (b"FLATSEEK\\x01")
+        or is not valid UTF-8, the file is encrypted. This avoids opening the
+        full adapter (which raises on encrypted files without a key).
+
+        Returns True if encrypted, False if plaintext.
+        """
+        fsk_path = Path(path)
+        with fsk_path.open("rb") as f:
+            header_bytes = f.read(HEADER_SIZE)
+            if len(header_bytes) < HEADER_SIZE:
+                return False  # too short to be valid
+
+            # Unpack header to find manifest section
+            magic = header_bytes[0:10]
+            if magic != MAGIC:
+                return False  # not a valid .fsk
+
+            version, flags, hdr_size, num_sections = struct.unpack_from(
+                "<HHIB", header_bytes, 10
+            )
+
+            # Read section descriptors (50 bytes each, start at offset 14 in header)
+            SECT_DESC_SIZE = 50
+            SID_MANIFEST = 0x01
+            manifest_offset = None
+            manifest_size = None
+
+            for i in range(num_sections):
+                desc_off = 64 + i * SECT_DESC_SIZE
+                if desc_off + SECT_DESC_SIZE > len(header_bytes):
+                    break
+                sid, _, offset_b, size, _ = struct.unpack_from(
+                    "<BB8sQ32s", header_bytes, desc_off
+                )
+                if sid == SID_MANIFEST:
+                    manifest_offset = struct.unpack("<Q", offset_b)[0]
+                    manifest_size = size
+                    break
+
+            if manifest_offset is None or manifest_size == 0:
+                return False  # no manifest, assume unencrypted
+
+            # Read full manifest data (it's typically small — few KB)
+            f.seek(manifest_offset)
+            manifest_data = f.read(manifest_size)
+
+            # Check encryption magic
+            _ENC_MAGIC = b"FLATSEEK\x01"
+            if manifest_data.startswith(_ENC_MAGIC):
+                return True
+
+            # Try UTF-8 decode (plaintext JSON manifest)
+            try:
+                manifest_text = manifest_data.decode("utf-8")
+                import json
+                parsed = json.loads(manifest_text)
+                # _encryption_b64 in manifest means sections are encrypted
+                if "_encryption_b64" in parsed:
+                    return True
+                return False
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return True  # binary/non-JSON → encrypted
+
     def set_key(self, enc_key: bytes):
         """Set the encryption key for an encrypted index.
 
@@ -1111,6 +1180,7 @@ class FlatseekFileStorageAdapter(StorageAdapter):
                     except UnicodeDecodeError:
                         # Manifest section is encrypted — decrypt then parse
                         from flatseek.core.query_engine import is_encrypted, decrypt_bytes
+                        self._is_encrypted = True  # mark encrypted BEFORE raising
                         if not self._enc_key:
                             raise ValueError(
                                 f"This .fsk file is encrypted but no key was provided. "
@@ -1118,7 +1188,6 @@ class FlatseekFileStorageAdapter(StorageAdapter):
                                 f"pass --passphrase to the serve/api command."
                             )
                         data = decrypt_bytes(data, self._enc_key)
-                        self._is_encrypted = True
                         self._parse_manifest(data)
                     break
 

@@ -3980,6 +3980,9 @@ def cmd_serve(args):
 
     print(f"Press Ctrl+C to stop")
 
+    if getattr(args, "reset_dashboard", False):
+        _os.environ["FLATSEEK_RESET_DASHBOARD"] = "1"
+
     uvicorn.run(
         "flatseek.api.main:app",
         host=host,
@@ -4348,6 +4351,9 @@ def main():
                    help="Host to bind to (default: 0.0.0.0)")
     p.add_argument("--no-reload", action="store_true", default=False,
                    help="Disable auto-reload (default: enabled)")
+    p.add_argument("--reset-dashboard", action="store_true", default=False, dest="reset_dashboard",
+                   help="Clear dashboard's stored API URL/bucket on startup "
+                        "(resets Flatlens to point to this server)")
     p.add_argument("--flatlens-dir", default=None, dest="flatlens_dir",
                    help="Path to flatlens installation (default: auto-detected from "
                         "FLATLENS_DIR, ~/.local/share/flatlens, or sibling flatlens repo)")

@@ -189,17 +189,56 @@ async def search(
     if encrypted:
         try:
             from flatseek.core.query_engine import load_encryption_key
+            from flatseek.flatseek_file import FlatseekFileStorageAdapter
             if bucket:
                 storage = manager._get_bucket_storage(bucket)
                 enc_data = storage.read_bytes("encryption.json")
                 meta = json.loads(enc_data)
                 key = load_encryption_key(None, stored_pass, meta)
+                engine.set_key(key)
+            elif index in manager._fsk_index_map:
+                # .fsk file: read manifest bytes directly to get _encryption_b64
+                fsk_path = manager._fsk_index_map[index]
+                import struct as _struct
+                _ENC_MAGIC = b"FLATSEEK\x01"
+                HEADER_SIZE = 1024
+                SECT_DESC_SIZE = 50
+                SID_MANIFEST = 0x01
+                enc_meta = None
+                try:
+                    with fsk_path.open("rb") as f:
+                        header = f.read(HEADER_SIZE)
+                        for i in range(16):
+                            off = 64 + i * SECT_DESC_SIZE
+                            if off + SECT_DESC_SIZE > len(header):
+                                break
+                            sid = header[off]
+                            if sid != SID_MANIFEST:
+                                continue
+                            offset = _struct.unpack_from("<Q", header, off + 2)[0]
+                            size = _struct.unpack_from("<Q", header, off + 10)[0]
+                            f.seek(offset)
+                            manifest_bytes = f.read(size)
+                            if manifest_bytes.startswith(_ENC_MAGIC):
+                                break
+                            parsed = json.loads(manifest_bytes.decode("utf-8"))
+                            enc_b64 = parsed.get("_encryption_b64")
+                            if enc_b64:
+                                import base64 as _b64
+                                enc_meta = json.loads(_b64.b64decode(enc_b64).decode("utf-8"))
+                            break
+                except Exception:
+                    pass
+                if enc_meta is None:
+                    raise HTTPException(401, "Invalid passphrase for encrypted index")
+                key = load_encryption_key(None, stored_pass, meta=enc_meta)
+                engine.set_key(key)
             else:
                 index_dir = os.path.join(manager.data_dir, index)
                 if not os.path.isdir(os.path.join(index_dir, "index")):
                     index_dir = manager.data_dir  # data_dir IS the index (unpacked .fsk)
                 key = load_encryption_key(index_dir, stored_pass)
-            engine.set_key(key)
+                engine.set_key(key)
             # Reload stats after set_key — encrypted stats.json needs the key to decrypt
             await asyncio.to_thread(engine.reload_stats)
         except Exception as exc:

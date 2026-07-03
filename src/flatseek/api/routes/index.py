@@ -1394,25 +1394,8 @@ async def is_index_encrypted(
     bucket: str | None = Query(None, description="URL storage bucket for remote indexes"),
 ):
     """Check if an index is encrypted."""
-    # For bucket URLs, check via remote storage (skip local filesystem check)
-    if bucket:
-        return {"index": index, "encrypted": manager.is_encrypted(index, bucket)}
-
-    # For local indexes, check filesystem
-    data_dir = manager.data_dir
-    nested_index_dir = os.path.join(data_dir, index)
-    if os.path.isdir(os.path.join(nested_index_dir, "index")):
-        index_dir = nested_index_dir
-    else:
-        index_dir = data_dir  # data_dir IS the index (unpacked .fsk)
-
-    # Single-file mode: .fsk has no index/ subdir — check via _single_file_engine
-    if manager._single_file_engine is not None:
-        return {"index": index, "encrypted": manager.is_encrypted(index, bucket)}
-
-    if not os.path.isdir(os.path.join(index_dir, "index")):
-        raise HTTPException(404, f"Index not found: {index}")
-
+    # Single-file mode, bucket URLs, and .fsk-in-directory mode:
+    # delegate to manager which has the full picture.
     return {"index": index, "encrypted": manager.is_encrypted(index, bucket)}
 
 
@@ -1473,6 +1456,102 @@ async def authenticate_index(
             return {"authenticated": False, "index": index, "error": "Invalid passphrase"}
 
         return {"authenticated": True, "index": index, "note": "Pass X-Index-Password header on every request"}
+
+    # Multi-.fsk directory mode: authenticate against the .fsk manifest
+    # Ensure local .fsk files have been discovered first
+    if not manager._fsk_index_map:
+        manager._discover_local_fsk()
+    if index in manager._fsk_index_map:
+        from flatseek.flatseek_file import FlatseekFileStorageAdapter
+
+        fsk_path = manager._fsk_index_map[index]
+
+        # Check if encrypted using lightweight probe (reads header only)
+        try:
+            is_enc = FlatseekFileStorageAdapter.probe_encrypted(fsk_path)
+        except Exception as e:
+            logger.warning(f"[auth] probe_encrypted failed for {index}: {e}")
+            is_enc = False
+
+        if not is_enc:
+            return {"authenticated": False, "index": index, "error": "Index is not encrypted"}
+
+        # Encrypted .fsk: read manifest bytes directly from file to get _encryption_b64.
+        # Read only header (1024 bytes) + manifest section — NOT the whole file.
+        enc_meta = None
+        try:
+            import struct as _struct
+            HEADER_SIZE = 1024
+            SECT_DESC_SIZE = 50
+            SID_MANIFEST = 0x01
+            _ENC_MAGIC = b"FLATSEEK\x01"
+
+            with fsk_path.open("rb") as f:
+                # Read header
+                header_bytes = f.read(HEADER_SIZE)
+                if len(header_bytes) < HEADER_SIZE:
+                    return {"authenticated": False, "index": index}
+
+                # Find manifest section descriptor
+                manifest_offset = None
+                manifest_size = None
+                for i in range(16):
+                    desc_off = 64 + i * SECT_DESC_SIZE
+                    if desc_off + SECT_DESC_SIZE > len(header_bytes):
+                        break
+                    sid = header_bytes[desc_off]
+                    if sid != SID_MANIFEST:
+                        continue
+                    offset = _struct.unpack_from("<Q", header_bytes, desc_off + 2)[0]
+                    size = _struct.unpack_from("<Q", header_bytes, desc_off + 10)[0]
+                    manifest_offset = offset
+                    manifest_size = size
+                    break
+
+                if manifest_offset is None or manifest_size == 0:
+                    return {"authenticated": False, "index": index}
+
+                # Read only manifest bytes (typically a few KB)
+                f.seek(manifest_offset)
+                manifest_bytes = f.read(manifest_size)
+
+                if manifest_bytes.startswith(_ENC_MAGIC):
+                    return {"authenticated": False, "index": index,
+                            "error": "Cannot read metadata: manifest is encrypted"}
+
+                manifest_text = manifest_bytes.decode("utf-8")
+                parsed = json.loads(manifest_text)
+                enc_b64 = parsed.get("_encryption_b64")
+                if enc_b64:
+                    import base64 as _b64
+                    enc_meta = json.loads(_b64.b64decode(enc_b64).decode("utf-8"))
+        except Exception as e:
+            logger.warning(f"[auth] failed to read manifest for {index}: {e}")
+
+        if enc_meta is None:
+            return {"authenticated": False, "index": index}
+
+        try:
+            key = load_encryption_key(None, passphrase, meta=enc_meta)
+        except Exception as e:
+            return {"authenticated": False, "index": index, "error": f"key derivation failed: {e}"}
+
+        # Verify key by opening adapter with it — if wrong key, it raises
+        try:
+            test_storage = FlatseekFileStorageAdapter(fsk_path, enc_key=key)
+            test_storage._fh.close()
+        except Exception as e:
+            logger.warning(f"[auth] key verification failed for {index}: {e}")
+            return {"authenticated": False, "index": index, "error": "Invalid passphrase"}
+
+        # Success — store key so get_engine() uses it
+        manager._enc_keys[index] = key
+        cache_key = manager._engine_cache_key(index, None)
+        engine = manager._engines.get(cache_key)
+        if engine is not None:
+            engine.set_key(key)
+            engine._enc_key = key
+        return {"authenticated": True, "index": index}
 
     # Single-file mode: authenticate via .fsk manifest (no filesystem encryption.json)
     if manager._single_file_engine is not None:
@@ -1650,17 +1729,58 @@ async def get_mapping(
     if encrypted:
         try:
             from flatseek.core.query_engine import load_encryption_key
+            from flatseek.flatseek_file import FlatseekFileStorageAdapter
             if bucket:
                 storage = manager._get_bucket_storage(bucket)
                 enc_data = storage.read_bytes("encryption.json")
                 meta = json.loads(enc_data)
                 key = load_encryption_key(None, stored_pass, meta)
+                engine.set_key(key)
+            elif index in manager._fsk_index_map:
+                # .fsk file: read manifest bytes directly to get _encryption_b64
+                fsk_path = manager._fsk_index_map[index]
+                import struct as _struct
+                _ENC_MAGIC = b"FLATSEEK\x01"
+                HEADER_SIZE = 1024
+                SECT_DESC_SIZE = 50
+                SID_MANIFEST = 0x01
+                enc_meta = None
+                try:
+                    with fsk_path.open("rb") as f:
+                        header = f.read(HEADER_SIZE)
+                        for i in range(16):
+                            off = 64 + i * SECT_DESC_SIZE
+                            if off + SECT_DESC_SIZE > len(header):
+                                break
+                            sid = header[off]
+                            if sid != SID_MANIFEST:
+                                continue
+                            offset = _struct.unpack_from("<Q", header, off + 2)[0]
+                            size = _struct.unpack_from("<Q", header, off + 10)[0]
+                            f.seek(offset)
+                            manifest_bytes = f.read(size)
+                            if manifest_bytes.startswith(_ENC_MAGIC):
+                                break
+                            parsed = json.loads(manifest_bytes.decode("utf-8"))
+                            enc_b64 = parsed.get("_encryption_b64")
+                            if enc_b64:
+                                import base64 as _b64
+                                enc_meta = json.loads(_b64.b64decode(enc_b64).decode("utf-8"))
+                            break
+                except Exception:
+                    pass
+                if enc_meta is None:
+                    raise HTTPException(401, "Invalid passphrase for encrypted index")
+                key = load_encryption_key(None, stored_pass, meta=enc_meta)
+                engine.set_key(key)
             else:
                 index_dir = os.path.join(manager.data_dir, index)
                 if not os.path.isdir(os.path.join(index_dir, "index")):
                     index_dir = manager.data_dir  # data_dir IS the index (unpacked .fsk)
                 key = load_encryption_key(index_dir, stored_pass)
-            engine.set_key(key)
+                engine.set_key(key)
+        except HTTPException:
+            raise
         except Exception:
             raise HTTPException(401, "Invalid passphrase for encrypted index")
 
@@ -1728,17 +1848,58 @@ async def get_stats(
     if encrypted:
         try:
             from flatseek.core.query_engine import load_encryption_key
+            from flatseek.flatseek_file import FlatseekFileStorageAdapter
             if bucket:
                 storage = manager._get_bucket_storage(bucket)
                 enc_data = storage.read_bytes("encryption.json")
                 meta = json.loads(enc_data)
                 key = load_encryption_key(None, stored_pass, meta)
+                engine.set_key(key)
+            elif index in manager._fsk_index_map:
+                # .fsk file: read manifest bytes directly to get _encryption_b64
+                fsk_path = manager._fsk_index_map[index]
+                import struct as _struct
+                _ENC_MAGIC = b"FLATSEEK\x01"
+                HEADER_SIZE = 1024
+                SECT_DESC_SIZE = 50
+                SID_MANIFEST = 0x01
+                enc_meta = None
+                try:
+                    with fsk_path.open("rb") as f:
+                        header = f.read(HEADER_SIZE)
+                        for i in range(16):
+                            off = 64 + i * SECT_DESC_SIZE
+                            if off + SECT_DESC_SIZE > len(header):
+                                break
+                            sid = header[off]
+                            if sid != SID_MANIFEST:
+                                continue
+                            offset = _struct.unpack_from("<Q", header, off + 2)[0]
+                            size = _struct.unpack_from("<Q", header, off + 10)[0]
+                            f.seek(offset)
+                            manifest_bytes = f.read(size)
+                            if manifest_bytes.startswith(_ENC_MAGIC):
+                                break
+                            parsed = json.loads(manifest_bytes.decode("utf-8"))
+                            enc_b64 = parsed.get("_encryption_b64")
+                            if enc_b64:
+                                import base64 as _b64
+                                enc_meta = json.loads(_b64.b64decode(enc_b64).decode("utf-8"))
+                            break
+                except Exception:
+                    pass
+                if enc_meta is None:
+                    raise HTTPException(401, "Invalid passphrase for encrypted index")
+                key = load_encryption_key(None, stored_pass, meta=enc_meta)
+                engine.set_key(key)
             else:
                 index_dir = os.path.join(manager.data_dir, index)
                 if not os.path.isdir(os.path.join(index_dir, "index")):
                     index_dir = manager.data_dir  # data_dir IS the index (unpacked .fsk)
                 key = load_encryption_key(index_dir, stored_pass)
-            engine.set_key(key)
+                engine.set_key(key)
+        except HTTPException:
+            raise
         except Exception:
             raise HTTPException(401, "Invalid passphrase for encrypted index")
 

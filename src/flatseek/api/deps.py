@@ -1,6 +1,7 @@
 """Dependency injection for Flatseek API."""
 
 import os
+from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, AsyncGenerator, Any
 
@@ -20,11 +21,9 @@ if TYPE_CHECKING:
 class IndexManager:
     """Manages QueryEngine instances per index (lazy loading).
 
-    Supports two storage modes:
-    - Default: uses shared storage adapter from environment (local, S3, Vercel Blob, URL)
-    - Per-request: when bucket= URL param is provided, creates a URLStorageAdapter
-      on-the-fly for that specific HuggingFace/GitHub URL. Engines are cached
-      separately per (bucket_url, index) to avoid cross-contamination.
+    Auto-detects index types from data_dir:
+    - Directory indices: data/<name>/ has index/ subdir
+    - .fsk archives: data/<name>.fsk or data/<sub>/<name>.fsk
     """
 
     def __init__(self):
@@ -34,6 +33,12 @@ class IndexManager:
         # Per-bucket URL storage adapters (key = bucket URL)
         self._bucket_storage: dict[str, URLStorageAdapter] = {}
 
+        # Discovered .fsk files in data_dir: index_name → Path
+        # Populated lazily on first list_indices() or get_engine() call
+        self._fsk_index_map: dict[str, Path] = {}
+        # Per-index encryption keys (set by authenticate route)
+        self._enc_keys: dict[str, bytes] = {}
+
         # Single-file mode: FLATSEEK_SINGLE_FILE points to a .fsk file
         self._single_file_path: str | None = os.environ.get("FLATSEEK_SINGLE_FILE")
         self._single_file_engine: "QueryEngine | None" = None
@@ -41,27 +46,67 @@ class IndexManager:
         if self._single_file_path:
             self._init_single_file_engine()
 
+    def _discover_local_fsk(self) -> None:
+        """Walk data_dir and register every .fsk file as an index.
+
+        Called lazily on first list/get call when in local-dir mode.
+        """
+        import base64
+        import json
+
+        dir_path = Path(self.data_dir)
+        if not dir_path.is_dir():
+            return
+
+        for fsk_path in sorted(dir_path.rglob("*.fsk")):
+            rel = fsk_path.relative_to(dir_path)
+            index_name = str(rel.with_suffix("").as_posix())
+            self._fsk_index_map[index_name] = fsk_path
+
+        # Pre-load per-index keys from FLATSEEK_FSK_KEYS (JSON)
+        # Format: {"index_name": "base64_encoded_key", ...}
+        keys_json = os.environ.get("FLATSEEK_FSK_KEYS", "{}")
+        try:
+            keys_map: dict[str, str] = json.loads(keys_json)
+            for idx, key_b64 in keys_map.items():
+                if idx in self._fsk_index_map:
+                    try:
+                        self._enc_keys[idx] = base64.b64decode(key_b64)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _open_fsk_engine(self, index: str) -> "QueryEngine":
+        """Lazily open a QueryEngine for a .fsk file."""
+        from flatseek.flatseek_file import FlatseekFileStorageAdapter
+        from flatseek.core.query_engine import QueryEngine
+
+        fsk_path = self._fsk_index_map[index]
+        enc_key = self._enc_keys.get(index)
+        storage = FlatseekFileStorageAdapter(fsk_path, enc_key=enc_key)
+        engine = QueryEngine(".", storage=storage)
+        if enc_key is not None:
+            engine._enc_key = enc_key
+        return engine
+
     def _init_single_file_engine(self) -> None:
         """Initialize QueryEngine from a single .fsk file."""
         import base64
-        from pathlib import Path
         from flatseek.flatseek_file import FlatseekFileStorageAdapter
         from flatseek.core.query_engine import QueryEngine
         p = Path(self._single_file_path)
-        self._single_file_name = p.stem  # e.g. "myindex" from "myindex.fsk"
+        self._single_file_name = p.stem
 
-        # Read encryption key from env (base64-encoded) if available
         enc_key = None
         key_b64 = os.environ.get("FLATSEEK_FSK_KEY")
         if key_b64:
             try:
                 enc_key = base64.b64decode(key_b64)
             except Exception:
-                pass  # ignore malformed key
+                pass
 
         storage = FlatseekFileStorageAdapter(p, enc_key=enc_key)
-        # Pass dummy data_dir; storage is FlatseekFileStorageAdapter so QE
-        # will use virtual paths (index_dir="index", docs_dir="docs")
         self._single_file_engine = QueryEngine(".", storage=storage)
         if enc_key is not None:
             self._single_file_engine._enc_key = enc_key
@@ -105,18 +150,29 @@ class IndexManager:
             except (FileNotFoundError, Exception):
                 return False
 
+        # Local directory mode: check both .fsk files and directory indices
+        # Lazily discover .fsk files if not already done
+        if not self._fsk_index_map:
+            self._discover_local_fsk()
+
+        if index in self._fsk_index_map:
+            # .fsk index: probe encryption status using lightweight header read
+            # (avoids full FlatseekFileStorageAdapter init which raises on encrypted files)
+            return FlatseekFileStorageAdapter.probe_encrypted(self._fsk_index_map[index])
+
+        # Directory index: check for encryption.json
         possible_paths = [
             os.path.join(self.data_dir, index),
             os.path.join(self.data_dir, index, "..", index),
         ]
-        # Also check if data_dir itself is the index (unpacked .fsk output)
+        # Also check if data_dir itself is the index dir (unpacked .fsk output)
         if os.path.basename(self.data_dir.rstrip(os.sep)) == index:
             possible_paths.insert(0, self.data_dir)
-
         for index_path in possible_paths:
             enc_path = os.path.join(index_path, "encryption.json")
             if os.path.isfile(enc_path):
                 return True
+        return False
         return False
 
     def _get_bucket_storage(self, bucket_url: str) -> URLStorageAdapter:
@@ -193,6 +249,25 @@ class IndexManager:
         # Single-file mode: serve the one .fsk file under any index name
         if self._single_file_engine is not None:
             return self._single_file_engine
+
+        # Lazily discover local .fsk files if in local-dir mode
+        if not self._fsk_index_map and not bucket_url:
+            self._discover_local_fsk()
+
+        # Local .fsk index
+        if index in self._fsk_index_map:
+            cache_key = self._engine_cache_key(index, bucket_url)
+            cached = self._engines.get(cache_key)
+            available_key = self._enc_keys.get(index)
+            # Re-open if: cached storage was opened without a key but we now have one
+            if cached is not None and available_key is not None:
+                cached_storage = getattr(cached, "storage", None)
+                if cached_storage is not None and getattr(cached_storage, "_enc_key", None) is None:
+                    # Was opened without key; re-open with the now-available key
+                    self._engines[cache_key] = self._open_fsk_engine(index)
+            elif cache_key not in self._engines:
+                self._engines[cache_key] = self._open_fsk_engine(index)
+            return self._engines[cache_key]
 
         if not index.replace("_", "").replace("-", "").replace("/", "").replace(".", "").isalnum():
             raise HTTPException(400, f"Invalid index name: {index}")
@@ -293,39 +368,44 @@ class IndexManager:
         Args:
             bucket_url: Optional URL storage URL. When provided, lists indices
                        from that remote HuggingFace/GitHub URL instead of local disk.
-                       Caches the URLStorageAdapter for reuse in subsequent calls.
         """
-        # Determine which storage to use
-        if bucket_url:
-            storage = self._get_bucket_storage(bucket_url)
-            # Cache the bucket URL storage adapter reference so it persists
-            return self._list_url_indices(storage)
-        elif isinstance(self._storage, URLStorageAdapter):
-            return self._list_url_indices(self._storage)
-
         # Single-file mode: only one index (the .fsk filename)
         if self._single_file_engine is not None:
             return [self._single_file_name] if self._single_file_name else []
 
+        # Determine which storage to use
+        if bucket_url:
+            storage = self._get_bucket_storage(bucket_url)
+            return self._list_url_indices(storage)
+        elif isinstance(self._storage, URLStorageAdapter):
+            return self._list_url_indices(self._storage)
+
+        # Local directory mode: merge .fsk files and directory-based indices
         if not os.path.isdir(self.data_dir):
             return []
 
-        # Detect if data_dir IS itself an index dir (e.g. unpacked .fsk output).
-        # If it has stats.json/manifest.json + an index/ subdir, treat it as one index.
+        indices: set[str] = set()
+
+        # Lazily discover .fsk files
+        if not self._fsk_index_map:
+            self._discover_local_fsk()
+        indices.update(self._fsk_index_map.keys())
+
+        # Directory-based indices
         if (os.path.isfile(os.path.join(self.data_dir, "stats.json")) and
                 os.path.isdir(os.path.join(self.data_dir, "index"))):
-            return [os.path.basename(self.data_dir.rstrip(os.sep))]
+            indices.add(os.path.basename(self.data_dir.rstrip(os.sep)))
 
-        indices = []
         for name in os.listdir(self.data_dir):
             path = os.path.join(self.data_dir, name)
             if os.path.isdir(os.path.join(path, "index")):
-                indices.append(name)
+                indices.add(name)
             elif os.path.isdir(path):
                 for sub in os.listdir(path):
                     sub_path = os.path.join(path, sub)
                     if os.path.isdir(os.path.join(sub_path, "index")):
-                        indices.append(f"{name}/{sub}")
+                        indices.add(f"{name}/{sub}")
+
         return sorted(indices)
 
     def _list_url_indices(self, storage: "URLStorageAdapter") -> list[str]:

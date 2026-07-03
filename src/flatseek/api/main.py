@@ -135,18 +135,21 @@ def _find_flatlens():
     return None
 
 
-def _copy_and_patch(flatlens_dir, api_base):
+def _copy_and_patch(flatlens_dir, api_base, *, reset_dashboard=False):
     """Copy flatlens to temp dir with API_BASE rewrite + logo href patch.
 
     Caches patched result by (flatlens_dir, api_base) to avoid re-copying on
-    repeated starts with the same configuration.
+    repeated starts with the same configuration. If reset_dashboard=True,
+    injects localStorage.clear() on load so the dashboard forgets any
+    previously stored API URL or bucket.
     """
     import time
     t0 = time.perf_counter()
     global _dashboard_temp_dir, _patched_api_base
 
     # Check if we already have a patched copy for this api_base
-    if _dashboard_temp_dir and _patched_api_base == api_base:
+    # If reset_dashboard=True, skip cache to force fresh localStorage.clear()
+    if _dashboard_temp_dir and _patched_api_base == api_base and not reset_dashboard:
         t1 = time.perf_counter()
         logger.debug(f"_copy_and_patch: cache hit ({t1-t0:.3f}s)")
         return _dashboard_temp_dir
@@ -187,6 +190,12 @@ def _copy_and_patch(flatlens_dir, api_base):
             'href="/" class="dashboard-title"',
             'href="/dashboard" class="dashboard-title"',
         )
+        if reset_dashboard:
+            # Inject localStorage.clear() before </head> so dashboard resets
+            clear_script = (
+                '<script>try{localStorage.clear()}catch(e){}</script>'
+            )
+            content = content.replace("</head>", clear_script + "</head>")
         with open(index_html, "w", encoding="utf-8") as f:
             f.write(content)
 
@@ -197,7 +206,7 @@ def _copy_and_patch(flatlens_dir, api_base):
     return dest
 
 
-def attach_dashboard(app, api_base):
+def attach_dashboard(app, api_base, *, reset_dashboard=False):
     """Mount flatlens dashboard at /dashboard with correct API_BASE."""
     import time
     t0 = time.perf_counter()
@@ -212,7 +221,7 @@ def attach_dashboard(app, api_base):
         return
 
     # Always copy to temp and patch — never touch the original
-    patched_dir = _copy_and_patch(flatlens_dir, api_base)
+    patched_dir = _copy_and_patch(flatlens_dir, api_base, reset_dashboard=reset_dashboard)
     t_patch = time.perf_counter()
     logger.debug(f"attach_dashboard: _copy_and_patch done ({t_patch-t0:.3f}s)")
 
@@ -222,7 +231,7 @@ def attach_dashboard(app, api_base):
     logger.info(f"Flatlens dashboard mounted at /dashboard (API_BASE={api_base}, total {t_mount-t0:.3f}s)")
 
 
-def _lazy_attach_dashboard(app, api_base):
+def _lazy_attach_dashboard(app, api_base, *, reset_dashboard=False):
     """Attach dashboard on first access to /dashboard, not at import time.
 
     copytree of flatlens (~7MB, 15 subdirs) during module import causes
@@ -238,7 +247,7 @@ def _lazy_attach_dashboard(app, api_base):
             nonlocal _attached
             if request.url.path.startswith("/dashboard") and not _attached:
                 _attached = True
-                attach_dashboard(app, api_base)
+                attach_dashboard(app, api_base, reset_dashboard=reset_dashboard)
             return await call_next(request)
 
     app.add_middleware(_DashboardAttachMiddleware)
@@ -259,7 +268,7 @@ if not _api_base:
     _api_base = f"http://localhost:{os.environ.get('FLATSEEK_PORT', '8000')}"
 
 # Attach lazily on first /dashboard request — avoids copytree hang at import
-_lazy_attach_dashboard(app, _api_base)
+_lazy_attach_dashboard(app, _api_base, reset_dashboard=os.environ.get("FLATSEEK_RESET_DASHBOARD") == "1")
 
 # Also add a redirect from /dashboard → /dashboard/ (without trailing slash)
 from starlette.responses import RedirectResponse
