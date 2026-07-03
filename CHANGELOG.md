@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.9] - 2026-07-03
 
+### Bug fix: `create_storage_adapter` ignores `FLATSEEK_STORAGE_URL` when backend defaults to "local"
+
+When `FLATSEEK_STORAGE_URL` was set but `FLATSEEK_STORAGE_BACKEND` was not,
+the factory defaulted to `backend="local"` and completely ignored the URL.
+Fix: auto-upgrade `backend="local"` → `"url"` when `FLATSEEK_STORAGE_URL`
+is present, so the URL is actually used without requiring both env vars.
+
+### Bug fix: `get_engine` default storage bypasses HF `.fsk` detection
+
+When serving a HF bucket index without an explicit `?bucket=` parameter,
+`get_engine` passed the bare `URLStorageAdapter` to `QueryEngine` directly.
+For HF bucket repos, this fails because `URLStorageAdapter` cannot resolve
+`.fsk` files (needs `FlatseekFileStorageAdapter` with HTTP Range).
+
+Fix: apply the same HF bucket/dataset detection logic to the default
+`self._storage` path that the `bucket=` parameter path already uses,
+ensuring `_search` and `_indices` consume the same env-configured storage.
+
 ### Bug fix: `flatseek serve` hangs on non-TTY stdin
 
 `cmd_serve` called `input("  Install flatlens now? [Y/n] ")` which blocks
@@ -23,6 +41,21 @@ startup.
 
 Avoid cached package issues in CI by adding `--no-cache-dir` to all
 `pip install` commands in `.github/workflows/test.yml`.
+
+### CLI: search/export/slice/verify via remote `.fsk` URL with spinner
+
+`flatseek search`, `export`, `slice`, and `verify` now accept a
+`https://` URL pointing directly at a `.fsk` file on HuggingFace,
+S3, or any HTTP server. HTTP Range requests are used — no full
+download required.
+
+For HuggingFace URLs, the CLI reads `HF_TOKEN` from the
+`huggingface_hub` token cache (`~/.cache/huggingface/token`) when
+`HF_TOKEN` env var is not set, enabling access to private repos
+without extra env configuration.
+
+A spinner (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`) is shown while reading the
+remote index and while fetching search results.
 
 ## [0.1.8] - 2026-06-30
 

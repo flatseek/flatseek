@@ -920,6 +920,17 @@ class RangeFile:
         self._size: int | None = None
         self._timeout = timeout
         self._headers = dict(headers or {})
+        # HuggingFace resolve URLs (hf.co / huggingface.co) require
+        # Authorization: Bearer <token> even for public files.
+        if "huggingface.co" in url.lower():
+            hf_token = os.environ.get("HF_TOKEN", "").strip()
+            if not hf_token:
+                # Try HF token cache (written by huggingface_hub CLI/login)
+                hf_cache_token = Path(os.path.expanduser("~/.cache/huggingface/token"))
+                if hf_cache_token.is_file():
+                    hf_token = hf_cache_token.read_text().strip()
+            if hf_token and "Authorization" not in self._headers:
+                self._headers["Authorization"] = f"Bearer {hf_token}"
         # Persistent HTTP client — reused for all requests (one TCP/TLS conn).
         # Try HTTP/2 first; fall back to HTTP/1.1 if h2 is not installed.
         import httpx

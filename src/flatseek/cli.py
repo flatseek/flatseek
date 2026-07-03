@@ -35,7 +35,7 @@ try:
     with open(_PYPROJECT_TOML, "rb") as _f:
         __version__ = tomllib.load(_f)["project"]["version"]
 except Exception:
-    __version__ = "0.1.8"
+    __version__ = "0.1.9"
 
 
 def _parse_columns(columns_str):
@@ -963,7 +963,28 @@ def cmd_search(args):
         source = args.data_dir if is_url else data_path
         enc_key = _get_flatseek_enc_key(source, args)
         from flatseek.flatseek_file import FlatseekFileStorageAdapter
-        storage = FlatseekFileStorageAdapter(source, enc_key=enc_key)
+        if is_url:
+            import itertools, time as _time, threading
+            spinner = itertools.cycle(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'])
+            stop_spin = [False]
+
+            def _spin():
+                while not stop_spin[0]:
+                    sys.stderr.write(f"\r[reading remote index] {next(spinner)}   ")
+                    sys.stderr.flush()
+                    _time.sleep(0.1)
+
+            t = threading.Thread(target=_spin, daemon=True)
+            t.start()
+            try:
+                storage = FlatseekFileStorageAdapter(source, enc_key=enc_key)
+            finally:
+                stop_spin[0] = True
+                t.join(timeout=0.5)
+                sys.stderr.write(f"\r[reading remote index] ✓       \n")
+                sys.stderr.flush()
+        else:
+            storage = FlatseekFileStorageAdapter(source, enc_key=enc_key)
 
         # If the manifest is locked (encrypted + no key / wrong key), the
         # storage adapter returns a placeholder stats so the search can
@@ -1012,7 +1033,28 @@ def cmd_search(args):
         sys.exit(1)
 
     try:
-        result = qe.query(query_str, page=args.page, page_size=args.page_size)
+        if is_url:
+            import itertools, time as _time, threading
+            spinner = itertools.cycle(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'])
+            stop_spin = [False]
+
+            def _spin():
+                while not stop_spin[0]:
+                    sys.stderr.write(f"\r[searching remote]  {next(spinner)}   ")
+                    sys.stderr.flush()
+                    _time.sleep(0.1)
+
+            t = threading.Thread(target=_spin, daemon=True)
+            t.start()
+            try:
+                result = qe.query(query_str, page=args.page, page_size=args.page_size)
+            finally:
+                stop_spin[0] = True
+                t.join(timeout=0.5)
+                sys.stderr.write(f"\r[searching remote]  ✓       \n")
+                sys.stderr.flush()
+        else:
+            result = qe.query(query_str, page=args.page, page_size=args.page_size)
     except SyntaxError as e:
         print(f"Query syntax error: {e}")
         sys.exit(1)
@@ -1357,15 +1399,38 @@ def cmd_export(args):
 
     # ── Resolve storage / encryption ──
     data_path = Path(args.data_dir)
+    is_url = isinstance(args.data_dir, str) and args.data_dir.startswith("https://")
     is_flat_file = data_path.is_file() and (
         str(data_path).endswith((".fsk", ".flatseek", ".flat"))
     )
     enc_key = None
     storage = None
-    if is_flat_file:
-        enc_key = _get_flatseek_enc_key(data_path, args)
+    if is_flat_file or is_url:
+        source = args.data_dir if is_url else data_path
+        enc_key = _get_flatseek_enc_key(source, args)
         from flatseek.flatseek_file import FlatseekFileStorageAdapter
-        storage = FlatseekFileStorageAdapter(data_path, enc_key=enc_key)
+        if is_url:
+            import itertools, time as _time, threading
+            spinner = itertools.cycle(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'])
+            stop_spin = [False]
+
+            def _spin():
+                while not stop_spin[0]:
+                    sys.stderr.write(f"\r[reading remote index] {next(spinner)}   ")
+                    sys.stderr.flush()
+                    _time.sleep(0.1)
+
+            t = threading.Thread(target=_spin, daemon=True)
+            t.start()
+            try:
+                storage = FlatseekFileStorageAdapter(source, enc_key=enc_key)
+            finally:
+                stop_spin[0] = True
+                t.join(timeout=0.5)
+                sys.stderr.write(f"\r[reading remote index] ✓       \n")
+                sys.stderr.flush()
+        else:
+            storage = FlatseekFileStorageAdapter(source, enc_key=enc_key)
     elif getattr(args, "storage_backend", None):
         config = StorageConfig(
             backend=args.storage_backend,
@@ -2620,16 +2685,39 @@ def cmd_verify(args):
     from flatseek.core.query_engine import _decompress_doc, _doc_loads, decrypt_bytes
 
     data_path = Path(args.data_dir)
+    is_url = isinstance(args.data_dir, str) and args.data_dir.startswith("https://")
     is_flat_file = data_path.is_file() and (
         str(data_path).endswith((".fsk", ".flatseek", ".flat"))
     )
 
     enc_key = None
     storage = None
-    if is_flat_file:
-        enc_key = _get_flatseek_enc_key(data_path, args)
+    if is_flat_file or is_url:
+        source = args.data_dir if is_url else data_path
+        enc_key = _get_flatseek_enc_key(source, args)
         from flatseek.flatseek_file import FlatseekFileStorageAdapter
-        storage = FlatseekFileStorageAdapter(data_path, enc_key=enc_key)
+        if is_url:
+            import itertools, time as _time, threading
+            spinner = itertools.cycle(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'])
+            stop_spin = [False]
+
+            def _spin():
+                while not stop_spin[0]:
+                    sys.stderr.write(f"\r[reading remote index] {next(spinner)}   ")
+                    sys.stderr.flush()
+                    _time.sleep(0.1)
+
+            t = threading.Thread(target=_spin, daemon=True)
+            t.start()
+            try:
+                storage = FlatseekFileStorageAdapter(source, enc_key=enc_key)
+            finally:
+                stop_spin[0] = True
+                t.join(timeout=0.5)
+                sys.stderr.write(f"\r[reading remote index] ✓       \n")
+                sys.stderr.flush()
+        else:
+            storage = FlatseekFileStorageAdapter(source, enc_key=enc_key)
     elif getattr(args, "storage_backend", None):
         from flatseek.core.storage import StorageConfig, create_storage_adapter
         config = StorageConfig(
@@ -2927,10 +3015,33 @@ def cmd_slice(args):
     # ── 2. Open source ────────────────────────────────────────────────────────
     enc_key = None
     storage = None
-    if is_flat_file:
-        enc_key = _get_flatseek_enc_key(data_path, args)
+    is_url = isinstance(args.data_dir, str) and args.data_dir.startswith("https://")
+    if is_flat_file or is_url:
+        source = args.data_dir if is_url else data_path
+        enc_key = _get_flatseek_enc_key(source, args)
         from flatseek.flatseek_file import FlatseekFileStorageAdapter
-        storage = FlatseekFileStorageAdapter(data_path, enc_key=enc_key)
+        if is_url:
+            import itertools, time as _time, threading
+            spinner = itertools.cycle(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'])
+            stop_spin = [False]
+
+            def _spin():
+                while not stop_spin[0]:
+                    sys.stderr.write(f"\r[reading remote index] {next(spinner)}   ")
+                    sys.stderr.flush()
+                    _time.sleep(0.1)
+
+            t = threading.Thread(target=_spin, daemon=True)
+            t.start()
+            try:
+                storage = FlatseekFileStorageAdapter(source, enc_key=enc_key)
+            finally:
+                stop_spin[0] = True
+                t.join(timeout=0.5)
+                sys.stderr.write(f"\r[reading remote index] ✓       \n")
+                sys.stderr.flush()
+        else:
+            storage = FlatseekFileStorageAdapter(source, enc_key=enc_key)
     elif getattr(args, "storage_backend", None):
         from flatseek.core.storage import StorageConfig, create_storage_adapter
         config = StorageConfig(
