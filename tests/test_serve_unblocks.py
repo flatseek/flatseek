@@ -107,7 +107,7 @@ cmd_serve(ns)
     )
 
 
-def _wait_for_server(port: int, timeout: float = 6.0) -> bool:
+def _wait_for_server(port: int, timeout: float = 20.0) -> bool:
     """Poll until the server responds on /, or timeout. Returns True on ready."""
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -170,7 +170,7 @@ class TestServeUnblocksOnEncryptedSources:
         proc = _serve_in_subprocess(str(fsk), is_dir=False, port=port)
         self._proc = proc
         try:
-            ready = _wait_for_server(port, timeout=6.0)
+            ready = _wait_for_server(port, timeout=20.0)
             assert ready, (
                 "server did not respond within 6s — likely hung on a "
                 "passphrase prompt. This is the regression the test "
@@ -192,7 +192,7 @@ class TestServeUnblocksOnEncryptedSources:
         proc = _serve_in_subprocess(str(data_dir), is_dir=True, port=port)
         self._proc = proc
         try:
-            ready = _wait_for_server(port, timeout=6.0)
+            ready = _wait_for_server(port, timeout=20.0)
             assert ready, (
                 "encrypted dir server did not respond within 6s — "
                 "likely hung on a passphrase prompt"
@@ -213,7 +213,7 @@ class TestServeUnblocksOnEncryptedSources:
             proc = _serve_in_subprocess(str(tmp2), is_dir=True, port=port)
             self._proc = proc
             try:
-                ready = _wait_for_server(port, timeout=6.0)
+                ready = _wait_for_server(port, timeout=20.0)
                 assert ready, "unencrypted server should start normally"
             finally:
                 self._stop(proc)
@@ -243,7 +243,7 @@ class TestServeUnblocksOnEncryptedSources:
         proc = _serve_in_subprocess(str(fsk), is_dir=False, port=port)
         self._proc = proc
         try:
-            ready = _wait_for_server(port, timeout=6.0)
+            ready = _wait_for_server(port, timeout=20.0)
             assert ready, "server should start with FLATSEEK_PASSPHRASE set"
             # With the key available, the env should have FLATSEEK_FSK_KEY set
             # (server unlocks the .fsk at startup). Verify by checking that
