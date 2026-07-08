@@ -17,6 +17,44 @@ from flatseek.api.deps import get_index_manager, IndexManager
 
 logger = logging.getLogger(__name__)
 
+
+def _parse_sort(raw):
+    """Parse sort parameter into list of (field, direction) tuples.
+
+    Accepts:
+      - "field1:desc,field2:asc" (string shorthand)
+      - [{"field": "amount", "order": "desc"}, ...] (Elasticsearch-style)
+      - [{"amount": "desc"}, ...] (simple dict style)
+    """
+    if not raw:
+        return None
+
+    if isinstance(raw, str):
+        # String format: "field1:desc,field2:asc"
+        result = []
+        for part in raw.split(","):
+            part = part.strip()
+            if ":" in part:
+                field, direction = part.split(":", 1)
+                result.append((field.strip(), direction.strip()))
+        return result if result else None
+
+    if isinstance(raw, list):
+        result = []
+        for item in raw:
+            if isinstance(item, dict):
+                # Elasticsearch-style: {"field": "amount", "order": "desc"}
+                if "field" in item and "order" in item:
+                    result.append((item["field"], item["order"]))
+                # Simple dict style: {"amount": "desc"}
+                else:
+                    for field, direction in item.items():
+                        result.append((field, direction))
+        return result if result else None
+
+    return None
+
+
 # ─── OpenAPI Response Schemas ───────────────────────────────────────────────────
 # Flexible schemas — no hardcoded field names so any dataset type works.
 
@@ -165,6 +203,7 @@ async def search(
     q: str | None = Query(None, description="Query string (Lucene syntax)"),
     from_: int = Query(0, ge=0, alias="from"),
     size: int = Query(20, ge=0, le=10000),
+    sort: str | None = Query(None, description="Sort: field:asc or field:desc (comma-separated for multi-field)"),
     bucket: str | None = Query(None, description="URL storage bucket (HuggingFace/GitHub URL) for remote indexes"),
     request: Request = None,
     manager: IndexManager = Depends(get_index_manager),
@@ -172,19 +211,24 @@ async def search(
     """Search with request body or query params."""
     encrypted = manager.is_encrypted(index, bucket)
     if encrypted:
-        # Password must come from request header — no global session store
-        # (prevents one user's authenticated session from leaking to others)
+        # Password must come from request header or session (already authenticated).
+        # Using session key from _authenticate endpoint (stored in _enc_keys) allows
+        # authenticated sessions to skip the header on subsequent requests.
         stored_pass = request.headers.get("x-index-password") if request else None
-        if not stored_pass:
+        already_authed = manager._enc_keys.get(index) is not None
+        if not stored_pass and not already_authed:
             raise HTTPException(
-                403,
-                f"Index '{index}' is encrypted. Submit password via POST /{index}/_authenticate"
+                401,
+                f"Index '{index}' is encrypted. Submit password via POST /{index}/_authenticate or pass X-Index-Password header."
             )
 
     try:
         engine = manager.get_engine(index, bucket_url=bucket)
+    except PermissionError as e:
+        # Encrypted FSK that needs auth — re-raise as 401
+        raise HTTPException(401, str(e)) from e
     except Exception as e:
-        raise HTTPException(404, f"Index not found: {index}") from e
+        raise HTTPException(404, f"Index not found: {e}") from e
 
     if encrypted:
         try:
@@ -229,9 +273,15 @@ async def search(
                             break
                 except Exception:
                     pass
-                if enc_meta is None:
+                # Use already-stored session key if available (handles both _encryption_b64
+                # and _K_inner_encrypted/license mode where _authenticate already derived the key).
+                # Only raise 401 if we have no stored key AND no enc_meta to derive from.
+                if already_authed and not stored_pass:
+                    key = manager._enc_keys[index]
+                elif enc_meta is None:
                     raise HTTPException(401, "Invalid passphrase for encrypted index")
-                key = load_encryption_key(None, stored_pass, meta=enc_meta)
+                else:
+                    key = load_encryption_key(None, stored_pass, meta=enc_meta)
                 engine.set_key(key)
             else:
                 index_dir = os.path.join(manager.data_dir, index)
@@ -269,6 +319,14 @@ async def search(
         req_from = body.get('from', body.get('from_')) if body else None
         req_from = req_from if req_from is not None else from_
 
+        # Parse sort parameter
+        sort_spec = None
+        raw_sort = body.get("sort") if body else None
+        if raw_sort:
+            sort_spec = _parse_sort(raw_sort)
+        elif sort:
+            sort_spec = _parse_sort(sort)
+
         # Route queries to engine.query() or engine.search():
         # - engine.query() handles Lucene DSL (field:term, AND/OR/NOT, wildcards)
         # - engine.search() handles cross-column simple wildcards (*term* without field:)
@@ -280,13 +338,13 @@ async def search(
         # Helper: run blocking query in thread so cancellation can propagate
         def _do_query():
             if query == "*" or query == "":
-                return engine.search("", page=req_from // max(req_size, 1), page_size=req_size)
+                return engine.search("", page=req_from // max(req_size, 1), page_size=req_size, sort=sort_spec)
             elif ":" in query or any(op in query.upper() for op in [" AND ", " OR ", " NOT "]):
-                return engine.query(query, page=req_from // max(req_size, 1), page_size=req_size)
+                return engine.query(query, page=req_from // max(req_size, 1), page_size=req_size, sort=sort_spec)
             elif "*" in query or "%" in query:
-                return engine.search(query, page=req_from // max(req_size, 1), page_size=req_size)
+                return engine.search(query, page=req_from // max(req_size, 1), page_size=req_size, sort=sort_spec)
             else:
-                return engine.query(query, page=req_from // max(req_size, 1), page_size=req_size)
+                return engine.query(query, page=req_from // max(req_size, 1), page_size=req_size, sort=sort_spec)
 
         # Run with configurable timeout — prevents runaway queries from holding resources
         try:
@@ -338,12 +396,13 @@ async def search_get(
     q: str | None = Query(None),
     from_: int = Query(0, ge=0, alias="from"),
     size: int = Query(20, ge=0, le=10000),
+    sort: str | None = Query(None, description="Sort: field:asc or field:desc (comma-separated for multi-field)"),
     bucket: str | None = Query(None, description="URL storage bucket (HuggingFace/GitHub URL) for remote indexes"),
     request: Request = None,
     manager: IndexManager = Depends(get_index_manager),
 ):
     """Search with GET (query params only)."""
-    return await search(index, None, q, from_, size, bucket, request, manager)
+    return await search(index, None, q, from_, size, sort, bucket, request, manager)
 
 
 @router.get(

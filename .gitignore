@@ -1,4 +1,9 @@
 # Byte-compiled / optimized / DLL files
+# Local demo datasets (do not commit)
+demo_datasets/
+dummy.sh
+scripts/create_demo_datasets.py
+
 __pycache__/
 *.py[codz]
 *$py.class

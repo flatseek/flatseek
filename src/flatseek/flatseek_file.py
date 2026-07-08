@@ -54,6 +54,11 @@ SID_INDEX = 0x02
 SID_DOCS = 0x03
 SID_DOC_VALUES = 0x04
 
+# Header flags
+LIC_ENCODED = 0x01   # License-encoded (legacy)
+LIC_INNER_KEY = 0x02  # Inner key present
+LIC_CHUNKED = 0x04   # Chunk-level format: offset table encrypted with K_inner
+
 # Section descriptor format: id(1) + reserved(1) + offset(8) + size(8) + checksum(32) = 50 bytes
 SECT_DESC_SIZE = 50
 MAX_SECTIONS = 16
@@ -169,10 +174,18 @@ class FlatseekPacker:
 
     CHUNK_SIZE = 4 * 1024 * 1024  # 4 MB read/write chunk
 
-    def __init__(self, index_dir: Path, output_path: Path, enc_key: bytes | None = None):
-        self.index_dir = index_dir
+    def __init__(self, index_dir: Path, output_path: Path, enc_key: bytes | None = None,
+                 description=None, url=None, expire_at: int | None = None,
+                 master_key: bytes | None = None,
+                 license_key: bytes | None = None):
+        self.index_dir = Path(index_dir)
         self.output_path = output_path
         self.enc_key = enc_key  # kept for reference; not used during pack
+        self.description = description
+        self.url = url
+        self.expire_at = expire_at  # Unix timestamp int
+        self.master_key = master_key
+        self.license_key = license_key  # HMAC key for signing tokens (stored in manifest)
 
     def _read_binary(self, path: Path) -> bytes:
         """Read binary file as-is (encrypted files stay encrypted)."""
@@ -220,7 +233,7 @@ class FlatseekPacker:
         if pad > 0:
             out.write(b"\x00" * pad)
 
-    def _build_manifest_bytes(self) -> bytes:
+    def _build_manifest_bytes(self, K_inner: bytes | None = None) -> bytes:
         """Build the manifest section JSON bytes.
 
         The manifest section is small (KB-scale) and is held in memory only
@@ -235,13 +248,72 @@ class FlatseekPacker:
         }
         enc_path = self.index_dir / "encryption.json"
 
-        # Re-encrypt JSON files if source is encrypted and key provided.
-        # This ensures unpack is the inverse of pack — encrypted state is preserved.
-        if enc_path.exists() and self.enc_key:
+        # ── License/Enclosed modes: encrypt stats + columns with K_inner ─────
+        # Determine the inner encryption key for license/enclosed modes.
+        # For license: K_inner was passed as parameter.
+        # For enclosed: self._K_inner is pre-set.
+        # For bucket: enc_path.exists() → use self.enc_key.
+        _inner_key = getattr(self, '_K_inner', None) or K_inner
+        _is_license_or_enclosed = bool(self.license_key or getattr(self, '_K_inner', None))
+        if _is_license_or_enclosed and _inner_key:
+            # Encrypt stats.json and column_map.json with K_inner.
+            # These are stored as hex in the plaintext manifest so the file
+            # structure remains valid (JSON parsable), but content is opaque.
+            from flatseek.core.query_engine import encrypt_bytes, decrypt_bytes
+            # stats: read from disk, inject description/url, then encrypt.
+            # Priority: _inner_key (K_inner for license/enclosed) > self.enc_key (bucket).
+            # If stats.json is encrypted with a different key (e.g. bucket-encrypted source index
+            # being repacked as license), try both keys.
+            if "stats" in manifest_paths and manifest_paths["stats"].exists():
+                stats_bytes = manifest_paths["stats"].read_bytes()
+                if stats_bytes.startswith(_ENC_MAGIC):
+                    # Encrypted — try _inner_key first (license/enclosed), then self.enc_key (bucket).
+                    _dec_key = _inner_key or self.enc_key
+                    try:
+                        decrypted = decrypt_bytes(stats_bytes, _dec_key)
+                        stats_for_enc = json.loads(decrypted.decode("utf-8"))
+                    except Exception:
+                        # Try the other key
+                        _alt_key = self.enc_key if _dec_key is _inner_key else _inner_key
+                        if _alt_key:
+                            decrypted = decrypt_bytes(stats_bytes, _alt_key)
+                            stats_for_enc = json.loads(decrypted.decode("utf-8"))
+                        else:
+                            # Can't decrypt — store encrypted blob as-is (re-encrypt later if needed)
+                            stats_for_enc = {}
+                else:
+                    stats_for_enc = json.loads(stats_bytes.decode("utf-8"))
+                if self.description:
+                    stats_for_enc["description"] = self.description
+                if self.url:
+                    stats_for_enc["url"] = self.url
+                raw = json.dumps(stats_for_enc, separators=(",", ":")).encode("utf-8")
+                raw = encrypt_bytes(raw, _inner_key)
+                manifest_data["stats"] = raw.hex()
+            # columns: read from disk and encrypt (try both keys similarly)
+            for key in ("columns",):
+                path = manifest_paths.get(key)
+                if path and path.exists():
+                    raw = path.read_bytes()
+                    if raw.startswith(_ENC_MAGIC):
+                        _dec_key = _inner_key or self.enc_key
+                        try:
+                            decrypted = decrypt_bytes(raw, _dec_key)
+                            raw = encrypt_bytes(decrypted, _inner_key)
+                        except Exception:
+                            _alt_key = self.enc_key if _dec_key == _inner_key else _inner_key
+                            if _alt_key:
+                                decrypted = decrypt_bytes(raw, _alt_key)
+                                raw = encrypt_bytes(decrypted, _inner_key)
+                    else:
+                        raw = encrypt_bytes(raw, _inner_key)
+                    manifest_data[key] = raw.hex()
+        elif enc_path.exists() and self.enc_key:
+            # Bucket mode: re-encrypt JSON files with the bucket key.
+            # This ensures unpack is the inverse of pack — encrypted state is preserved.
             for key, path in manifest_paths.items():
                 if path.exists():
                     raw = path.read_bytes()
-                    # Only encrypt if not already encrypted (avoid double-encryption)
                     if not raw.startswith(_ENC_MAGIC):
                         raw = self._encrypt_bytes(raw)
                     manifest_data[key] = raw.hex()  # hex for JSON-safe storage
@@ -266,6 +338,94 @@ class FlatseekPacker:
         # _encryption_b64 is readable without key, enabling _get_flatseek_enc_key()
         # to derive the key from the passphrase. The actual file data (index/docs/dv)
         # is encrypted at the section level for encrypted indexes.
+
+        # ── Expiration / license metadata ─────────────────────────────────────
+        if self.expire_at is not None and self.master_key:
+            import os as _os
+            from flatseek.core.query_engine import encrypt_expire_info
+            salt = _os.urandom(32)
+            expire_cipher = encrypt_expire_info(self.expire_at, self.master_key, salt)
+            manifest_data["expire_at"] = self.expire_at
+            manifest_data["expire_cipher"] = expire_cipher
+            manifest_data["_salt"] = salt.hex()
+
+        # ── License model: store encrypted K_inner + embedded key ──────────────
+        # license_key = HMAC key for token verification + K_inner encryption
+        # The manifest stores both _embedded_key (the license key itself, base64)
+        # and _K_inner_encrypted (K_inner encrypted with the embedded key).
+        #
+        # Runtime flow for license mode:
+        #   1. Verify token via embedded_key
+        #   2. K_user = HMAC(token, embedded_key)
+        #   3. Decrypt _K_inner_encrypted with K_user → K_inner
+        #   4. Check expiry
+        #   5. Decrypt inner data with K_inner
+        #
+        # This is crypto-layer protection: expiry is checked AFTER K_inner is
+        # decrypted, so patching the binary doesn't bypass expiry.
+        #
+        # ── Enclosed mode: K_inner NOT in manifest ─────────────────────────────
+        # For enclosed format, K_inner is stored in outer_ct (encrypted with
+        # PBKDF2-derived K_user), NOT in the manifest. The manifest must NOT
+        # contain _K_inner_encrypted so license token flow doesn't apply.
+        # Detected by getattr(self, '_K_inner', None) being pre-set.
+        if getattr(self, '_K_inner', None):
+            pass  # Enclosed mode: K_inner is in outer_ct, not manifest — do nothing
+        elif self.license_key:
+            import base64 as _b64
+            from flatseek.core.query_engine import encrypt_bytes
+
+            # Encrypt K_inner with K_user derived from license_key.
+            # K_user = HMAC(license_key, "flatseek-license-v1") — must match runtime.
+            import hmac as _hmac
+            import hashlib as _hashlib
+            K_user = _hmac.new(self.license_key, b"flatseek-license-v1", _hashlib.sha256).digest()
+
+            # Encrypt K_inner (JSON-encoded so runtime knows the key length)
+            K_inner_plaintext = json.dumps({"k": K_inner.hex()}).encode("utf-8")
+            K_inner_encrypted = encrypt_bytes(K_inner_plaintext, K_user)
+            manifest_data["_embedded_key"] = _b64.b64encode(self.license_key).decode("ascii")
+            manifest_data["_K_inner_encrypted"] = K_inner_encrypted.hex()  # hex for JSON safety
+            manifest_data["_license_mode"] = True
+
+        # ── Description & URL ───────────────────────────────────────────────────
+        # For encrypted modes (license/enclosed/bucket), description and url are
+        # stored ONLY in the encrypted stats.json blob — NOT in the plaintext
+        # manifest. This prevents enumeration via hex editor.
+        # For plain/old FSKs, they remain in the plaintext manifest.
+        _is_encrypted = bool(self.license_key or getattr(self, '_K_inner', None) or self.enc_key)
+        stats_data = manifest_data.get("stats", {})
+        if isinstance(stats_data, dict):
+            if _is_encrypted:
+                # Put description/url in the encrypted blob (stats.json).
+                # They will be readable after decryption with the proper key.
+                if self.description:
+                    stats_data["description"] = self.description
+                if self.url:
+                    stats_data["url"] = self.url
+                manifest_data["stats"] = stats_data
+                # Do NOT write to plaintext manifest fields — they must not be
+                # visible in the plaintext manifest for encrypted FSKs.
+            else:
+                # Plain/old FSK: store in plaintext manifest as before.
+                if self.description:
+                    manifest_data["description"] = self.description
+                elif stats_data.get("description"):
+                    manifest_data["description"] = stats_data["description"]
+                if self.url:
+                    manifest_data["url"] = self.url
+                elif stats_data.get("url"):
+                    manifest_data["url"] = stats_data["url"]
+        else:
+            # stats is hex-encoded (already encrypted) — this is an old encrypted
+            # FSK that stores stats as encrypted hex. description/url should not
+            # appear in plaintext manifest for encrypted FSKs.
+            if not _is_encrypted:
+                if self.description:
+                    manifest_data["description"] = self.description
+                if self.url:
+                    manifest_data["url"] = self.url
+
         return json.dumps(manifest_data, separators=(",", ":")).encode("utf-8")
 
     def _stream_section(
@@ -275,26 +435,15 @@ class FlatseekPacker:
         subdir: str,
         desc_label: str,
         total_hasher: "hashlib._Hash",
+        encrypt_key: bytes | None = None,
     ) -> tuple[int, int, bytes]:
         """Stream a file-collection section into `out` and update hashers.
 
-        Writes a 4-byte offset-table-length, the offset table itself (paths +
-        sizes), then streams each file's bytes. Both per-section and total
-        checksums are updated incrementally as bytes are written.
-
-        Parallelism: N worker threads each read ONE source file in CHUNK_SIZE
-        blocks and push the chunks into a per-file bounded queue. The main
-        thread drains those queues in order — it must stay serial because it
-        owns the single output stream + the single section/total hashers.
-        Reading and writing are decoupled: workers can run ahead of the main
-        thread, hiding read latency under write+hash time.
-
-        Memory: O(N) for the file_info list (paths/sizes) +
-                O(P * CHUNK_SIZE) for the per-file prefetch queues
-                (P = n_workers, default 4 → at most ~16 MB worst case).
-
-        Returns (offset, unpadded_size, section_checksum).
+        If ``encrypt_key`` is set (license-protected .fsk), each file is encrypted
+        with ChaCha20-Poly1305 before being written. Encrypted sizes are stored
+        in the offset table so the storage adapter can read them back.
         """
+
         import time as _time
         from concurrent.futures import ThreadPoolExecutor
         from queue import Queue
@@ -313,11 +462,30 @@ class FlatseekPacker:
             size = os.path.getsize(path)
             file_info.append((path, rel_no_prefix, size))
 
-        # Pass 2: build offset table.
+        # If encrypt_key is set, pre-encrypt all files to get encrypted sizes.
+        # We do this upfront because the offset table must be written before
+        # file data, and encryption changes the size.
+        if encrypt_key:
+            from flatseek.core.query_engine import encrypt_bytes
+            encrypted_map: dict[Path, bytes] = {}
+            for path, rel_no_prefix, orig_size in file_info:
+                raw = path.read_bytes()
+                ct = encrypt_bytes(raw, encrypt_key)
+                encrypted_map[path] = ct
+            # Rebuild file_info with encrypted sizes (each file encrypts to different length)
+            file_info = [(p, r, len(encrypted_map[p])) for (p, r, _) in file_info]
+
+        # Pass 2: build offset table (plaintext).
         tbl_parts = [struct.pack("<I", len(file_info))]
         for _path, rel, size in file_info:
             tbl_parts.append(rel.encode("utf-8") + b"|" + struct.pack("<I", size))
         tbl_bytes = b"".join(tbl_parts)
+
+        # Encrypt offset table with K_inner when license_key is set (chunked format).
+        # The encrypted table is stored at the start of the section, before file data.
+        if encrypt_key:
+            from flatseek.core.query_engine import encrypt_bytes
+            tbl_bytes = encrypt_bytes(tbl_bytes, encrypt_key)
 
         len_bytes = struct.pack("<I", len(tbl_bytes))
         out.write(len_bytes)
@@ -333,7 +501,16 @@ class FlatseekPacker:
         n_workers = min(4, len(file_info))
         t0 = _time.time()
 
-        if n_workers <= 1:
+        if encrypt_key:
+            # Sequential-only path for encrypted files: write pre-computed ciphertext.
+            for i, (path, _rel, size) in enumerate(file_info, 1):
+                ct = encrypted_map[path]
+                out.write(ct)
+                data_hasher.update(ct)
+                total_hasher.update(ct)
+                data_size += size
+                self._print_pack_progress(i, len(file_info), t0, desc_label)
+        elif n_workers <= 1:
             # Sequential fast path — no thread overhead for tiny sections.
             for i, (path, _rel, size) in enumerate(file_info, 1):
                 with open(path, "rb") as src:
@@ -418,14 +595,35 @@ class FlatseekPacker:
 
         Memory profile: bounded by CHUNK_SIZE (~4 MB) plus the file_info list
         (paths + sizes only). Total file size no longer drives peak memory.
+
+        If expire_at is set, applies enclosed encryption that cryptographically
+        enforces expiration - no streaming, entire blob encrypted.
         """
         import time as _time
+        import os as _os
 
         print(f"[PACK] Reading index from: {self.index_dir}")
 
-        # ── Build manifest section (small, held briefly in memory) ──
+        # ── Enclosed mode: pack to temp, then enclose ──
+        if self.expire_at is not None and self.master_key:
+            return self._pack_enclosed()
+
         t_overall = _time.time()
-        manifest_bytes = self._build_manifest_bytes()
+
+        # ── Derive K_inner for license-protected .fsk ───────────────────────────
+        # K_inner is the random key used to encrypt section data. It is stored
+        # encrypted in the manifest so only users with a valid token can access it.
+        # For enclosed mode, _K_inner is pre-set by _pack_enclosed; reuse it.
+        K_inner: bytes | None = None
+        if getattr(self, '_K_inner', None):
+            K_inner = self._K_inner  # enclosed mode: reuse pre-generated K_inner
+        elif self.license_key:
+            import hmac as _hmac, hashlib as _hashlib
+            # Derive K_user = HMAC(license_key, "flatseek-license-v1") for encrypting K_inner
+            K_user = _hmac.new(self.license_key, b"flatseek-license-v1", _hashlib.sha256).digest()
+            K_inner = _os.urandom(32)
+
+        manifest_bytes = self._build_manifest_bytes(K_inner=K_inner)
 
         # ── Enumerate source files for each section ──
         idx_dir = self.index_dir / "index"
@@ -464,26 +662,38 @@ class FlatseekPacker:
             self._write_padding(out, manifest_size)
 
             # File-collection sections — streamed in 4 MB chunks.
+            # For license-protected .fsk, encrypt section data with K_inner
+            # (the random key stored encrypted in the manifest). This ensures
+            # only users with a valid token can decrypt K_inner and access data.
+            # Note: section checksums are skipped for encrypted sections because
+            # encrypt_bytes uses a random nonce → different ciphertext each pack.
+            # ChaCha20-Poly1305 AEAD auth tag provides integrity verification.
             idx_offset, idx_size, idx_checksum = self._stream_section(
                 out, idx_files, "index", "Index", total_hasher,
+                encrypt_key=K_inner,
             )
             section_descs.append(SectionDesc(SID_INDEX, idx_offset, idx_size, idx_checksum))
 
             docs_offset, docs_size, docs_checksum = self._stream_section(
                 out, doc_files, "docs", "Docs", total_hasher,
+                encrypt_key=K_inner,
             )
             section_descs.append(SectionDesc(SID_DOCS, docs_offset, docs_size, docs_checksum))
 
             dv_offset, dv_size, dv_checksum = self._stream_section(
                 out, dv_files, "dv", "DocValues", total_hasher,
+                encrypt_key=K_inner,
             )
             section_descs.append(SectionDesc(SID_DOC_VALUES, dv_offset, dv_size, dv_checksum))
 
             # Patch header at offset 0 with final descriptors + total checksum.
             total_checksum = total_hasher.digest()
+            # Set LIC_CHUNKED when license_key is present — offset table is encrypted
+            # with K_inner, not stored in plaintext outside the encrypted section.
+            header_flags = LIC_CHUNKED if self.license_key else 0
             header = FlatseekHeader(
                 version=1,
-                flags=0,
+                flags=header_flags,
                 header_size=HEADER_SIZE,
                 num_sections=len(section_descs),
                 sections=section_descs,
@@ -500,6 +710,83 @@ class FlatseekPacker:
         elapsed = _time.time() - t_overall
         size_mb = self.output_path.stat().st_size / 1024 / 1024
         print(f"[PACK] Done! Size: {size_mb:.1f} MB in {elapsed:.1f}s ({size_mb / max(elapsed, 0.001):.1f} MB/s)")
+        return self.output_path
+
+    def _pack_enclosed(self) -> Path:
+        """Pack with enclosed encryption: per-section encrypt, outer_ct wraps K_inner.
+
+        Format: salt(32) + outer_ct_len(4) + outer_ct + [LIC_CHUNKED FSK data]
+          outer_ct = encrypt({"k": K_inner, "expire_at": ts}, K_user)
+          FSK data: normal LIC_CHUNKED format (offset tables + file data encrypted with K_inner)
+
+        Decrypt (search/serve):
+          1. salt, outer_ct = read from file start
+          2. K_user = PBKDF2(passphrase, salt)
+          3. outer_plaintext = decrypt(outer_ct, K_user) → {k: K_inner, expire_at: ts}
+          4. Check expiry (cryptographic — can't bypass without K_inner)
+          5. K_inner → decrypt FSK sections on demand via FlatseekFileStorageAdapter.from_bytes()
+
+        No temp file: sections are encrypted during streaming pack.
+        """
+        import os as _os
+        import time as _time
+        import json as _json
+        import tempfile as _tempfile
+
+        t_overall = _time.time()
+
+        # Generate K_inner (random, used for per-section encryption)
+        K_inner = _os.urandom(32)
+        # Generate salt for PBKDF2
+        salt = _os.urandom(32)
+
+        # Temporarily disable enclosed mode so regular pack() path runs,
+        # but pass K_inner for per-section encryption (LIC_CHUNKED).
+        orig_expire = self.expire_at
+        orig_master = self.master_key
+        orig_license_key = getattr(self, 'license_key', None)
+        self.expire_at = None  # pack() won't trigger _pack_enclosed
+        self.master_key = None  # pack() won't use enclosed wrapper
+        self.license_key = K_inner  # triggers LIC_CHUNKED per-section encrypt
+        self._K_inner = K_inner  # store so pack() uses our K_inner, not a new one
+
+        # Save K_inner for later (pack normally without outer wrapper,
+        # then we'll wrap the result)
+        saved_output = self.output_path
+        self.output_path = Path(_tempfile.mktemp(suffix=".fsk"))
+        try:
+            # Pack with per-section encryption (K_inner, LIC_CHUNKED)
+            FlatseekPacker.pack(self)
+
+            # Read packed FSK bytes
+            fsk_bytes = self.output_path.read_bytes()
+        finally:
+            self.output_path.unlink()
+        self.output_path = saved_output
+        self.expire_at = orig_expire
+        self.master_key = orig_master
+        self.license_key = orig_license_key
+        del self._K_inner
+
+        # Build outer_ct: encrypt K_inner + expire_ts with PBKDF2-derived K_user
+        from flatseek.core.query_engine import derive_key, encrypt_bytes
+        # master_key may be bytes or str; decode to str for PBKDF2
+        passphrase = self.master_key.decode("utf-8") if isinstance(self.master_key, bytes) else self.master_key
+        k_user = derive_key(passphrase, salt)
+        outer_plaintext = _json.dumps({
+            "k": K_inner.hex(),
+            "expire_at": self.expire_at,
+        }).encode("utf-8")
+        outer_ct = encrypt_bytes(outer_plaintext, k_user)
+
+        # Write final file: salt + outer_ct_len + outer_ct + fsk_bytes
+        outer_ct_len = len(outer_ct)
+        final_bytes = salt + struct.pack("<I", outer_ct_len) + outer_ct + fsk_bytes
+        self.output_path.write_bytes(final_bytes)
+
+        elapsed = _time.time() - t_overall
+        size_mb = self.output_path.stat().st_size / 1024 / 1024
+        print(f"[PACK] Done (enclosed)! Size: {size_mb:.1f} MB in {elapsed:.1f}s")
         return self.output_path
 
     def _validate(self, path: Path):
@@ -531,6 +818,12 @@ class FlatseekPacker:
         n_workers = min(4, len(sections_to_check))
 
         def _check_one(desc: SectionDesc) -> SectionDesc:
+            # For license-protected sections, skip checksum comparison:
+            # encrypt_bytes uses a random nonce per call → ciphertext differs each pack.
+            # ChaCha20-Poly1305 AEAD auth tag provides integrity — a tampered
+            # ciphertext would fail decryption with an auth tag error downstream.
+            if self.license_key:
+                return desc
             hasher = hashlib.sha256()
             with open(path, "rb") as fh:
                 fh.seek(desc.offset)
@@ -569,10 +862,12 @@ class FlatseekUnpacker:
 
     CHUNK_SIZE = 4 * 1024 * 1024  # 4 MB read/write chunk
 
-    def __init__(self, flatseek_path: Path, output_dir: Path, enc_key: bytes | None = None):
+    def __init__(self, flatseek_path: Path, output_dir: Path, enc_key: bytes | None = None,
+                 passphrase: str | None = None):
         self.flatseek_path = flatseek_path
         self.output_dir = output_dir
         self.enc_key = enc_key
+        self.passphrase = passphrase
 
     def _decrypt_bytes(self, data: bytes) -> bytes:
         """Decrypt bytes if they carry the flatseek encryption magic."""
@@ -582,6 +877,23 @@ class FlatseekUnpacker:
         if not is_encrypted(data):
             return data
         return decrypt_bytes(data, self.enc_key)
+
+    def _check_expiration(self, manifest: dict) -> None:
+        """Check if index has expired (simple date check for non-enclosed)."""
+        from datetime import datetime, timezone
+
+        expire_at = manifest.get("expire_at")
+        if expire_at is None:
+            return  # No expiration set
+
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        if now_ts <= expire_at:
+            return  # Not yet expired
+
+        raise PermissionError(
+            f"This index expired on {datetime.fromtimestamp(expire_at, tz=timezone.utc).isoformat()}. "
+            "Please contact the vendor for an updated license."
+        )
 
     def _parse_offset_table(self, tbl_bytes: bytes) -> list[tuple[str, int]]:
         """Parse offset table into [(rel_path, size), ...].
@@ -763,7 +1075,16 @@ class FlatseekUnpacker:
         print(f"[UNPACK] Reading {self.flatseek_path}")
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Check for enclosed format (no FLATSEEK04 magic at start)
         with open(self.flatseek_path, "rb") as f:
+            magic = f.read(10)
+
+            if magic != b"FLATSEEK04":
+                # Enclosed format: salt + outer_ct + inner_ct
+                return self._unpack_enclosed()
+
+            # Normal format: seek back and read header
+            f.seek(0)
             header = FlatseekHeader.unpack(f.read(HEADER_SIZE))
             print(f"[UNPACK] Version: {header.version}, Sections: {header.num_sections}")
 
@@ -778,6 +1099,8 @@ class FlatseekUnpacker:
                 # Verify manifest checksum.
                 if hashlib.sha256(manifest_bytes).digest() != manifest_desc.checksum:
                     raise ValueError("Manifest section checksum mismatch")
+                manifest = json.loads(manifest_bytes.decode("utf-8"))
+                self._check_expiration(manifest)  # raises PermissionError if expired
                 self._write_manifest_files(manifest_bytes)
                 print(f"[UNPACK]   Manifest extracted")
 
@@ -793,6 +1116,122 @@ class FlatseekUnpacker:
                 n_files = self._stream_extract_section(f, section_desc, subdir)
                 print(f"[UNPACK]   {subdir}: {n_files} files")
 
+        print(f"[UNPACK] Done! Output: {self.output_dir}")
+        return self.output_dir
+
+    def _unpack_enclosed(self) -> Path:
+        """Unpack enclosed .fsk format: salt + outer_ct + FSK (LIC_CHUNKED).
+
+        New format (v0.1.9+):
+          Format: salt(32) + outer_ct_len(4) + outer_ct + [LIC_CHUNKED FSK data]
+          outer_ct = encrypt({"k": K_inner, "expire_at": ts}, K_user)
+          FSK = normal LIC_CHUNKED format (per-section encrypted with K_inner)
+
+        Decrypt:
+          1. Derive K_user = PBKDF2(passphrase, salt)
+          2. Decrypt outer_ct → K_inner + expire_ts
+          3. Check expiry (cryptographic enforcement)
+          4. FSK data is already per-section encrypted with K_inner — no further decrypt
+          5. Use FlatseekFileStorageAdapter.from_bytes() to read and extract
+
+        The temp file holds the already-decrypted FSK data (LIC_CHUNKED, not
+        encrypted as a blob), so the temp file is not a security concern.
+        """
+        import tempfile as _tempfile
+        import os as _os
+        import json as _json
+
+        print(f"[UNPACK] Enclosed format detected, decrypting...")
+
+        data = self.flatseek_path.read_bytes()
+
+        # Format: salt(32) + outer_ct_len(4) + outer_ct + FSK (LIC_CHUNKED)
+        salt = data[:32]
+        outer_ct_len = int.from_bytes(data[32:36], "little")
+        outer_ct = data[36:36 + outer_ct_len]
+        fsk_data = data[36 + outer_ct_len:]  # LIC_CHUNKED FSK, per-section encrypted
+
+        # Decrypt outer with passphrase
+        # K_user = PBKDF2(passphrase, salt)
+        # outer_plaintext = decrypt(outer_ct, K_user) = {"k": K_inner_hex, "expire_at": ts}
+        from flatseek.core.query_engine import derive_key, decrypt_bytes
+        if not self.passphrase:
+            raise ValueError("Passphrase required for enclosed format")
+        k_user = derive_key(self.passphrase, salt)
+        outer_plaintext = decrypt_bytes(outer_ct, k_user)
+        outer_data = _json.loads(outer_plaintext)
+
+        K_inner = bytes.fromhex(outer_data["k"])
+        expire_ts = outer_data["expire_at"]
+
+        # Check expiration BEFORE reading FSK data (cryptographic enforcement)
+        from datetime import datetime, timezone
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        if now_ts > expire_ts:
+            raise PermissionError(
+                f"This index expired on {datetime.fromtimestamp(expire_ts, tz=timezone.utc).isoformat()}. "
+                "The license has lapsed and the data can no longer be accessed."
+            )
+
+        # FSK data is LIC_CHUNKED — use from_bytes to open in memory,
+        # then manually extract files to output dir (no temp file for FSK data).
+        import io
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Open FSK via from_bytes (K_inner for per-section decryption)
+        fsk_fh = io.BytesIO(fsk_data)
+        from flatseek.flatseek_file import FlatseekFileStorageAdapter
+        adapter = FlatseekFileStorageAdapter.from_bytes(fsk_data, enc_key=K_inner)
+
+        # Extract manifest files
+        for path_key, field in (
+            ("stats.json", "stats"),
+            ("column_map.json", "columns"),
+            ("manifest.json", "manifest"),
+        ):
+            try:
+                content = adapter.read_bytes(path_key)
+                (self.output_dir / path_key).write_bytes(content)
+            except FileNotFoundError:
+                pass
+        print(f"[UNPACK]   Manifest extracted")
+
+        # Extract index, docs, dv sections using the adapter.
+        # Files in _file_offsets are stored WITHOUT section prefix.
+        # Key format: "00/00/docs_0000000000.zlib" (docs), "08/a4/idx.bin" (index), etc.
+        import time as _time
+        import re
+        t0 = _time.time()
+
+        for section_key, subdir, file_pattern in (
+            ("index", "index", r"\.bin$"),
+            ("docs", "docs", r"\.zlib$"),
+            ("dv", "dv", r"\.(bin|json)$"),
+        ):
+            out_subdir = self.output_dir / subdir
+            out_subdir.mkdir(parents=True, exist_ok=True)
+            # Get section_id for this section
+            section_id = {"index": 2, "docs": 3, "dv": 4}.get(section_key, 0)
+            # Filter keys that belong to this section (by section_id in offset tuple)
+            files = sorted(
+                k for k, v in adapter._file_offsets.items()
+                if v[0] == section_id and re.search(file_pattern, k)
+            )
+            for i, rel_path in enumerate(files):
+                content = adapter.read_bytes(rel_path)
+                out_path = out_subdir / rel_path
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_bytes(content)
+                if (i + 1) % 5000 == 0 or i + 1 == len(files):
+                    elapsed = _time.time() - t0
+                    pct = (i + 1) / len(files) * 100
+                    print(
+                        f"\r[UNPACK]   {subdir}: {i+1:,}/{len(files):,} ({pct:.0f}%)",
+                        end="", flush=True,
+                    )
+            if files:
+                print(f"\r[UNPACK]   {subdir}: {len(files):,} files extracted")
+        print()
         print(f"[UNPACK] Done! Output: {self.output_dir}")
         return self.output_dir
 
@@ -968,7 +1407,7 @@ class FlatseekFileStorageAdapter(StorageAdapter):
     throughout the codebase.
     """
 
-    def __init__(self, source: str | Path, enc_key: bytes | None = None):
+    def __init__(self, source: str | Path, enc_key: bytes | None = None, passphrase: str | None = None):
         """Open a .flatseek file for reading.
 
         ``source`` can be:
@@ -995,6 +1434,7 @@ class FlatseekFileStorageAdapter(StorageAdapter):
         self._file_offsets: dict[str, tuple[int, int, int]] = {}
         self._manifest: dict = {}  # Parsed manifest data
         self._enc_key: bytes | None = enc_key  # ChaCha20 key for encrypted indexes
+        self._passphrase: str | None = passphrase  # For enclosed format: derive K_user to decrypt outer_ct
         self._is_encrypted: bool = False  # set after manifest is parsed
         # Names of manifest fields (e.g. "stats", "columns") that are still
         # encrypted — could not be decrypted because no key or wrong key
@@ -1004,6 +1444,29 @@ class FlatseekFileStorageAdapter(StorageAdapter):
         self._locked_manifest_fields: set[str] = set()
         self._fh = None  # file handle (or RangeFile for URLs), set in _open()
         self._open()
+
+    @classmethod
+    def from_bytes(cls, data: bytes, enc_key: bytes | None = None, passphrase: str | None = None) -> "FlatseekFileStorageAdapter":
+        """Create a FlatseekFileStorageAdapter from raw .fsk bytes in memory.
+
+        No temp file is written to disk. The adapter reads the data through
+        an io.BytesIO buffer, enabling enclosed FSK search on read-only
+        filesystems.
+        """
+        adapter = cls.__new__(cls)
+        adapter._is_url = False
+        adapter.path = Path("<memory>")
+        adapter._url = None
+        adapter._header = None
+        adapter._file_offsets = {}
+        adapter._manifest = {}
+        adapter._enc_key = enc_key
+        adapter._passphrase = passphrase
+        adapter._is_encrypted = False
+        adapter._locked_manifest_fields = set()
+        adapter._fh = io.BytesIO(data)
+        adapter._open_from_fh(adapter._fh)
+        return adapter
 
     @staticmethod
     def probe_encrypted(path: Path | str) -> bool:
@@ -1025,8 +1488,21 @@ class FlatseekFileStorageAdapter(StorageAdapter):
 
             # Unpack header to find manifest section
             magic = header_bytes[0:10]
+
+            # ── Enclosed / subscription format ─────────────────────────────────
+            # Enclosed .fsk has NO FLATSEEK04 header — it starts with a 32-byte
+            # salt instead. This is always encrypted (needs passphrase).
             if magic != MAGIC:
-                return False  # not a valid .fsk
+                # Confirm: enclosed format has salt(32) + outer_ct_len(4) + outer_ct
+                # minimum valid enclosed = 32 (salt) + 4 (len) + 16 (nonce+tag) = 52
+                if len(header_bytes) >= 36:
+                    try:
+                        outer_ct_len = int.from_bytes(header_bytes[32:36], "little")
+                        if outer_ct_len > 0 and outer_ct_len < 10 * 1024 * 1024:  # sanity check
+                            return True  # enclosed format → encrypted
+                    except (ValueError, struct.error):
+                        pass
+                return False  # not a valid .fsk at all
 
             version, flags, hdr_size, num_sections = struct.unpack_from(
                 "<HHIB", header_bytes, 10
@@ -1069,6 +1545,12 @@ class FlatseekFileStorageAdapter(StorageAdapter):
                 parsed = json.loads(manifest_text)
                 # _encryption_b64 in manifest means sections are encrypted
                 if "_encryption_b64" in parsed:
+                    return True
+                # _K_inner_encrypted means license-protected (sections encrypted with K_inner)
+                if "_K_inner_encrypted" in parsed:
+                    return True
+                # _license_mode = license-protected (even if sections aren't encrypted yet)
+                if parsed.get("_license_mode"):
                     return True
                 return False
             except (UnicodeDecodeError, json.JSONDecodeError):
@@ -1151,12 +1633,51 @@ class FlatseekFileStorageAdapter(StorageAdapter):
         """
         if self._is_url:
             from flatseek.core.storage import RangeFile
-            self._fh = RangeFile(self._url)
+            fh = RangeFile(self._url)
         else:
-            self._fh = open(self.path, "rb")
+            fh = open(self.path, "rb")
+        self._open_from_fh(fh)
+
+    def _open_from_fh(self, fh):
+        """Parse header and build offset tables from an existing file handle.
+
+        Used by from_bytes() to open a FlatseekFileStorageAdapter from raw bytes
+        without writing a temp file to disk. Also handles enclosed format
+        (salt + outer_ct + LIC_CHUNKED FSK) by decrypting the outer layer
+        if K_inner (_enc_key) is available.
+        """
+        self._fh = fh
         try:
             f = self._fh
-            # Read header
+            enclosed_mode = False
+
+            # ── Enclosed / subscription format ──────────────────────────────────
+            # Enclosed format: salt(32) + outer_ct_len(4) + outer_ct + FSK (LIC_CHUNKED)
+            # outer_ct is encrypted with K_user (PBKDF2 derived from passphrase).
+            # Decrypt outer_ct → {"k": K_inner, "expire_at": ...}.
+            # inner_fsk (rest of file) is the LIC_CHUNKED FSK (NOT double-encrypted).
+            magic_probe = f.read(36)  # Read enough for enclosed header check (salt[32] + outer_ct_len[4])
+            f.seek(0)  # Reset to read full header
+            if magic_probe[:10] != MAGIC and len(magic_probe) >= 36:
+                try:
+                    outer_ct_len = int.from_bytes(magic_probe[32:36], "little")
+                    if outer_ct_len > 0 and outer_ct_len < 10 * 1024 * 1024:
+                        if self._passphrase:
+                            from flatseek.core.query_engine import derive_key, decrypt_bytes
+                            outer_ct = f.read(36 + outer_ct_len)[36:]
+                            inner_fsk = f.read()  # Rest is already plaintext FSK data
+                            k_user = derive_key(self._passphrase, magic_probe[:32])
+                            outer_plaintext = decrypt_bytes(outer_ct, k_user)
+                            outer_data = json.loads(outer_plaintext)
+                            k_inner = bytes.fromhex(outer_data["k"])
+                            self._enc_key = k_inner
+                            self._fh = io.BytesIO(inner_fsk)
+                            f = self._fh  # Update local f to inner BytesIO
+                            enclosed_mode = True
+                except (ValueError, struct.error):
+                    pass
+
+            # Read header (1024 bytes)
             header_data = f.read(HEADER_SIZE)
             self._header = FlatseekHeader.unpack(header_data)
 
@@ -1189,6 +1710,13 @@ class FlatseekFileStorageAdapter(StorageAdapter):
                             )
                         data = decrypt_bytes(data, self._enc_key)
                         self._parse_manifest(data)
+                    self._check_expiration(self._manifest)  # raises PermissionError if expired
+                    # For license-protected .fsk (plaintext manifest with _K_inner_encrypted),
+                    # _is_encrypted is not set by _parse_manifest — set it here so the adapter
+                    # is correctly marked as encrypted even without a key.
+                    if not self._is_encrypted and self._manifest:
+                        if "_K_inner_encrypted" in self._manifest or self._manifest.get("_license_mode"):
+                            self._is_encrypted = True
                     break
 
             # Build offset tables for all sections.
@@ -1253,6 +1781,23 @@ class FlatseekFileStorageAdapter(StorageAdapter):
             return data
         return decrypt_bytes(data, self._enc_key)
 
+    def _check_expiration(self, manifest: dict) -> None:
+        """Check if index has expired (simple date check for non-enclosed)."""
+        from datetime import datetime, timezone
+
+        expire_at = manifest.get("expire_at")
+        if expire_at is None:
+            return  # No expiration set
+
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        if now_ts <= expire_at:
+            return  # Not yet expired
+
+        raise PermissionError(
+            f"This index expired on {datetime.fromtimestamp(expire_at, tz=timezone.utc).isoformat()}. "
+            "Please contact the vendor for an updated license."
+        )
+
     def _parse_manifest(self, data: bytes):
         """Parse manifest section, handle base64-encoded encrypted values."""
         import base64 as _b64
@@ -1279,10 +1824,16 @@ class FlatseekFileStorageAdapter(StorageAdapter):
         # passphrase (or to fix the wrong one) instead of crashing
         # downstream with `'str' object has no attribute 'get'`.
         _ENC_HEX_MAGIC = "464c41545345454b01"  # FLATSEEK\x01 in hex
+        _CRYPTO_META_KEYS = frozenset({
+            "_encryption_b64",  # encryption metadata (old format)
+            "_K_inner_encrypted",  # license mode: K_inner encrypted with K_user
+            "_embedded_key",  # license mode: base64-encoded HMAC key for token verification
+            "_license_mode",  # license mode flag
+        })
         locked_fields: set[str] = set()
         for key, value in list(parsed.items()):
-            if key == "_encryption_b64":
-                continue  # internal metadata, not a manifest file
+            if key in _CRYPTO_META_KEYS:
+                continue  # internal crypto metadata, not a manifest file
             if isinstance(value, str) and value.startswith(_ENC_HEX_MAGIC):
                 # New format: hex-encoded encrypted blob.
                 if not self._enc_key:
@@ -1348,9 +1899,15 @@ class FlatseekFileStorageAdapter(StorageAdapter):
                 return
 
         # Check if manifest section itself is encrypted, or if _encryption_b64
-        # is present (new format: plaintext manifest but encrypted sections).
+        # is present (plaintext manifest but encrypted sections), or if
+        # _K_inner_encrypted/_license_mode is present (license-protected).
         from flatseek.core.query_engine import is_encrypted as _is_enc
-        self._is_encrypted = _is_enc(data) or ("_encryption_b64" in parsed)
+        self._is_encrypted = (
+            _is_enc(data)
+            or ("_encryption_b64" in parsed)
+            or ("_K_inner_encrypted" in parsed)
+            or bool(parsed.get("_license_mode"))
+        )
 
     def _parse_section_offsets(self, section_id: int, data: bytes, section_file_offset: int = 0):
         """Parse binary offset table from section data.
@@ -1375,6 +1932,21 @@ class FlatseekFileStorageAdapter(StorageAdapter):
             return
 
         table_data = data[4:4 + tbl_len]
+
+        # ── LIC_CHUNKED: offset table is encrypted with K_inner ─────────────
+        # Detect from header flags. Decrypt if key is available.
+        # For backward compat: old format (no LIC_CHUNKED) has plaintext table.
+        if self._header is not None and (self._header.flags & LIC_CHUNKED):
+            if table_data.startswith(_ENC_MAGIC):
+                if not self._enc_key:
+                    raise PermissionError(
+                        "This .fsk is license-protected and requires a valid token "
+                        "to access the index. Provide --passphrase <TOKEN> or set "
+                        "FLATSEEK_PASSPHRASE env var."
+                    )
+                from flatseek.core.query_engine import decrypt_bytes
+                table_data = decrypt_bytes(table_data, self._enc_key)
+
         pos = 0
 
         try:

@@ -68,34 +68,38 @@ class TestIndexManagerEncryption:
                     assert manager.is_encrypted("nonexistent") is False
 
     def test_is_encrypted_bucket_url_via_storage(self):
-        """Test is_encrypted for bucket URL checks remote storage."""
+        """Test is_encrypted for HF dataset URL raises PermissionError when layout is private."""
         manager = IndexManager()
 
         bucket = "https://huggingface.co/datasets/owner/repo"
 
-        # Mock storage adapter
+        # Mock storage adapter (not actually used — HF API is checked first)
         mock_storage = MagicMock()
         mock_storage.read_bytes.side_effect = FileNotFoundError("not found")
         manager._bucket_storage[bucket] = mock_storage
 
-        # Should return False when file not found
-        assert manager.is_encrypted("some-index", bucket) is False
+        # HF API returns 401 for fake repo → layout "private" → raises PermissionError
+        with pytest.raises(PermissionError):
+            manager.is_encrypted("some-index", bucket)
 
     def test_is_encrypted_bucket_url_with_file(self):
-        """Test is_encrypted for bucket URL when file exists."""
+        """Test is_encrypted for bucket URL when HF layout is non-private."""
         manager = IndexManager()
 
         bucket = "https://huggingface.co/datasets/owner/repo"
 
-        # Mock storage adapter that returns content
-        mock_storage = MagicMock()
-        mock_storage.read_bytes.return_value = json.dumps({
-            "salt": "abc123",
-            "algorithm": "ChaCha20-Poly1305"
-        }).encode()
-        manager._bucket_storage[bucket] = mock_storage
-
-        assert manager.is_encrypted("some-index", bucket) is True
+        # Mock HF layout detection to return "dir" (not private)
+        # so it reaches _get_bucket_storage
+        with patch.object(manager, "_detect_hf_layout", return_value="dir"):
+            # Mock _get_bucket_storage to return a mock storage with encryption.json
+            mock_storage = MagicMock()
+            mock_storage.read_bytes.return_value = json.dumps({
+                "salt": "abc123",
+                "algorithm": "ChaCha20-Poly1305"
+            }).encode()
+            with patch.object(manager, "_get_bucket_storage", return_value=mock_storage):
+                # Layout is "dir" → reads encryption.json → is encrypted
+                assert manager.is_encrypted("some-index", bucket) is True
 
 
 class TestFLATSEEKVerifyConstant:

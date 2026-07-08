@@ -203,4 +203,4 @@ async def aggregate_get(
             body["aggs"] = json.loads(aggs)
         except Exception:
             raise HTTPException(400, "Invalid aggs JSON")
-    return await aggregate(index, body, request, bucket=None, manager=manager)
+    return await aggregate(index, body, request, bucket=bucket, manager=manager)

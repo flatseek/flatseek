@@ -279,9 +279,11 @@ async def redirect_dashboard():
 from flatseek.api.routes.index import router as index_router
 from flatseek.api.routes.search import router as search_router
 from flatseek.api.routes.aggregate import router as aggregate_router
+from flatseek.api.routes.documents import router as documents_router
 app.include_router(index_router)
 app.include_router(search_router)
 app.include_router(aggregate_router)
+app.include_router(documents_router)
 
 
 # ─── Root ───────────────────────────────────────────────────────────────

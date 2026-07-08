@@ -70,6 +70,8 @@ class IndexStats(BaseModel):
     encrypted: bool = Field(..., example=False)
     columns: dict
     in_upload: bool = Field(..., example=False)
+    description: str | None = Field(None, example="Solana blockchain transactions index")
+    license_expire: str | None = Field(None, example="2025-12-31 23:59:59 UTC")
 
     class Config:
         populate_by_name = True
@@ -1428,8 +1430,164 @@ async def authenticate_index(
 
     # For bucket URLs, read encryption.json from remote storage
     if bucket:
-        storage = manager._get_bucket_storage(bucket)
-        logger.warning(f"[auth] bucket={bucket} storage={storage}")
+        # For HF dataset repos: distinguish dir-style vs fsk-style BEFORE calling
+        # _get_bucket_storage. Calling _get_bucket_storage for HF repos causes it to
+        # try FlatseekFileStorageAdapter(fsk_url) without passphrase → PermissionError.
+        is_hf_ds = "huggingface.co" in bucket.lower() and "/datasets/" in bucket.lower()
+        if is_hf_ds:
+            # HF dataset repo: check if this is a fsk-style index (pure .fsk repo)
+            # vs dir-style (has stats.json/index/ subdirs). Use HF API to detect.
+            import httpx as _httpx
+            try:
+                parts = bucket.rstrip("/").split("/")
+                hf_idx = parts.index("huggingface.co")
+                owner = parts[hf_idx + 2]
+                repo = parts[hf_idx + 3]
+                api_url = f"https://huggingface.co/api/datasets/{owner}/{repo}/tree/main"
+                resp = _httpx.get(api_url, timeout=30.0)
+                if resp.status_code == 401:
+                    raise HTTPException(401, "Authentication required for this dataset")
+                if resp.status_code == 200:
+                    files = resp.json()
+                    root_files = {f["path"] for f in files if f.get("type") == "file"}
+                    if f"{index}.fsk" in root_files:
+                        # Fsk-style: read manifest via HTTP Range, verify token, derive K_inner.
+                        # This avoids trying to open the full FSK (which fails for license
+                        # format without proper token verification).
+                        fsk_url = f"{bucket.rstrip('/')}/resolve/main/{index}.fsk"
+                        from flatseek.core.query_engine import verify_license_token, decrypt_bytes, derive_key
+                        import struct as _struct
+                        try:
+                            # Read header + manifest section via HTTP Range
+                            # Header is 1024 bytes. Manifest section descriptor is at offset 64.
+                            # We'll read a larger range to get both.
+                            import httpx
+                            with httpx.Client(timeout=60.0) as client:
+                                # Read header (1024 bytes) to find manifest offset/size
+                                hdr_resp = client.get(fsk_url, headers={"Range": "bytes=0-1023"}, follow_redirects=True)
+                                if hdr_resp.status_code not in (200, 206):
+                                    return {"authenticated": False, "index": index, "error": f"Failed to read .fsk header: {hdr_resp.status_code}"}
+                                hdr_data = hdr_resp.content
+
+                                magic = hdr_data[:10]
+                                SID_MANIFEST = 0x01
+                                if magic != b'FLATSEEK04':
+                                    # Enclosed format: salt(32) + outer_ct_len(4) + outer_ct + inner FSK.
+                                    # The .fsk is NOT corrupted — it's just enclosed/encrypted.
+                                    if len(hdr_data) < 36:
+                                        return {"authenticated": False, "index": index, "error": "Invalid .fsk file (too short)"}
+                                    outer_ct_len = _struct.unpack_from("<I", hdr_data, 32)[0]
+                                    if outer_ct_len <= 0 or outer_ct_len > 10 * 1024 * 1024:
+                                        return {"authenticated": False, "index": index, "error": "Invalid .fsk file"}
+                                    # Enclosed: passphrase → derive K_user → decrypt outer_ct → get K_inner
+                                    try:
+                                        from flatseek.core.query_engine import derive_key, decrypt_bytes
+                                        salt = hdr_data[:32]
+                                        outer_ct = hdr_data[36:36 + outer_ct_len]
+                                        k_user = derive_key(passphrase, salt)
+                                        outer_plaintext = decrypt_bytes(outer_ct, k_user)
+                                        outer_data = json.loads(outer_plaintext)
+                                        k_inner = bytes.fromhex(outer_data["k"])
+                                        expire_ts = outer_data.get("expire_at", 0)
+                                        if expire_ts > 0:
+                                            import datetime
+                                            now_ts = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+                                            if now_ts > expire_ts:
+                                                return {"authenticated": False, "index": index,
+                                                        "error": f"Enclosed index expired on {datetime.datetime.fromtimestamp(expire_ts, tz=datetime.timezone.utc).strftime('%Y-%m-%d')}"}
+                                        # Success: store K_inner for enclosed format
+                                        manager._enc_keys[index] = k_inner
+                                        manager._enc_passphrases[index] = passphrase
+                                        return {"authenticated": True, "index": index}
+                                    except Exception as auth_err:
+                                        logger.warning(f"[auth] enclosed FSK auth failed for {index}: {auth_err}")
+                                        return {"authenticated": False, "index": index, "error": "Invalid passphrase"}
+
+                                version, flags, hdr_size, num_sections = _struct.unpack_from("<HHIB", hdr_data, 10)
+                                SID_MANIFEST = 0x01
+                                manifest_offset = None
+                                manifest_size = None
+                                for i in range(num_sections):
+                                    off = 64 + i * 50
+                                    sid = hdr_data[off]
+                                    if sid != SID_MANIFEST:
+                                        continue
+                                    manifest_offset = _struct.unpack_from("<Q", hdr_data, off + 2)[0]
+                                    manifest_size = _struct.unpack_from("<Q", hdr_data, off + 10)[0]
+                                    break
+
+                                if manifest_offset is None or manifest_size == 0:
+                                    return {"authenticated": False, "index": index, "error": "Manifest not found in .fsk"}
+
+                                # Read manifest bytes
+                                manifest_resp = client.get(
+                                    fsk_url,
+                                    headers={"Range": f"bytes={manifest_offset}-{manifest_offset + manifest_size - 1}"},
+                                    follow_redirects=True
+                                )
+                                manifest_bytes = manifest_resp.content
+
+                                if manifest_bytes.startswith(b'FLATSEEK\x01'):
+                                    return {"authenticated": False, "index": index, "error": "Manifest is encrypted — need key not token"}
+
+                                manifest = json.loads(manifest_bytes.decode("utf-8"))
+                                if "_K_inner_encrypted" in manifest:
+                                    # License mode: verify token, derive K_inner
+                                    try:
+                                        id_str, expire_ts, export_limit = verify_license_token(passphrase, manifest)
+                                    except PermissionError as e:
+                                        return {"authenticated": False, "index": index, "error": str(e)}
+                                    except Exception:
+                                        return {"authenticated": False, "index": index, "error": "Invalid token"}
+
+                                    import hmac, hashlib, base64 as _b64
+                                    embedded_b64 = manifest["_embedded_key"]
+                                    embedded_key = _b64.b64decode(embedded_b64)
+                                    K_user = hmac.new(embedded_key, b"flatseek-license-v1", hashlib.sha256).digest()
+                                    K_inner_encrypted_hex = manifest["_K_inner_encrypted"]
+                                    K_inner_encrypted = bytes.fromhex(K_inner_encrypted_hex)
+                                    try:
+                                        K_inner_plaintext = decrypt_bytes(K_inner_encrypted, K_user)
+                                        K_inner_data = json.loads(K_inner_plaintext)
+                                        key = bytes.fromhex(K_inner_data["k"])
+                                    except Exception:
+                                        return {"authenticated": False, "index": index, "error": "Failed to decrypt license key"}
+
+                                    manager._enc_keys[index] = key
+                                    manager._enc_passphrases[index] = passphrase
+                                    return {"authenticated": True, "index": index}
+                                elif manifest.get("_encryption_b64"):
+                                    # Enclosed or standard encrypted format
+                                    from flatseek.flatseek_file import FlatseekFileStorageAdapter
+                                    try:
+                                        fsk_adapter = FlatseekFileStorageAdapter(fsk_url, passphrase=passphrase)
+                                        enc_key = getattr(fsk_adapter, "_enc_key", None)
+                                        if enc_key:
+                                            manager._enc_keys[index] = enc_key
+                                            manager._enc_passphrases[index] = passphrase
+                                        return {"authenticated": True, "index": index}
+                                    except Exception as auth_err:
+                                        logger.warning(f"[auth] FSK enclosed auth failed for {index}: {auth_err}")
+                                        return {"authenticated": False, "index": index, "error": "Invalid passphrase or token"}
+                                else:
+                                    return {"authenticated": False, "index": index, "error": "Index is not encrypted"}
+                        except Exception as auth_err:
+                            logger.warning(f"[auth] HF FSK auth failed for {index}: {auth_err}")
+                            return {"authenticated": False, "index": index, "error": "Invalid passphrase or token"}
+                    # Else: dir-style — fall through to _get_bucket_storage + encryption.json
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.warning(f"[auth] HF API probe failed for {bucket}: {e}")
+
+        # Dir-style HF repo or non-HF bucket: use _get_bucket_storage + encryption.json
+        try:
+            storage = manager._get_bucket_storage(bucket, index)
+            logger.warning(f"[auth] bucket={bucket} storage={storage}")
+        except PermissionError:
+            raise HTTPException(401, "Authentication required for this index")
+        except FileNotFoundError:
+            raise HTTPException(404, f"Index '{index}' not found in bucket")
         try:
             enc_data = storage.read_bytes("encryption.json")
             logger.warning(f"[auth] read encryption.json, len={len(enc_data)}")
@@ -1492,6 +1650,50 @@ async def authenticate_index(
                 if len(header_bytes) < HEADER_SIZE:
                     return {"authenticated": False, "index": index}
 
+                # ── Enclosed / subscription format (no FLATSEEK04 header) ─────────
+                # Enclosed .fsk starts with a 32-byte salt, NOT FLATSEEK04.
+                # Check: if no FLATSEEK04 magic, verify enclosed format signature.
+                if header_bytes[:10] != b"FLATSEEK04":
+                    # Enclosed format: salt(32) + outer_ct_len(4) + outer_ct + FSK data
+                    # Minimum valid enclosed = 36 bytes
+                    if len(header_bytes) >= 36:
+                        try:
+                            outer_ct_len = int.from_bytes(header_bytes[32:36], "little")
+                            if outer_ct_len > 0 and outer_ct_len < 10 * 1024 * 1024:
+                                # Confirmed enclosed format — derive K_user via PBKDF2, decrypt outer_ct
+                                from flatseek.core.query_engine import derive_key, decrypt_bytes
+                                from datetime import datetime, timezone
+                                try:
+                                    salt = header_bytes[:32]
+                                    # Need full header for outer_ct — read from file directly
+                                    f.seek(0)
+                                    full_header = f.read(36 + outer_ct_len)
+                                    outer_ct = full_header[36:36 + outer_ct_len]
+
+                                    k_user = derive_key(passphrase, salt)
+                                    outer_plaintext = decrypt_bytes(outer_ct, k_user)
+                                    outer_data = json.loads(outer_plaintext)
+                                    key = bytes.fromhex(outer_data["k"])
+
+                                    # Check expiration
+                                    expire_ts = outer_data.get("expire_at", 0)
+                                    if expire_ts > 0:
+                                        now_ts = int(datetime.now(timezone.utc).timestamp())
+                                        if now_ts > expire_ts:
+                                            return {"authenticated": False, "index": index,
+                                                    "error": f"Enclosed index expired on {datetime.fromtimestamp(expire_ts, tz=timezone.utc).isoformat()}"}
+
+                                    manager._enc_keys[index] = key
+                                    manager._enc_passphrases[index] = passphrase
+                                    return {"authenticated": True, "index": index,
+                                            "note": "Enclosed index authenticated."}
+                                except Exception as e:
+                                    logger.warning(f"[auth] enclosed decrypt failed for {index}: {e}")
+                                    return {"authenticated": False, "index": index,
+                                            "error": "Invalid passphrase for enclosed index"}
+                        except (ValueError, struct.error):
+                            pass  # Not enclosed format, fall through to normal handling
+
                 # Find manifest section descriptor
                 manifest_offset = None
                 manifest_size = None
@@ -1525,6 +1727,39 @@ async def authenticate_index(
                 if enc_b64:
                     import base64 as _b64
                     enc_meta = json.loads(_b64.b64decode(enc_b64).decode("utf-8"))
+                elif parsed.get("_K_inner_encrypted"):
+                    # ── License mode: verify token, then derive K_inner ─────────────
+                    # verify_license_token checks token against _embedded_key and returns
+                    # (id, expire_ts, export_limit). On success, derive K_user and decrypt
+                    # _K_inner_encrypted → K_inner.
+                    from flatseek.core.query_engine import verify_license_token, decrypt_bytes, derive_key
+                    import hmac, hashlib, base64 as _b64
+                    try:
+                        id_str, expire_ts, export_limit = verify_license_token(passphrase, parsed)
+                    except PermissionError as e:
+                        return {"authenticated": False, "index": index, "error": str(e)}
+                    except Exception:
+                        return {"authenticated": False, "index": index, "error": "Invalid token"}
+
+                    # Derive K_user = HMAC(embedded_key, "flatseek-license-v1")
+                    embedded_b64 = parsed["_embedded_key"]
+                    embedded_key = _b64.b64decode(embedded_b64)
+                    K_user = hmac.new(embedded_key, b"flatseek-license-v1", hashlib.sha256).digest()
+
+                    # Decrypt _K_inner_encrypted → K_inner
+                    K_inner_encrypted_hex = parsed["_K_inner_encrypted"]
+                    K_inner_encrypted = bytes.fromhex(K_inner_encrypted_hex)
+                    try:
+                        K_inner_plaintext = decrypt_bytes(K_inner_encrypted, K_user)
+                        import json as _json
+                        K_inner_data = _json.loads(K_inner_plaintext)
+                        key = bytes.fromhex(K_inner_data["k"])
+                    except Exception:
+                        return {"authenticated": False, "index": index, "error": "Failed to decrypt license key"}
+
+                    manager._enc_keys[index] = key
+                    return {"authenticated": True, "index": index}
+
         except Exception as e:
             logger.warning(f"[auth] failed to read manifest for {index}: {e}")
 
@@ -1713,14 +1948,18 @@ async def get_mapping(
     encrypted = manager.is_encrypted(index, bucket)
     if encrypted:
         stored_pass = request.headers.get("x-index-password") if request else None
-        if not stored_pass:
+        already_authed = manager._enc_keys.get(index) is not None
+        if not stored_pass and not already_authed:
             raise HTTPException(
                 403,
-                f"Index '{index}' is encrypted. Passphrase required via X-Index-Password header."
+                f"Index '{index}' is encrypted. Submit password via POST /{index}/_authenticate or pass X-Index-Password header."
             )
 
     try:
         engine = manager.get_engine(index, bucket_url=bucket)
+    except PermissionError as e:
+        # Encrypted/locked index — return 401 so client knows passphrase is needed
+        raise HTTPException(401, str(e)) from e
     except Exception as e:
         raise HTTPException(404, f"Index not found: {index}") from e
 
@@ -1731,7 +1970,7 @@ async def get_mapping(
             from flatseek.core.query_engine import load_encryption_key
             from flatseek.flatseek_file import FlatseekFileStorageAdapter
             if bucket:
-                storage = manager._get_bucket_storage(bucket)
+                storage = manager._get_bucket_storage(bucket, index)
                 enc_data = storage.read_bytes("encryption.json")
                 meta = json.loads(enc_data)
                 key = load_encryption_key(None, stored_pass, meta)
@@ -1745,6 +1984,7 @@ async def get_mapping(
                 SECT_DESC_SIZE = 50
                 SID_MANIFEST = 0x01
                 enc_meta = None
+                manifest_expire = None
                 try:
                     with fsk_path.open("rb") as f:
                         header = f.read(HEADER_SIZE)
@@ -1766,12 +2006,27 @@ async def get_mapping(
                             if enc_b64:
                                 import base64 as _b64
                                 enc_meta = json.loads(_b64.b64decode(enc_b64).decode("utf-8"))
+                            # Extract expire_at for license_expire display
+                            manifest_expire = parsed.get("expire_at")
+                            if manifest_expire:
+                                from datetime import datetime, timezone
+                                try:
+                                    exp_dt = datetime.fromtimestamp(int(manifest_expire), tz=timezone.utc)
+                                    license_expire_str = exp_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+                                except (ValueError, TypeError):
+                                    pass
                             break
                 except Exception:
                     pass
-                if enc_meta is None:
+                # Use already-stored session key if available (handles both _encryption_b64
+                # and _K_inner_encrypted/license mode where _authenticate already derived the key).
+                # Only raise 401 if we have no stored key AND no enc_meta to derive from.
+                if already_authed and not stored_pass:
+                    key = manager._enc_keys[index]
+                elif enc_meta is None:
                     raise HTTPException(401, "Invalid passphrase for encrypted index")
-                key = load_encryption_key(None, stored_pass, meta=enc_meta)
+                else:
+                    key = load_encryption_key(None, stored_pass, meta=enc_meta)
                 engine.set_key(key)
             else:
                 index_dir = os.path.join(manager.data_dir, index)
@@ -1826,18 +2081,28 @@ async def get_stats(
     bucket: str | None = Query(None, description="URL storage bucket for remote indexes"),
 ):
     """Get index statistics: document count, size, columns, encryption status."""
+    license_expire_str = None  # license expiration from manifest
     # BLOCK unauthenticated access to encrypted buckets — metadata must not leak
-    encrypted = manager.is_encrypted(index, bucket)
+    encrypted = False
+    try:
+        encrypted = manager.is_encrypted(index, bucket)
+    except PermissionError as e:
+        raise HTTPException(403, str(e)) from e
+
     if encrypted:
         stored_pass = request.headers.get("x-index-password") if request else None
-        if not stored_pass:
+        already_authed = manager._enc_keys.get(index) is not None
+        if not stored_pass and not already_authed:
             raise HTTPException(
                 403,
-                f"Index '{index}' is encrypted. Passphrase required via X-Index-Password header."
+                f"Index '{index}' is encrypted. Submit password via POST /{index}/_authenticate or pass X-Index-Password header."
             )
 
     try:
         engine = manager.get_engine(index, bucket_url=bucket)
+    except PermissionError as e:
+        # Encrypted/locked index — return 401 so client knows passphrase is needed
+        raise HTTPException(401, str(e)) from e
     except Exception as e:
         raise HTTPException(404, f"Index not found or cannot load: {e}")
 
@@ -1850,7 +2115,7 @@ async def get_stats(
             from flatseek.core.query_engine import load_encryption_key
             from flatseek.flatseek_file import FlatseekFileStorageAdapter
             if bucket:
-                storage = manager._get_bucket_storage(bucket)
+                storage = manager._get_bucket_storage(bucket, index)
                 enc_data = storage.read_bytes("encryption.json")
                 meta = json.loads(enc_data)
                 key = load_encryption_key(None, stored_pass, meta)
@@ -1864,6 +2129,7 @@ async def get_stats(
                 SECT_DESC_SIZE = 50
                 SID_MANIFEST = 0x01
                 enc_meta = None
+                manifest_expire = None
                 try:
                     with fsk_path.open("rb") as f:
                         header = f.read(HEADER_SIZE)
@@ -1885,12 +2151,27 @@ async def get_stats(
                             if enc_b64:
                                 import base64 as _b64
                                 enc_meta = json.loads(_b64.b64decode(enc_b64).decode("utf-8"))
+                            # Extract expire_at for license_expire display
+                            manifest_expire = parsed.get("expire_at")
+                            if manifest_expire:
+                                from datetime import datetime, timezone
+                                try:
+                                    exp_dt = datetime.fromtimestamp(int(manifest_expire), tz=timezone.utc)
+                                    license_expire_str = exp_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+                                except (ValueError, TypeError):
+                                    pass
                             break
                 except Exception:
                     pass
-                if enc_meta is None:
+                # Use already-stored session key if available (handles both _encryption_b64
+                # and _K_inner_encrypted/license mode where _authenticate already derived the key).
+                # Only raise 401 if we have no stored key AND no enc_meta to derive from.
+                if already_authed and not stored_pass:
+                    key = manager._enc_keys[index]
+                elif enc_meta is None:
                     raise HTTPException(401, "Invalid passphrase for encrypted index")
-                key = load_encryption_key(None, stored_pass, meta=enc_meta)
+                else:
+                    key = load_encryption_key(None, stored_pass, meta=enc_meta)
                 engine.set_key(key)
             else:
                 index_dir = os.path.join(manager.data_dir, index)
@@ -1909,7 +2190,7 @@ async def get_stats(
         await asyncio.to_thread(engine.reload_stats)
         stats = engine.stats
     except Exception as e:
-        # Wrong key / corrupted encrypted stats.json → 401 (not empty data).
+        # Wrong key / corrupted encrypted stats.json → 401 (forbidden).
         # Check InvalidToken before falling through to return minimal stats.
         try:
             from cryptography.fernet import InvalidToken as _IT
@@ -1926,6 +2207,8 @@ async def get_stats(
             "store": {"size_bytes": 0, "index_size_mb": 0, "docs_size_mb": 0},
             "encrypted": manager.is_encrypted(index, bucket),
             "columns": {},
+            "description": None,
+            "license_expire": license_expire_str,
             "in_upload": False,
             "upload": None,
             "encrypt_job": None,
@@ -1963,7 +2246,7 @@ async def get_stats(
         "_index": index,
         "docs": {
             "count": stats.get("total_docs", 0),
-            "deleted": 0,
+            "deleted": getattr(engine, '_tombstones', None) and engine._tombstones.get_deleted_count() or 0,
         },
         "store": {
             "size_bytes": int(total_mb * 1024 * 1024),
@@ -1972,6 +2255,8 @@ async def get_stats(
         },
         "encrypted": manager.is_encrypted(index, bucket),
         "columns": stats.get("columns", {}),
+        "description": stats.get("description"),
+        "license_expire": license_expire_str or stats.get("license_expire"),
         "in_upload": in_upload,
         "upload_interrupted": upload_interrupted,
         "flush_progress": {

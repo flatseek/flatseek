@@ -1201,6 +1201,26 @@ def create_storage_adapter(
             return FlatseekFileStorageAdapter(p)
 
     if config.backend == "local":
+        # Auto-upgrade: if FLATSEEK_STORAGE_URL is set, switch to url backend
+        if config.url:
+            # Fall through to url backend below
+            pass
+        else:
+            return LocalStorageAdapter(base_path=config.base_path)
+    if config.backend in ("local", "url"):
+        # If the URL points at a .fsk archive, use RangeFile-backed
+        # FlatseekFileStorageAdapter (no full download). Otherwise fall
+        # back to URLStorageAdapter (directory mode) for HuggingFace
+        # dataset repos etc.
+        if config.url and config.url.split("?", 1)[0].rstrip("/").endswith(
+                (".fsk", ".flatseek", ".flat")):
+            from flatseek.flatseek_file import FlatseekFileStorageAdapter
+            return FlatseekFileStorageAdapter(config.url)
+        if config.url:
+            return URLStorageAdapter(
+                url=config.url,
+                base_path=config.base_path,
+            )
         return LocalStorageAdapter(base_path=config.base_path)
     elif config.backend == "s3":
         return S3StorageAdapter(

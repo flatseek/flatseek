@@ -212,6 +212,9 @@ def _prompt_columns(path, delimiter):
         elif ans.upper() in _TYPES:
             type_overrides[col] = ans.upper()
             final_cols.append(col)
+        elif ans == "":
+            # Empty input (Enter) → accept detected type as default
+            final_cols.append(col)
         else:
             print(f"  ✗ Unknown input {ans!r}. Valid: type name, SKIP, or →new_name")
             i -= 1; continue
@@ -735,7 +738,10 @@ def cmd_build(args):
                   estimate=getattr(args, "estimate", False),
                   dedup_fields=dedup_fields,
                   daemon=getattr(args, "daemon", False),
-                  storage=storage)
+                  storage=storage,
+                  description=getattr(args, "description", None),
+                  url=getattr(args, "url", None),
+                  id_field=getattr(args, "id_field", None))
 
             # Auto-pack into .flatseek
             from flatseek.flatseek_file import FlatseekPacker
@@ -753,7 +759,10 @@ def cmd_build(args):
           estimate=getattr(args, "estimate", False),
           dedup_fields=dedup_fields,
           daemon=getattr(args, "daemon", False),
-          storage=storage)
+          storage=storage,
+          description=getattr(args, "description", None),
+          url=getattr(args, "url", None),
+          id_field=getattr(args, "id_field", None))
 
 
 def cmd_plan(args):
@@ -764,7 +773,7 @@ def cmd_plan(args):
     plan(csv_src, output_dir, n_workers=args.workers, delimiter=args.sep, columns=columns)
 
 
-def _get_flatseek_enc_key(flatseek_source, args, *, allow_prompt: bool = True) -> bytes | None:
+def _get_flatseek_enc_key(flatseek_source, args, *, allow_prompt: bool = True) -> tuple[bytes | None, dict | None]:
     """Read .flatseek manifest, derive key if passphrase is available.
 
     ``flatseek_source`` can be a local ``Path`` or an HTTP URL string.
@@ -778,7 +787,9 @@ def _get_flatseek_enc_key(flatseek_source, args, *, allow_prompt: bool = True) -
     blocking server startup when a CLI user accidentally runs
     ``flatseek serve`` from a TTY without setting FLATSEEK_PASSPHRASE.
 
-    Returns None when no key source is available. The caller surfaces
+    Returns (key, token_info) tuple. token_info is a dict with license/subscription
+    details when available, or None for plain/old-bucket encryption.
+    Returns (None, None) when no key source is available. The caller surfaces
     the locked-manifest error on actual data access if needed.
     """
     import base64 as _b64
@@ -794,9 +805,19 @@ def _get_flatseek_enc_key(flatseek_source, args, *, allow_prompt: bool = True) -
     if is_url:
         rf = RangeFile(flatseek_source)
         header_data = rf.read(HEADER_SIZE)
+        magic = header_data[:10]
     else:
         with open(flatseek_source, "rb") as f:
-            header_data = f.read(HEADER_SIZE)
+            magic = f.read(10)
+            header_data = magic + f.read(HEADER_SIZE - 10)
+
+    # Enclosed format has no FLATSEEK04 header — it starts with salt bytes.
+    # For enclosed format, derive K_inner via _get_enclosed_key (PBKDF2 path).
+    if magic != b"FLATSEEK04":
+        # Enclosed format: K_inner derived from passphrase + salt in file header.
+        # _resolve_flatseek_passphrase is called inside _get_enclosed_key.
+        return _get_enclosed_key(flatseek_source, args)
+
     header = FlatseekHeader.unpack(header_data)
     for desc in header.sections:
         if desc.section_id == 0x01:  # SID_MANIFEST
@@ -809,30 +830,52 @@ def _get_flatseek_enc_key(flatseek_source, args, *, allow_prompt: bool = True) -
                     data = f.read(desc.size)
             break
     else:
-        return None
+        return None, None
 
     try:
         manifest = _json.loads(data.decode("utf-8"))
     except Exception:
-        return None
+        return None, None
 
     enc_b64 = manifest.get("_encryption_b64")
-    if not enc_b64:
-        return None  # not encrypted
+    license_encrypted = manifest.get("_K_inner_encrypted")  # license mode has this
 
+    if not enc_b64 and not license_encrypted:
+        return None, None  # not encrypted (plain .fsk)
+
+    # For license-protected .fsk, derive K_inner via _get_enclosed_key
+    if license_encrypted:
+        passphrase = _resolve_flatseek_passphrase(args, allow_prompt=allow_prompt)
+        if not passphrase:
+            sys.stderr.write(
+                f"WARNING: {flatseek_source} is license-protected — provide --passphrase to unlock at startup,\n"
+                f"         set FLATSEEK_PASSPHRASE env var, or authenticate via API (Flatlens will prompt).\n"
+            )
+            return None, None
+        try:
+            token_result = _verify_passphrase_token(passphrase, manifest)
+        except PermissionError:
+            # Key mismatch or expired token — treat as "no valid key" so
+            # caller shows a clear "invalid token" error instead of a traceback.
+            return None, None
+        if token_result is None:
+            return None, None
+        # Token verified. Derive K_inner from license mode.
+        K_inner, token_info = _get_enclosed_key(flatseek_source, args, manifest=manifest)
+        return K_inner, token_info
+
+    # Regular encryption passphrase — derive key via PBKDF2
     passphrase = _resolve_flatseek_passphrase(args, allow_prompt=allow_prompt)
     if not passphrase:
-        # No source — don't block. Server (if serving) will surface
-        # is_encrypted=true and Flatlens prompts the client for password.
         sys.stderr.write(
             f"WARNING: {flatseek_source} is encrypted — provide --passphrase to unlock at startup,\n"
             f"         set FLATSEEK_PASSPHRASE env var, or authenticate via API (Flatlens will prompt).\n"
         )
-        return None
-
+        return None, None
     enc_json = _b64.b64decode(enc_b64)
     enc_meta = _json.loads(enc_json.decode("utf-8"))
-    return load_encryption_key(None, passphrase, meta=enc_meta)
+    key = load_encryption_key(None, passphrase, meta=enc_meta)
+    return key, None
 
 
 def _apply_passphrase(qe, args):
@@ -869,6 +912,184 @@ def _apply_passphrase(qe, args):
     key = load_encryption_key(args.data_dir, passphrase)
     qe.set_key(key)
     return key
+
+
+def _get_enclosed_key(flatseek_source, args, manifest: dict | None = None) -> tuple[bytes | None, dict | None]:
+    """Extract K_inner from an enclosed/license .fsk file.
+
+    Two modes:
+
+    LICENSE MODE (manifest has _K_inner_encrypted):
+      - _embedded_key from manifest
+      - Token verified by _verify_passphrase_token (crypto layer)
+      - K_user = HMAC(token, embedded_key) — NOT PBKDF2
+      - Decrypt _K_inner_encrypted with K_user → K_inner
+
+    OLD ENCLOSED MODE (FLATSEEK04 header exists, PBKDF2 derivation):
+      - salt(32) + outer_ct in file
+      - K_user = PBKDF2(passphrase, salt)
+
+    Args:
+        flatseek_source: path or URL to .fsk file
+        args: CLI args with passphrase
+        manifest: pre-read manifest dict (optional, for efficiency)
+
+    Returns (K_inner bytes, token_info dict) on success.
+    token_info = {"id": str, "expire_ts": int, "export_limit": int} for license mode,
+    or {"id": "Enclosed", "expire_ts": int} for enclosed mode.
+    Returns (None, None) if not enclosed / no token.
+    Raises PermissionError on key mismatch or expired.
+    """
+    import base64 as _b64
+    import json as _json
+    import hmac
+    import hashlib
+
+    passphrase = _resolve_flatseek_passphrase(args, allow_prompt=False)
+    if not passphrase:
+        return None, None
+
+    # ── LICENSE MODE: _K_inner_encrypted in manifest ──────────────────────
+    if manifest and manifest.get("_K_inner_encrypted"):
+        embedded_key_bytes = manifest.get("_embedded_key")
+        if not embedded_key_bytes:
+            return None, None
+
+        # embedded_key is base64 in manifest
+        try:
+            embedded_key = _b64.b64decode(embedded_key_bytes)
+        except Exception:
+            return None, None
+
+        # Verify token (crypto layer)
+        try:
+            token_result = _verify_passphrase_token(passphrase, manifest)
+        except PermissionError:
+            raise  # Re-raise permission errors
+        if token_result is None:
+            return None, None
+
+        id_str, expire_ts, export_limit = token_result
+
+        # Derive K_user = HMAC(embedded_key, "flatseek-license-v1") — must match packer
+        K_user = hmac.new(embedded_key, b"flatseek-license-v1", hashlib.sha256).digest()
+
+        # Decrypt _K_inner_encrypted with K_user
+        from flatseek.core.query_engine import decrypt_bytes
+        try:
+            K_inner_encrypted_hex = manifest["_K_inner_encrypted"]
+            K_inner_encrypted = bytes.fromhex(K_inner_encrypted_hex)
+            K_inner_plaintext = decrypt_bytes(K_inner_encrypted, K_user)
+            K_inner_data = _json.loads(K_inner_plaintext)
+            K_inner = bytes.fromhex(K_inner_data["k"])
+            return K_inner, {"id": id_str, "expire_ts": expire_ts, "export_limit": export_limit}
+        except Exception:
+            return None, None
+
+    # ── OLD ENCLOSED MODE: FLATSEEK04 header + PBKDF2 ──────────────────
+    try:
+        if isinstance(flatseek_source, str) and flatseek_source.startswith("http"):
+            from flatseek.core.storage import RangeFile
+            rf = RangeFile(flatseek_source)
+            # Read first 36 bytes: salt(32) + outer_ct_len(4)
+            header = rf.read(36)
+        else:
+            with open(flatseek_source, "rb") as f:
+                header = f.read(36)
+    except Exception:
+        return None, None
+
+    if len(header) < 36:
+        return None, None
+
+    # Check it's not FLATSEEK04 (enclosed has no header)
+    if header[:10] == b"FLATSEEK04":
+        return None, None  # Regular .fsk with FLATSEEK04 header
+
+    salt = header[:32]
+    outer_ct_len = int.from_bytes(header[32:36], "little")
+
+    # Read outer_ct (starts at byte 36)
+    try:
+        if isinstance(flatseek_source, str):
+            from flatseek.core.storage import RangeFile
+            rf = RangeFile(flatseek_source)
+            rf.seek(36)
+            outer_ct = rf.read(outer_ct_len)
+        else:
+            with open(flatseek_source, "rb") as f:
+                f.seek(36)
+                outer_ct = f.read(outer_ct_len)
+    except Exception:
+        return None, None
+
+    # Derive K_user from passphrase and decrypt outer_ct
+    from flatseek.core.query_engine import derive_key, decrypt_bytes
+    try:
+        k_user = derive_key(passphrase, salt)
+        outer_plaintext = decrypt_bytes(outer_ct, k_user)
+        outer_data = _json.loads(outer_plaintext)
+        K_inner = bytes.fromhex(outer_data["k"])
+        expire_ts = outer_data.get("expire_at", 0)
+        return K_inner, {"id": "Enclosed", "expire_ts": expire_ts}
+    except Exception:
+        return None, None
+
+
+def _verify_passphrase_token(passphrase: str, manifest: dict) -> tuple[str, int, int] | None:
+    """Verify a license token using crypto-layer verification.
+
+    This uses the embedded key FROM THE MANIFEST (not from the binary's default).
+    The manifest's _embedded_key determines which key to verify against.
+
+    For license-protected .fsk:
+      - Crypto layer verifies token against manifest's embedded_key
+      - Key mismatch (custom vs default) raises PermissionError with clear message
+      - Expired token raises PermissionError
+      - Returns (id, expire_ts, export_limit) if valid
+
+    For plain .fsk (no _embedded_key):
+      - Returns None — let caller try PBKDF2 decryption path
+
+    Raises PermissionError if:
+      - .fsk is license-protected but binary's key doesn't match manifest's key
+      - Token is expired
+    """
+    from flatseek.core.query_engine import verify_license_token
+
+    try:
+        return verify_license_token(passphrase, manifest)
+    except ValueError:
+        # Not a license-protected .fsk (no _embedded_key in manifest)
+        return None
+    # PermissionError is re-raised (key mismatch or expired)
+
+
+def _print_index_banner(qe, *, license_id=None, license_expire=None):
+    """Print description/url from stats as intro banner if present.
+
+    Also prints license/subscription info when available.
+    """
+    stats = getattr(qe, "stats", {}) or {}
+    description = stats.get("description")
+    url = stats.get("url")
+
+    has_info = description or url or license_id
+    if has_info:
+        print("── Index Info ─────────────────────────────────────────")
+        if description:
+            print(f"  {description}")
+        if url:
+            print(f"  {url}")
+        if license_id:
+            if license_expire:
+                from datetime import datetime, timezone
+                exp_dt = datetime.fromtimestamp(license_expire, tz=timezone.utc)
+                exp_str = exp_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+                print(f"  License : {license_id}  (expires {exp_str})")
+            else:
+                print(f"  License : {license_id}")
+        print()
 
 
 def _resolve_passphrase(args):
@@ -961,9 +1182,133 @@ def cmd_search(args):
         # Read manifest to detect encryption
         # For URL: pass the URL string. For local: pass the Path.
         source = args.data_dir if is_url else data_path
-        enc_key = _get_flatseek_enc_key(source, args)
+
+        # Check for enclosed format (no FLATSEEK04 header)
+        token_info = None
+        if not is_url:
+            with open(source, "rb") as f:
+                magic = f.read(10)
+            if magic != b"FLATSEEK04":
+                # Enclosed format — derive K_inner via _get_enclosed_key
+                # (_get_enclosed_key reads salt from enclosed header, derives K_user via PBKDF2)
+                enc_key, token_info = _get_enclosed_key(source, args)
+                if enc_key is None:
+                    print(
+                        f"Error: {source} is an enclosed/subscription index but no valid\n"
+                        f"       passphrase was provided. Pass --passphrase <PASSPHRASE>",
+                        file=sys.stderr
+                    )
+                    sys.exit(1)
+                is_enclosed = True
+            else:
+                enc_key, token_info = _get_flatseek_enc_key(source, args)
+                is_enclosed = False
+        else:
+            # URL path: probe magic first to detect enclosed format
+            from flatseek.core.storage import RangeFile
+            rf = RangeFile(source)
+            magic = rf.read(10)
+            if magic != b"FLATSEEK04":
+                # Enclosed format — derive K_inner via _get_enclosed_key
+                enc_key, token_info = _get_enclosed_key(source, args)
+                if enc_key is None:
+                    print(
+                        f"Error: {source} is an enclosed/subscription index but no valid\n"
+                        f"       passphrase was provided. Pass --passphrase <PASSPHRASE>",
+                        file=sys.stderr
+                    )
+                    sys.exit(1)
+                is_enclosed = True
+            else:
+                enc_key, token_info = _get_flatseek_enc_key(source, args)
+                is_enclosed = False
+
+        # Handle expired/invalid token — enc_key is None means no valid key.
+        # But first check: if the manifest has no encryption metadata, this is a
+        # plain FSK — just pass enc_key=None and let FlatseekFileStorageAdapter handle it.
+        if not is_enclosed and enc_key is None:
+            # Quick check: is this actually an encrypted FSK?
+            try:
+                from flatseek.flatseek_file import FlatseekHeader, HEADER_SIZE
+                with open(source, "rb") as f:
+                    f.seek(0)
+                    magic = f.read(10)
+                if magic == b"FLATSEEK04":
+                    with open(source, "rb") as f:
+                        hdr = FlatseekHeader.unpack(f.read(HEADER_SIZE))
+                    for desc in hdr.sections:
+                        if desc.section_id == 0x01:
+                            with open(source, "rb") as f:
+                                f.seek(desc.offset)
+                                m_bytes = f.read(desc.size)
+                            import json as _json
+                            m = _json.loads(m_bytes.decode("utf-8"))
+                            if m.get("_K_inner_encrypted") or m.get("_encryption_b64"):
+                                # Encrypted FSK but no valid key — extract expiration
+                                # from manifest for banner display before exiting.
+                                expire_at = m.get("expire_at") or m.get("expire_ts")
+                                if expire_at:
+                                    try:
+                                        from datetime import datetime, timezone
+                                        exp_dt = datetime.fromtimestamp(int(expire_at), tz=timezone.utc)
+                                        exp_str = exp_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+                                        print("── Index Info ─────────────────────────────────────────")
+                                        print(f"  License : (expires {exp_str})")
+                                        print()
+                                    except (ValueError, TypeError):
+                                        pass
+
+                                # Encrypted FSK but no valid key — error
+                                print(
+                                    f"Error: {source} is license-protected and requires a valid token.\n"
+                                    f"       The token is missing, invalid, or expired.",
+                                    file=sys.stderr
+                                )
+                                sys.exit(1)
+                            # Plain FSK — enc_key stays None, proceed normally
+                            break
+            except Exception:
+                pass  # Fall through — let FlatseekFileStorageAdapter handle errors
+
         from flatseek.flatseek_file import FlatseekFileStorageAdapter
-        if is_url:
+        import tempfile as _tempfile
+
+        if is_enclosed and enc_key is not None:
+            # Decrypt enclosed: derive K_user from passphrase, decrypt outer to get K_inner,
+            # FSK data is LIC_CHUNKED (per-section encrypted with K_inner).
+            # Use from_bytes() to open in memory — no temp file needed.
+            try:
+                from flatseek.core.query_engine import derive_key, decrypt_bytes
+                if is_url:
+                    from flatseek.core.storage import RangeFile
+                    rf = RangeFile(source)
+                    data = rf.read()
+                else:
+                    with open(source, "rb") as f:
+                        data = f.read()
+                salt = data[:32]
+                outer_ct_len = int.from_bytes(data[32:36], "little")
+                outer_ct = data[36:36 + outer_ct_len]
+                fsk_data = data[36 + outer_ct_len:]  # LIC_CHUNKED FSK, not encrypted further
+                passphrase = getattr(args, "passphrase", None) or ""
+                k_user = derive_key(passphrase, salt)
+                outer_plaintext = decrypt_bytes(outer_ct, k_user)
+                import json as _json
+                outer_data = _json.loads(outer_plaintext)
+                K_inner = bytes.fromhex(outer_data["k"])
+                expire_ts = outer_data.get("expire_at", 0)
+                from datetime import datetime, timezone
+                now_ts = int(datetime.now(timezone.utc).timestamp())
+                if now_ts > expire_ts:
+                    raise PermissionError("expired")
+                storage = FlatseekFileStorageAdapter.from_bytes(fsk_data, enc_key=K_inner)
+            except PermissionError:
+                print(
+                    f"Error: {source} is expired and cannot be accessed.",
+                    file=sys.stderr
+                )
+                sys.exit(1)
+        elif is_url:
             import itertools, time as _time, threading
             spinner = itertools.cycle(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'])
             stop_spin = [False]
@@ -984,7 +1329,21 @@ def cmd_search(args):
                 sys.stderr.write(f"\r[reading remote index] ✓       \n")
                 sys.stderr.flush()
         else:
-            storage = FlatseekFileStorageAdapter(source, enc_key=enc_key)
+            try:
+                storage = FlatseekFileStorageAdapter(source, enc_key=enc_key)
+            except (PermissionError, ValueError) as e:
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
+            except Exception as e:
+                # cryptography.fernet.InvalidToken — raised by decrypt_bytes on wrong key
+                try:
+                    from cryptography.fernet import InvalidToken as _IT
+                    if isinstance(e, _IT):
+                        print(f"Error: Invalid token or wrong key.", file=sys.stderr)
+                        sys.exit(1)
+                except ImportError:
+                    pass
+                raise  # re-raise anything else
 
         # If the manifest is locked (encrypted + no key / wrong key), the
         # storage adapter returns a placeholder stats so the search can
@@ -1009,11 +1368,21 @@ def cmd_search(args):
         )
         storage = create_storage_adapter(config)
 
-    qe = QueryEngine(args.data_dir, storage=storage)
+    try:
+        qe = QueryEngine(args.data_dir, storage=storage)
+    except FileNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     if enc_key is not None:
         qe.set_key(enc_key)  # key already derived above
     else:
         _apply_passphrase(qe, args)
+
+    _print_index_banner(
+        qe,
+        license_id=token_info["id"] if token_info else None,
+        license_expire=token_info.get("expire_ts") if token_info else None,
+    )
 
     # Build Lucene query string from args.
     # -c / --and are convenience shortcuts converted to Lucene syntax.
@@ -1404,10 +1773,42 @@ def cmd_export(args):
         str(data_path).endswith((".fsk", ".flatseek", ".flat"))
     )
     enc_key = None
+    token_info = None
     storage = None
     if is_flat_file or is_url:
         source = args.data_dir if is_url else data_path
-        enc_key = _get_flatseek_enc_key(source, args)
+
+        # Check for enclosed format (no FLATSEEK04 header)
+        if not is_url:
+            with open(source, "rb") as f:
+                magic = f.read(10)
+            if magic != b"FLATSEEK04":
+                # Enclosed format — derive K_inner via _get_enclosed_key
+                # (_get_enclosed_key reads salt from enclosed header, derives K_user via PBKDF2)
+                enc_key, token_info = _get_enclosed_key(source, args)
+                if enc_key is None:
+                    # Show banner with license info before exiting
+                    if token_info:
+                        from datetime import datetime, timezone
+                        exp_dt = datetime.fromtimestamp(token_info.get("expire_ts", 0), tz=timezone.utc)
+                        exp_str = exp_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+                        print("── Index Info ─────────────────────────────────────────")
+                        print(f"  License : {token_info.get('id', 'Unknown')}  (expires {exp_str})")
+                        print()
+                    print(
+                        f"Error: {source} is an enclosed/subscription index but no valid\n"
+                        f"       passphrase was provided. Pass --passphrase <PASSPHRASE>",
+                        file=sys.stderr
+                    )
+                    sys.exit(1)
+                is_enclosed = True
+            else:
+                enc_key, token_info = _get_flatseek_enc_key(source, args)
+                is_enclosed = False
+        else:
+            enc_key, token_info = _get_flatseek_enc_key(source, args)
+            is_enclosed = False
+
         from flatseek.flatseek_file import FlatseekFileStorageAdapter
         if is_url:
             import itertools, time as _time, threading
@@ -1447,6 +1848,12 @@ def cmd_export(args):
         qe.set_key(enc_key)
     elif not is_flat_file:
         _apply_passphrase(qe, args)
+
+    _print_index_banner(
+        qe,
+        license_id=token_info["id"] if token_info else None,
+        license_expire=token_info.get("expire_ts") if token_info else None,
+    )
 
     # ── Open output target ──
     # Stdout mode: resume is silently disabled (stdout can't be replayed).
@@ -1750,7 +2157,9 @@ def cmd_chat(args):
 
 def cmd_stats(args):
     from flatseek.core.query_engine import QueryEngine
-    print(QueryEngine(args.data_dir).summary())
+    qe = QueryEngine(args.data_dir)
+    _print_index_banner(qe)
+    print(qe.summary())
 
 
 def cmd_dedup(args):
@@ -2694,7 +3103,23 @@ def cmd_verify(args):
     storage = None
     if is_flat_file or is_url:
         source = args.data_dir if is_url else data_path
-        enc_key = _get_flatseek_enc_key(source, args)
+
+        # Check for enclosed format (no FLATSEEK04 header)
+        if not is_url:
+            with open(source, "rb") as f:
+                magic = f.read(10)
+            if magic != b"FLATSEEK04":
+                print(
+                    f"Error: {source} is an enclosed/subscription .fsk file.\n"
+                    f"       'flatseek verify' cannot verify enclosed files directly.\n"
+                    f"       Use 'flatseek unpack --passphrase <TOKEN>' first.",
+                    file=sys.stderr
+                )
+                sys.exit(1)
+            enc_key, _token_info = _get_flatseek_enc_key(source, args)
+        else:
+            enc_key, _token_info = _get_flatseek_enc_key(source, args)
+
         from flatseek.flatseek_file import FlatseekFileStorageAdapter
         if is_url:
             import itertools, time as _time, threading
@@ -3018,7 +3443,36 @@ def cmd_slice(args):
     is_url = isinstance(args.data_dir, str) and args.data_dir.startswith("https://")
     if is_flat_file or is_url:
         source = args.data_dir if is_url else data_path
-        enc_key = _get_flatseek_enc_key(source, args)
+
+        # Block slice on license-protected .fsk
+        if not is_url:
+            try:
+                from flatseek.flatseek_file import FlatseekHeader, HEADER_SIZE
+                with open(source, "rb") as f:
+                    header = FlatseekHeader.unpack(f.read(HEADER_SIZE))
+                    for desc in header.sections:
+                        if desc.section_id == 0x01:
+                            f.seek(desc.offset)
+                            manifest_bytes = f.read(desc.size)
+                            try:
+                                manifest_bytes.decode("utf-8")
+                                import json as _json_license
+                                m = _json_license.loads(manifest_bytes)
+                                if m.get("_K_inner_encrypted"):
+                                    print(
+                                        "Error: cannot slice a license-protected .fsk.\n"
+                                        "License-protected archives cannot be sliced.\n"
+                                        "Access data via 'flatseek serve' or 'flatseek search' instead.",
+                                        file=sys.stderr
+                                    )
+                                    sys.exit(1)
+                            except Exception:
+                                pass
+                            break
+            except Exception:
+                pass
+
+        enc_key, _token_info = _get_flatseek_enc_key(source, args)
         from flatseek.flatseek_file import FlatseekFileStorageAdapter
         if is_url:
             import itertools, time as _time, threading
@@ -3815,6 +4269,276 @@ def cmd_delete(args):
     print(f"Done in {elapsed:.1f}s")
 
 
+# ─── Document-level delete / update / compact ──────────────────────────────
+
+
+def cmd_compact(args):
+    """Reclaim disk space by rewriting the index without deleted documents."""
+    from flatseek.core.compactor import IndexCompactor
+
+    index = args.index
+
+    # Detect .fsk
+    if index.endswith((".fsk", ".flatseek", ".flat")):
+        print("ERROR: Cannot compact packed .fsk. Unpack first: flatseek unpack <file.fsk>")
+        sys.exit(1)
+
+    from flatseek.core.tombstone import TombstoneStore
+    tombstones = TombstoneStore(index)
+
+    deleted_count = tombstones.get_deleted_count()
+    alive_count = tombstones.get_alive_count()
+    total = tombstones.get_total_count()
+
+    if deleted_count == 0:
+        print("No deleted documents to reclaim. Nothing to compact.")
+        return
+
+    print(f"Compacting {index}...")
+    print(f"  Total docs : {total}")
+    print(f"  Alive      : {alive_count}")
+    print(f"  Deleted    : {deleted_count} (will be purged)")
+
+    compact = IndexCompactor(index, tombstones)
+    result = compact.compact()
+
+    saved = result.old_size_mb - result.new_size_mb
+    pct = (saved / result.old_size_mb * 100) if result.old_size_mb > 0 else 0
+    print(f"Compacted: {result.alive_rewritten} alive docs rewritten, {result.deleted_removed} deleted docs purged.")
+    print(f"Size: {result.old_size_mb}MB → {result.new_size_mb}MB (saved {saved:.1f}MB, {pct:.1f}%)")
+
+
+def cmd_delete_doc(args):
+    """Delete documents by ID or Lucene query."""
+    import json
+    from flatseek.core.query_engine import QueryEngine
+    from flatseek.flatseek_file import FlatseekFileStorageAdapter
+
+    index = args.index
+
+    # Detect .fsk
+    is_fsk = index.endswith((".fsk", ".flatseek", ".flat"))
+    if is_fsk:
+        print("ERROR: Cannot delete from packed .fsk. Unpack first: flatseek unpack <file.fsk>")
+        sys.exit(1)
+
+    engine = QueryEngine(index)
+
+    if engine._tombstones is None:
+        print("ERROR: Index does not support delete operations. Only directory indices support this.")
+        sys.exit(1)
+
+    # Get id_field from stats
+    stats_path = os.path.join(index, "stats.json")
+    id_field = None
+    if os.path.exists(stats_path):
+        stats = json.loads(open(stats_path).read())
+        id_field = stats.get("_id_field")
+
+    if args.doc_id:
+        # Delete by natural key
+        if not id_field:
+            print("ERROR: Index was not built without --id-field. Cannot delete by ID.")
+            sys.exit(1)
+
+        existing_doc_id = engine._tombstones.get_doc_id_for_field(id_field, args.doc_id)
+        if existing_doc_id is None:
+            print(f"Document with {id_field}={args.doc_id} not found.")
+            return
+
+        count, conflicts = engine._tombstones.mark_deleted([existing_doc_id])
+        if conflicts:
+            print(f"Concurrent modification detected for doc_id={existing_doc_id}. Retry needed.")
+            sys.exit(1)
+        engine._tombstones.remove_doc_id_for_field(id_field, args.doc_id)
+        print(f"Deleted: {id_field}={args.doc_id} (doc_id={existing_doc_id})")
+
+    elif args.query:
+        # Delete by query
+        result = engine.query(args.query, page=0, page_size=100_000)
+        doc_ids = [doc["_id"] for doc in result.get("results", [])]
+
+        if not doc_ids:
+            print(f"No documents match query: {args.query}")
+            return
+
+        count, conflicts = engine._tombstones.mark_deleted(doc_ids)
+        if conflicts:
+            conflict_ids = [cid for cid, _ in conflicts]
+            print(f"Deleted {count} documents. {len(conflicts)} had concurrent modifications: {conflict_ids}")
+        else:
+            print(f"Deleted {count} documents matching query: {args.query}")
+
+    else:
+        print("ERROR: Provide either --id <value> or --query <lucene_query>")
+        sys.exit(1)
+
+
+def cmd_update_doc(args):
+    """Update documents by ID or Lucene query."""
+    import json
+    from flatseek.core.query_engine import QueryEngine
+    from flatseek.core.builder import IndexBuilder
+    from flatseek.flatseek_file import FlatseekFileStorageAdapter
+
+    index = args.index
+
+    # Detect .fsk
+    is_fsk = index.endswith((".fsk", ".flatseek", ".flat"))
+    if is_fsk:
+        print("ERROR: Cannot update packed .fsk. Unpack first: flatseek unpack <file.fsk>")
+        sys.exit(1)
+
+    engine = QueryEngine(index)
+
+    if engine._tombstones is None:
+        print("ERROR: Index does not support update operations. Only directory indices support this.")
+        sys.exit(1)
+
+    # Get id_field from stats
+    stats_path = os.path.join(index, "stats.json")
+    id_field = None
+    if os.path.exists(stats_path):
+        stats = json.loads(open(stats_path).read())
+        id_field = stats.get("_id_field")
+
+    # Parse --set fields
+    updates = {}
+    if args.fields:
+        for pair in args.fields.split(","):
+            if "=" not in pair:
+                print(f"ERROR: Invalid --set format: {pair}. Use KEY=VALUE")
+                sys.exit(1)
+            k, v = pair.split("=", 1)
+            updates[k.strip()] = v.strip()
+
+    if args.doc_id:
+        # Update by natural key
+        if not id_field:
+            print("ERROR: Index was built without --id-field. Cannot update by ID.")
+            sys.exit(1)
+
+        existing_doc_id = engine._tombstones.get_doc_id_for_field(id_field, args.doc_id)
+        if existing_doc_id is None:
+            print(f"Document with {id_field}={args.doc_id} not found.")
+            return
+
+        # Tombstone old doc
+        engine._tombstones.mark_deleted([existing_doc_id])
+
+        # Get current total_docs
+        total_docs = 0
+        if os.path.exists(stats_path):
+            stats = json.loads(open(stats_path).read())
+            total_docs = stats.get("total_docs", 0)
+
+        # Create builder and add new doc with updated fields
+        builder = IndexBuilder(
+            index,
+            column_map={},
+            start_doc_id=total_docs,
+            dataset=id_field,
+            checkpoint_cb=None,
+            delimiter=",",
+            columns=None,
+            worker_id=None,
+            dedup_fields=None,
+            doc_id_end=None,
+            daemon=True,
+        )
+
+        # Get existing doc to merge
+        existing_doc = None
+        for doc in engine._fetch_docs([existing_doc_id]):
+            existing_doc = doc
+            break
+
+        if existing_doc:
+            # Merge updates into existing doc
+            merged = {k: v for k, v in existing_doc.items() if not k.startswith("_")}
+            merged.update(updates)
+        else:
+            merged = updates
+
+        # Normalize and add
+        normalized = {k: (json.dumps(v) if isinstance(v, (dict, list)) else str(v)) for k, v in merged.items()}
+        builder.add_row(normalized, list(normalized.keys()), file_rel=None, col_schema=None)
+        builder.finalize()
+
+        new_doc_id = total_docs
+
+        # Update ID mapping
+        engine._tombstones.set_doc_id_for_field(id_field, args.doc_id, new_doc_id)
+
+        print(f"Updated: {id_field}={args.doc_id} (old doc_id={existing_doc_id} → new doc_id={new_doc_id})")
+
+    elif args.query:
+        # Update by query
+        if not updates:
+            print("ERROR: --set KEY=VALUE,... required for update by query")
+            sys.exit(1)
+
+        result = engine.query(args.query, page=0, page_size=100_000)
+        docs = result.get("results", [])
+
+        if not docs:
+            print(f"No documents match query: {args.query}")
+            return
+
+        total_docs = 0
+        if os.path.exists(stats_path):
+            stats = json.loads(open(stats_path).read())
+            total_docs = stats.get("total_docs", 0)
+
+        new_doc_ids = []
+        old_doc_ids = []
+
+        for doc in docs:
+            old_doc_id = doc["_id"]
+            old_doc_ids.append(old_doc_id)
+
+            # Merge updates
+            merged = {k: v for k, v in doc.items() if not k.startswith("_")}
+            merged.update(updates)
+
+            # Create builder and add updated doc
+            builder = IndexBuilder(
+                index,
+                column_map={},
+                start_doc_id=total_docs,
+                dataset=id_field or "doc",
+                checkpoint_cb=None,
+                delimiter=",",
+                columns=None,
+                worker_id=None,
+                dedup_fields=None,
+                doc_id_end=None,
+                daemon=True,
+            )
+
+            normalized = {k: (json.dumps(v) if isinstance(v, (dict, list)) else str(v)) for k, v in merged.items()}
+            builder.add_row(normalized, list(normalized.keys()), file_rel=None, col_schema=None)
+            builder.finalize()
+
+            new_doc_ids.append(total_docs)
+
+            # Update ID mapping if natural key exists
+            if id_field and id_field in merged:
+                engine._tombstones.set_doc_id_for_field(id_field, str(merged[id_field]), total_docs)
+
+            total_docs += 1
+
+        # Tombstone old docs
+        engine._tombstones.mark_deleted(old_doc_ids)
+
+        print(f"Updated {len(old_doc_ids)} documents matching query: {args.query}")
+        print(f"New doc_ids: {new_doc_ids}")
+
+    else:
+        print("ERROR: Provide either --id <value> or --query <lucene_query>")
+        sys.exit(1)
+
+
 def cmd_compress(args):
     """Compress all idx.bin files in-place with zlib after a build is complete.
 
@@ -4005,10 +4729,59 @@ def cmd_serve(args):
     if _os.path.isfile(data_dir) and data_dir.endswith((".fsk", ".flatseek", ".flat")):
         _os.environ["FLATSEEK_SINGLE_FILE"] = data_dir
         if not _os.environ.get("FLATSEEK_FSK_KEY"):
-            enc_key = _get_flatseek_enc_key(Path(data_dir), args, allow_prompt=False)
-            if enc_key:
-                import base64 as _b64
-                _os.environ["FLATSEEK_FSK_KEY"] = _b64.b64encode(enc_key).decode("ascii")
+            # Check for enclosed format (no FLATSEEK04 header — starts with salt)
+            with open(data_dir, "rb") as f:
+                magic = f.read(10)
+            if magic != b"FLATSEEK04":
+                # Enclosed format — decrypt and serve directly from memory (no temp file).
+                passphrase = _resolve_flatseek_passphrase(args, allow_prompt=False)
+                if not passphrase:
+                    sys.stderr.write(
+                        f"Enclosed .fsk requires a passphrase token.\n"
+                        f"Pass --passphrase <TOKEN> or set FLATSEEK_PASSPHRASE.\n"
+                    )
+                    sys.exit(1)
+                try:
+                    from flatseek.core.query_engine import derive_key, decrypt_bytes
+                    from datetime import datetime, timezone
+                    import json as _json
+                    import base64 as _b64
+
+                    data = open(data_dir, "rb").read()
+                    salt = data[:32]
+                    outer_ct_len = int.from_bytes(data[32:36], "little")
+                    outer_ct = data[36:36 + outer_ct_len]
+                    inner_ct = data[36 + outer_ct_len:]
+
+                    k_user = derive_key(passphrase, salt)
+                    outer_plaintext = decrypt_bytes(outer_ct, k_user)
+                    outer_data = _json.loads(outer_plaintext)
+                    K_inner = bytes.fromhex(outer_data["k"])
+
+                    # Verify expiry
+                    expire_ts = outer_data.get("expire_at", 0)
+                    now_ts = int(datetime.now(timezone.utc).timestamp())
+                    if now_ts > expire_ts:
+                        sys.stderr.write(
+                            f"Enclosed .fsk expired on "
+                            f"{datetime.fromtimestamp(expire_ts, tz=timezone.utc).strftime('%Y-%m-%d')}.\n"
+                        )
+                        sys.exit(1)
+
+                    # Serve enclosed FSK directly from memory via from_bytes().
+                    # Pass inner_ct + K_inner to API via env vars (no temp file).
+                    _os.environ["FLATSEEK_ENCLOSED_CT"] = _b64.b64encode(inner_ct).decode("ascii")
+                    _os.environ["FLATSEEK_SINGLE_FILE"] = ":enclosed:"
+                    _os.environ["FLATSEEK_FSK_KEY"] = _b64.b64encode(K_inner).decode("ascii")
+                except Exception as e:
+                    sys.stderr.write(f"Failed to decrypt enclosed .fsk: {e}\n")
+                    sys.exit(1)
+            else:
+                # Regular .fsk — derive key via PBKDF2
+                enc_key, _tok_info = _get_flatseek_enc_key(Path(data_dir), args, allow_prompt=False)
+                if enc_key:
+                    import base64 as _b64
+                    _os.environ["FLATSEEK_FSK_KEY"] = _b64.b64encode(enc_key).decode("ascii")
     # Also handle unpacked .fsk directories — if data_dir has encryption.json and --passphrase
     # was provided, derive key and store it so IndexManager.get_engine() can apply it.
     elif _os.path.isdir(data_dir):
@@ -4118,10 +4891,10 @@ def cmd_api(args):
     if _os.path.isfile(data_dir) and data_dir.endswith((".fsk", ".flatseek", ".flat")):
         _os.environ["FLATSEEK_SINGLE_FILE"] = data_dir
         if not _os.environ.get("FLATSEEK_FSK_KEY"):
-            enc_key = _get_flatseek_enc_key(Path(data_dir), args)
+            enc_key, _tok_info = _get_flatseek_enc_key(Path(data_dir), args)
             if enc_key:
                 import base64 as _b64
-                _os.environ["FLATSEEK_FSK_KEY"] = _b64.b64encode(enc_key).decode("ascii")
+                _os.environ["FLATSEEK_FSK_KEY"] = _b64.b64encode(enc_key[0]).decode("ascii")
     _os.environ["FLATSEEK_PORT"] = str(args.port)
     # Do NOT set FLATSEEK_API_BASE — dashboard should not be attached
 
@@ -4260,6 +5033,123 @@ def cmd_generate(args):
     )
 
 
+def cmd_generate_passphrase(args):
+    """Generate a signed passphrase token for subscription distribution.
+
+    Owner runs this monthly to generate a new passphrase for each subscriber.
+    The token is a base64 string: base64(id|expire_ts|export_limit|signature).
+
+    Usage:
+      flatseek generate-passphrase --id "user@email.com" --expire "2026-08-01" --key <hex_key>
+      flatseek generate-passphrase --id "user@email.com" --expire "2026-08-01"  (uses binary default key)
+
+    Output: the passphrase token string to share with the user.
+    """
+    import base64 as _b64
+    from datetime import datetime, timezone
+
+    # Parse key — falls back to binary default embedded key
+    from flatseek.core.query_engine import get_embedded_license_key
+    if args.key:
+        try:
+            key = bytes.fromhex(args.key)
+        except ValueError:
+            print("Error: --key must be a 32-byte hex string (64 hex chars).")
+            sys.exit(1)
+        if len(key) != 32:
+            print(f"Error: --key must be 32 bytes, got {len(key)} bytes.")
+            sys.exit(1)
+    else:
+        key = get_embedded_license_key()  # use binary default
+
+    # Parse expire date
+    expire_str = args.expire
+    # Support both "2026-08-01" and "2026-08-01 00:00" formats
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            expire_dt = datetime.strptime(expire_str, fmt)
+            break
+        except ValueError:
+            continue
+    else:
+        print(f"Error: invalid expire date format: {expire_str!r}")
+        print("  Expected: YYYY-MM-DD or 'YYYY-MM-DD HH:MM'")
+        sys.exit(1)
+
+    # Convert to UTC unix timestamp
+    expire_dt_utc = expire_dt.replace(tzinfo=timezone.utc)
+    expire_ts = int(expire_dt_utc.timestamp())
+
+    # Check not already expired
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    if expire_ts <= now_ts:
+        print(f"Warning: expire date {expire_str} is in the past (now: {datetime.now(timezone.utc).isoformat()})")
+
+    # Export limit (default 1000, 0 = unlimited)
+    export_limit = getattr(args, "export_limit", None)
+    if export_limit is None:
+        export_limit = 1000
+    else:
+        export_limit = int(export_limit)
+
+    from flatseek.core.query_engine import generate_passphrase
+    token = generate_passphrase(args.id, expire_ts, key, export_limit)
+
+    print()
+    print("License token (share with user):")
+    print(f"  {token}")
+    print()
+    print("User command:")
+    print(f"  flatseek serve data.fsk --passphrase {token}")
+    print(f"  flatseek search data.fsk ... --passphrase {token}")
+    print(f"  flatseek export data.fsk ... --passphrase {token}")
+    print()
+    print(f"  ID          : {args.id}")
+    print(f"  Expire      : {expire_str} (Unix ts: {expire_ts})")
+    print(f"  Export limit : {export_limit if export_limit > 0 else 'unlimited'}")
+
+
+def cmd_generate_license_key(args):
+    """Generate a new random owner license key for subscription indexes.
+
+    This is the OWNER'S SECRET KEY — used to sign license tokens.
+    It is stored in the .fsk manifest and used to verify tokens at runtime.
+
+    Owner workflow:
+      1. Generate license key (once per product)
+         flatseek generate-license-key
+
+      2. Pack index with this key
+         flatseek pack data/ -o data.fsk --license-key <key_hex>
+
+      3. Generate tokens for users
+         flatseek generate-license-token --id "user@email.com" --expire "2026-08-01" --license-key <key_hex>
+
+    SECURITY: This key signs tokens. It is NOT the embedded verification key.
+    The embedded key (for opensource compatibility) is set via FLATSEEK_EMBEDDED_KEY env.
+    This license key is stored in the manifest for runtime verification.
+    """
+    import secrets, base64 as _b64
+
+    key_bytes = secrets.token_bytes(32)
+    key_hex = key_bytes.hex()
+    key_b64 = _b64.b64encode(key_bytes).decode("ascii")
+
+    print()
+    print("Owner license key:")
+    print(f"  Hex (64 chars):  {key_hex}")
+    print()
+    print("Use for token generation:")
+    print(f"  flatseek generate-license-token --id \"user@email.com\" --expire \"2026-08-01\" --license-key {key_hex}")
+    print()
+    print("Use for packing:")
+    print(f"  flatseek pack data/ -o data.fsk --license-key {key_hex}")
+    print()
+    print("IMPORTANT: Keep this key SECRET. It is used to sign license tokens.")
+    print("If leaked, attackers can generate valid tokens.")
+    print("For custom embedded key (premium tier), set FLATSEEK_EMBEDDED_KEY env var before packing.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="flatseek",
@@ -4314,6 +5204,9 @@ def main():
                    dest="dedup_fields",
                    help="Dedup on specific canonical column keys only (e.g. 'phone,nik'). "
                         "Implies --dedup. Useful when rows differ only in unimportant fields.")
+    p.add_argument("--id-field", dest="id_field", default=None,
+                   help="Natural key field for delete/update operations. "
+                        "Example: --id-field email. The field value uniquely identifies each document.")
     p.add_argument("--daemon", action="store_true", default=False,
                    help="Daemon/memory mode: never write prefix buffers to disk at checkpoint. "
                         "All index data accumulates in RAM; a lazy background writer drains "
@@ -4336,6 +5229,10 @@ def main():
                    help="URL for remote index (GitHub releases, HuggingFace, or generic URL). "
                         "Used when --storage-backend is 'url'. E.g.: "
                         "https://github.com/user/repo/releases/download/v1.0/")
+    p.add_argument("--description", default=None, dest="description",
+                   help="Description for this index (stored in stats.json and manifest).")
+    p.add_argument("--url", default=None, dest="url",
+                   help="Reference URL for this index (stored in stats.json and manifest).")
 
     # generate
     _gen_help = "Generate dummy dataset for benchmarking (standard, ecommerce, logs, nested, sparse, article, adsb, campaign, devops, sosmed, blockchain)"
@@ -4619,6 +5516,26 @@ def main():
     p.add_argument("-w", "--workers", type=int, default=None, metavar="N",
                    help="Parallel workers (default: min(16, cpu_count))")
 
+    # delete-doc: delete documents by ID or query
+    p = sub.add_parser("delete-doc",
+                       help="Delete documents by ID or Lucene query")
+    p.add_argument("index", help="Index name (directory or .fsk file)")
+    p.add_argument("--id", dest="doc_id", default=None,
+                   help="Delete document by natural key value (requires --id-field was set at build)")
+    p.add_argument("--query", "-q", dest="query", default=None,
+                   help="Delete all documents matching Lucene query, e.g. 'email:*@gmail.com'")
+
+    # update-doc: update documents by ID or query
+    p = sub.add_parser("update-doc",
+                       help="Update documents by ID or Lucene query (partial or full)")
+    p.add_argument("index", help="Index name (directory or .fsk file)")
+    p.add_argument("--id", dest="doc_id", default=None,
+                   help="Update document by natural key value (requires --id-field was set at build)")
+    p.add_argument("--query", "-q", dest="query", default=None,
+                   help="Update all documents matching Lucene query")
+    p.add_argument("--set", dest="fields", default=None, metavar="KEY=VALUE,...",
+                   help="Fields to set (partial update). Example: --set status=verified,name=Alice")
+
     # dedup
     p = sub.add_parser("dedup",
                        help="Remove duplicate docs from index (works after parallel builds)")
@@ -4630,6 +5547,11 @@ def main():
                    help="Report duplicates without making any changes")
     p.add_argument("-w", "--workers", type=int, default=None, metavar="N",
                    help="Parallel workers for rewrite phase (default: min(8, cpu_count))")
+
+    # compact
+    p = sub.add_parser("compact",
+                       help="Reclaim disk space by rewriting index without deleted documents")
+    p.add_argument("index", help="Index directory to compact")
 
     # wal
     p = sub.add_parser("wal", help="Manage WAL (Write-Ahead Log) files from ongoing builds")
@@ -4651,6 +5573,20 @@ def main():
     p.add_argument("-o", "--output", required=True, help="Output .flatseek file path")
     p.add_argument("--passphrase", default=None, metavar="PASS",
                    help="Encrypt the packed file with this passphrase (omit to pack as plaintext)")
+    p.add_argument("--description", default=None, dest="description",
+                   help="Description for the packed index (overrides stats.json)")
+    p.add_argument("--url", default=None, dest="url",
+                   help="Reference URL for the packed index (overrides stats.json)")
+    p.add_argument("--expire-at", type=int, default=None, dest="expire_at", metavar="UNIX_TS",
+                   help="Unix timestamp (int) when this index expires. After this time, "
+                        "the index will refuse to open. Requires --master-key.")
+    p.add_argument("--master-key", default=None, dest="master_key", metavar="HEX_KEY",
+                   help="Master key (32-byte hex) for encrypting expiration metadata. "
+                        "Required if --expire-at is set. Also uses FLATSEEK_MASTER_KEY env var.")
+    p.add_argument("--license-key", default=None, dest="license_key", metavar="HEX_KEY",
+                   help="32-byte license key (hex) from generate-license-key. "
+                        "Stores the HMAC verification key in the manifest for token verification. "
+                        "Use with FLATSEEK_EMBEDDED_KEY env var for custom embedded key.")
 
     # unpack - unpack .flatseek file into directory
     p = sub.add_parser("unpack", help="Unpack .flatseek file into index directory")
@@ -4658,6 +5594,24 @@ def main():
     p.add_argument("-o", "--output", help="Output directory (default: <name>.unpacked)")
     p.add_argument("--passphrase", default=None, metavar="PASS",
                    help="Decryption passphrase for encrypted .fsk manifest (required if .fsk is encrypted)")
+
+    # generate-passphrase - generate a signed subscription passphrase token
+    p = sub.add_parser("generate-passphrase",
+                       help="Generate a signed passphrase token for subscription distribution")
+    p.add_argument("--id", required=True, metavar="ID",
+                   help="Subscriber identifier (email, UUID, etc.)")
+    p.add_argument("--expire", required=True, metavar="DATE",
+                   help="Expiration date: YYYY-MM-DD or 'YYYY-MM-DD HH:MM' (UTC)")
+    p.add_argument("--key", required=False, default=None, metavar="HEX_KEY",
+                   help="32-byte license key as 64 hex characters (from generate-license-key). "
+                        "Uses binary default key if omitted.")
+    p.add_argument("--export-limit", default=None, metavar="N",
+                   dest="export_limit",
+                   help="Max rows exportable with this token (default: 1000, 0=unlimited)")
+
+    # generate-license-key - generate a new owner license key
+    p = sub.add_parser("generate-license-key",
+                       help="Generate a new random owner license key for subscription indexes")
 
     args = parser.parse_args()
 
@@ -4693,14 +5647,24 @@ def main():
         cmd_slice(args)
     elif args.command == "delete":
         cmd_delete(args)
+    elif args.command == "delete-doc":
+        cmd_delete_doc(args)
+    elif args.command == "update-doc":
+        cmd_update_doc(args)
     elif args.command == "dedup":
         cmd_dedup(args)
+    elif args.command == "compact":
+        cmd_compact(args)
     elif args.command == "wal":
         cmd_wal(args)
     elif args.command == "plan":
         cmd_plan(args)
     elif args.command == "generate":
         cmd_generate(args)
+    elif args.command == "generate-passphrase":
+        cmd_generate_passphrase(args)
+    elif args.command == "generate-license-key":
+        cmd_generate_license_key(args)
     elif args.command == "pack":
         from flatseek.flatseek_file import FlatseekPacker
         from flatseek.core.query_engine import load_encryption_key, is_encrypted
@@ -4719,7 +5683,52 @@ def main():
         if enc_path.exists() and args.passphrase:
             enc_key = load_encryption_key(str(index_dir), args.passphrase)
 
-        packer = FlatseekPacker(index_dir, output_path, enc_key=enc_key)
+        # Master key for expiration (from CLI or env var)
+        # Kept as hex string for PBKDF2 derivation in enclosed format.
+        master_key = None
+        if args.expire_at:
+            master_key_hex = args.master_key or _os.environ.get("FLATSEEK_MASTER_KEY")
+            if not master_key_hex:
+                raise ValueError("--master-key is required when --expire-at is set, "
+                                 "or set FLATSEEK_MASTER_KEY env var.")
+            master_key = master_key_hex
+
+        # Embedded HMAC verification key (stored in manifest for subscription token verification)
+        # Falls back to binary's default embedded key (same key used by generate-passphrase
+        # and verify_license_token when --key is not provided), so license .fsk files
+        # work out-of-the-box without any env vars or custom keys.
+        from flatseek.core.query_engine import get_embedded_license_key
+        license_key = None
+        if args.license_key:
+            try:
+                license_key = bytes.fromhex(args.license_key)
+            except ValueError:
+                raise ValueError("--license-key must be a 32-byte hex string (64 hex chars).")
+            if len(license_key) != 32:
+                raise ValueError(f"--license-key must be 32 bytes, got {len(license_key)}.")
+        else:
+            license_key = get_embedded_license_key()  # use binary default
+
+        # Read description/url from stats.json if not provided via CLI
+        import json as _json
+        stats_path = index_dir / "stats.json"
+        description = getattr(args, "description", None)
+        url = getattr(args, "url", None)
+        if stats_path.exists():
+            try:
+                with open(stats_path) as f:
+                    stats = _json.load(f)
+                description = description or stats.get("description")
+                url = url or stats.get("url")
+            except Exception:
+                pass
+
+        packer = FlatseekPacker(
+            index_dir, output_path, enc_key=enc_key,
+            description=description, url=url,
+            expire_at=args.expire_at, master_key=master_key,
+            license_key=license_key,
+        )
         packer.pack()
     elif args.command == "unpack":
         import json
@@ -4733,30 +5742,82 @@ def main():
         else:
             output_dir = flatseek_path.parent / (flatseek_path.stem + "_unpacked")
 
-        # Derive encryption key if .fsk is encrypted
-        enc_key = None
-        enc_meta = None
+        # Check if enclosed format (no FLATSEEK04 magic)
+        is_enclosed = False
         try:
-            raw = flatseek_path.read_bytes()[:8192].decode("utf-8", errors="replace")
-            m = re.search(r'"_encryption_b64"\s*:\s*"([^"]+)"', raw)
-            if m:
-                enc_raw = base64.b64decode(m.group(1))
-                enc_meta = json.loads(enc_raw.decode("utf-8"))
+            with open(flatseek_path, "rb") as f:
+                magic = f.read(10)
+                if magic != b"FLATSEEK04":
+                    is_enclosed = True
         except Exception:
-            enc_meta = None
+            pass
 
-        if enc_meta:
-            from flatseek.core.query_engine import load_encryption_key
-            passphrase = args.passphrase
+        enc_key = None
+        passphrase = args.passphrase
+
+        # Check if license-protected .fsk (manifest has _K_inner_encrypted)
+        # Block unpack for license-protected .fsk — cannot extract raw data
+        is_license = False
+        try:
+            from flatseek.flatseek_file import FlatseekHeader, HEADER_SIZE
+            with open(flatseek_path, "rb") as f:
+                header = FlatseekHeader.unpack(f.read(HEADER_SIZE))
+                for desc in header.sections:
+                    if desc.section_id == 0x01:  # SID_MANIFEST
+                        f.seek(desc.offset)
+                        manifest_data = f.read(desc.size)
+                        try:
+                            manifest_data.decode("utf-8")
+                            m = json.loads(manifest_data)
+                            if m.get("_K_inner_encrypted"):
+                                is_license = True
+                        except Exception:
+                            pass
+                        break
+        except Exception:
+            pass
+
+        if is_license:
+            print(
+                "Error: cannot unpack a license-protected .fsk.\n"
+                "License-protected archives are encrypted and cannot be extracted.\n"
+                "Access data via 'flatseek serve' or 'flatseek search' instead.",
+                file=sys.stderr
+            )
+            sys.exit(1)
+
+        if is_enclosed:
+            # Enclosed format - passphrase required for outer decryption
             if not passphrase:
                 try:
                     passphrase = _getpass.getpass(f"Passphrase for {flatseek_path.name}: ")
                 except Exception:
                     passphrase = None
-            if passphrase:
-                enc_key = load_encryption_key(None, passphrase, meta=enc_meta)
+            if not passphrase:
+                raise ValueError("Passphrase required for enclosed format")
+        else:
+            # Old encrypted format - derive enc_key from passphrase
+            enc_meta = None
+            try:
+                raw = flatseek_path.read_bytes()[:8192].decode("utf-8", errors="replace")
+                m = re.search(r'"_encryption_b64"\s*:\s*"([^"]+)"', raw)
+                if m:
+                    enc_raw = base64.b64decode(m.group(1))
+                    enc_meta = json.loads(enc_raw.decode("utf-8"))
+            except Exception:
+                enc_meta = None
 
-        unpacker = FlatseekUnpacker(flatseek_path, output_dir, enc_key=enc_key)
+            if enc_meta:
+                from flatseek.core.query_engine import load_encryption_key
+                if not passphrase:
+                    try:
+                        passphrase = _getpass.getpass(f"Passphrase for {flatseek_path.name}: ")
+                    except Exception:
+                        passphrase = None
+                if passphrase:
+                    enc_key = load_encryption_key(None, passphrase, meta=enc_meta)
+
+        unpacker = FlatseekUnpacker(flatseek_path, output_dir, enc_key=enc_key, passphrase=passphrase)
         unpacker.unpack()
     else:
         parser.print_help()

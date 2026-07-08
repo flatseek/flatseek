@@ -673,7 +673,9 @@ class IndexBuilder:
     def __init__(self, output_dir, column_map=None, start_doc_id=0, dataset=None,
                  checkpoint_cb=None, delimiter=",", columns=None, worker_id=None,
                  dedup_fields=None, doc_id_end=None, daemon=False,
-                 storage: StorageAdapter | None = None):
+                 storage: StorageAdapter | None = None,
+                 description=None, url=None, license_expire=None,
+                 id_field=None):
         self._file_excludes: set = set()   # set per-file by process_file
         """
         Args:
@@ -709,6 +711,10 @@ class IndexBuilder:
         self.storage = storage or create_storage_adapter()
         self.column_map = column_map or {}
         self.dataset = dataset  # injected as _dataset on every doc
+        self.description = description  # optional description stored in stats.json
+        self.url = url          # optional url stored in stats.json
+        self.license_expire = license_expire  # optional license expiration timestamp, stored in stats.json
+        self._id_field = id_field  # natural key field for delete/update operations
         self.delimiter = delimiter
         self.columns = columns  # explicit header names for headerless files
         self._worker_id = worker_id
@@ -1204,7 +1210,7 @@ class IndexBuilder:
 
         idx_mb  = round(self._idx_bytes_flushed / 1024**2, 1)
         doc_mb  = round(self._doc_bytes_flushed / 1024**2, 1)
-        stats_data = json.dumps({
+        stats = {
             "total_docs":    self.doc_counter,
             "rows_indexed":  self.total_docs,
             "total_entries": prev_entries + self._total_entries,
@@ -1216,7 +1222,16 @@ class IndexBuilder:
             "total_size_mb": round(idx_mb + doc_mb, 1),
             "columns": {**prev_cols, **self.columns_seen},
             "_partial": True,     # marker; removed by finalize()
-        }, indent=2)
+        }
+        if self.description:
+            stats["description"] = self.description
+        if self.url:
+            stats["url"] = self.url
+        if self.license_expire:
+            stats["license_expire"] = self.license_expire
+        if getattr(self, '_id_field', None):
+            stats["_id_field"] = self._id_field
+        stats_data = json.dumps(stats, indent=2)
         self.storage.write_bytes(stats_path, stats_data.encode())
 
     def _chunk_start(self, doc_id):
@@ -2705,6 +2720,14 @@ class IndexBuilder:
             "total_size_mb": round((idx_size + doc_size) / 1024**2, 1),
             "columns": merged_cols,
         }
+        if self.description:
+            stats["description"] = self.description
+        if self.url:
+            stats["url"] = self.url
+        if self.license_expire:
+            stats["license_expire"] = self.license_expire
+        if getattr(self, '_id_field', None):
+            stats["_id_field"] = self._id_field
 
         with open(stats_path, "w") as f:
             json.dump(stats, f, indent=2)
@@ -3047,10 +3070,31 @@ def _expand_record(obj, prefix="", sep="."):
                         except (ValueError, SyntaxError, TypeError):
                             parsed = None
                 if not isinstance(parsed, (dict, list)):
-                    # Not actually structured — store as plain string and skip recursion
-                    result[full_key] = val
-                    continue
+                    # Not actually structured — try separator split
+                    pass  # fall through to separator check below
+                # else: parsed is dict/list from JSON, continue to recursion
             else:
+                parsed = None
+
+            # Try separator split: "a,b,c" or "x#y#z" → list
+            if parsed is None and len(val) >= 3:
+                # Common separators: comma, semicolon, pipe, hash
+                sep = None
+                if ',' in val:
+                    sep = ','
+                elif ';' in val:
+                    sep = ';'
+                elif '|' in val:
+                    sep = '|'
+                elif '#' in val:
+                    sep = '#'
+                if sep:
+                    parts = [p.strip() for p in val.split(sep) if p.strip()]
+                    if len(parts) >= 2:
+                        parsed = parts
+
+            if parsed is None:
+                # Not structured — store as plain string
                 result[full_key] = val
                 continue
         else:
@@ -3805,7 +3849,8 @@ def _auto_classify(files, csv_base, col_map_file, delimiter=",", columns=None,
 
 def build(csv_src, output_dir, column_map_path=None, dataset=None, delimiter=",",
           columns=None, type_overrides=None, excludes=None, worker_id=None, plan_path=None,
-          estimate=False, dedup_fields=None, daemon=False, storage=None):
+          estimate=False, dedup_fields=None, daemon=False, storage=None,
+          description=None, url=None, license_expire=None, id_field=None):
     """Build index from csv_src, which may be a single file or a directory.
 
     Distributed / parallel mode:
@@ -3921,7 +3966,8 @@ def build(csv_src, output_dir, column_map_path=None, dataset=None, delimiter=","
                       type_overrides=type_overrides,
                       worker_id=None,
                       plan_path=None,
-                      estimate=estimate)
+                      estimate=estimate,
+                      id_field=id_field)
             return
         else:
             print(f"Error: {csv_src!r} is not a file or directory")
@@ -4018,7 +4064,9 @@ def build(csv_src, output_dir, column_map_path=None, dataset=None, delimiter=","
     builder = IndexBuilder(output_dir, column_map, start_doc_id=start_doc_id, dataset=dataset,
                           delimiter=delimiter, columns=columns, worker_id=worker_id,
                           dedup_fields=dedup_fields, doc_id_end=doc_id_end_override,
-                          daemon=daemon, storage=storage)
+                          daemon=daemon, storage=storage,
+                          description=description, url=url, license_expire=license_expire,
+                          id_field=id_field)
     builder._estimate_enabled = estimate and not _is_worker
     total_new = 0
 

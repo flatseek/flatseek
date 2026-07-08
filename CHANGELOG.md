@@ -5,7 +5,127 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.9] - 2026-07-03
+## [0.1.9] - 2026-07-07
+
+### Feature: Elasticsearch-compatible bulk API
+
+`POST /{index}/_bulk_documents` provides an Elasticsearch-compatible bulk
+API accepting NDJSON (newline-delimited JSON) with four operation types:
+
+- `index` — insert or replace document by `_id` (upsert, ES `index` action)
+- `create` — insert only, fails with 409 if `_id` already exists (ES `create`)
+- `update` — partial update by `_id`, merges fields into existing doc (ES `update`)
+- `delete` — delete by `_id` (ES `delete`)
+
+**Request format (NDJSON):**
+```
+{"index": {"_id": "1"}}
+{"email": "alice@example.com", "name": "Alice"}
+{"create": {"_id": "2"}}
+{"email": "bob@example.com", "name": "Bob"}
+{"update": {"_id": "1"}}
+{"doc": {"status": "verified"}}
+{"delete": {"_id": "3"}}
+```
+
+Compatible with the official `elasticsearch-py` client. Returns per-item
+status codes (200/201/404/409), `took` milliseconds, and totals.
+
+**Internal reliability fixes (included in this feature):**
+- TombstoneStore: write 1 null byte to `bitmap.bin` before `mmap()` — fixes `ValueError` crash on macOS.
+- upsert counter: seed from `stats.json["total_docs"]` when `.next_doc_id` is absent — prevents new upserts from overwriting existing doc_ids 0,1.
+- upsert lock scope: hold `fcntl.LOCK_EX` through `builder.finalize()` — prevents concurrent workers from corrupting the same chunk file.
+
+### Feature: Document-level delete and update by query
+
+Add CRUD operations for documents — delete and update by ID or Lucene query.
+
+**Tombstone storage:** Documents are never physically removed from the index.
+Instead, a persistent bitmap marks deleted doc_ids, and a WAL ensures
+crash-consistency. Query results automatically exclude deleted documents.
+
+**Optimistic locking:** Delete and update operations use version tracking to
+detect concurrent modifications. Conflicting operations return HTTP 409 or
+retry automatically up to 3 times.
+
+**API:**
+- `DELETE /{index}/_doc/{id}` — Delete document by natural key
+- `DELETE /{index}/_doc?q=...` — Delete all documents matching Lucene query
+- `PUT /{index}/_doc/{id}` — Upsert (insert or replace) document by natural key
+- `PUT /{index}/_doc?q=...` — Update all documents matching Lucene query
+- `GET /{index}/_stats` — Now includes `docs.deleted` count
+
+**CLI:**
+- `flatseek delete-doc <index> --id=<value>` — Delete by natural key
+- `flatseek delete-doc <index> --query="email:*@gmail.com"` — Delete by query
+- `flatseek update-doc <index> --id=<value> --set=status=verified` — Update by ID
+- `flatseek update-doc <index> --query="email:*@gmail.com" --set=status=verified` — Update by query
+
+**Build with natural key:**
+- `flatseek build data/ -o index/ --id-field email` — Enables delete/update by email
+
+**`.fsk` files:** Packed archives are read-only. Delete/update operations return
+HTTP 409 with message: "Cannot modify packed .fsk. Unpack first."
+
+### Feature: `--id-field` for natural key tracking
+
+Documents can now be identified by a natural key field (e.g. email, user_id)
+instead of internal doc_id. The field is stored in `stats.json._id_field` and
+used for upsert/delete-by-ID operations.
+
+### Feature: Compaction to reclaim disk space after bulk deletes
+
+Deleted documents are marked as tombstones but occupy disk space. Compaction
+rewrites the index to include only alive documents, freeing the space.
+
+**API:**
+- `POST /{index}/_compact` — Rewrite index without deleted documents
+
+**CLI:**
+- `flatseek compact <index>` — Reclaim disk space after bulk deletes
+
+**Returns:** `{result: "ok", deleted_removed: N, alive_rewritten: M, old_size_mb: X, new_size_mb: Y}`
+
+**Note:** Compaction rewrites all index files (docs + postings). For large
+indexes, run during off-peak hours. `.fsk` files cannot be compacted —
+unpack first.
+
+### Feature: Sort search results by field
+
+Add sorting to search results with field-based and score-based sort.
+
+**API:**
+- GET `/{index}/_search?sort=amount:desc`
+- POST body: `"sort": [{"amount": "desc"}, {"created_at": "asc"}]`
+
+**Supports:**
+- Numeric field sorting via doc_values (fast path)
+- Text/keyword field sorting via chunk scan (fallback)
+- Multi-field sorting (stable, applied in reverse order)
+- Missing values sort last
+- Pagination with sort works correctly
+
+**CLI:**
+- `flatseek search data/ "query" --sort amount:desc`
+
+### Bug fix: HuggingFace bucket URL routing for all dataset types
+
+Fixed correct storage adapter selection (dir-style `URLStorageAdapter` vs
+fsk-style `FlatseekFileStorageAdapter`) and proper authentication flows
+for all HF dataset types:
+
+- **Plain directory**: `https://huggingface.co/datasets/owner/repo` → 200
+- **Encrypted directory**: prompt via `x-index-password` → 401 on wrong/missing → 200 on success
+- **Plain `.fsk`**: served directly → 200
+- **Enclosed FSK (active)**: passphrase → decrypt outer layer → 200
+- **Enclosed FSK (expired)**: `PermissionError` → 403
+- **License FSK**: `HF_TOKEN` verified against `_K_inner_encrypted` → 200; wrong token → 401
+- **Direct `.fsk` URL**: HTTP Range + `HF_TOKEN` if private → 200
+- **Bucket repo**: `/resolve/{index}` pattern (not `/resolve/main/{index}`) → 200
+
+HF API-first layout detection (`/api/datasets/{owner}/{repo}/tree/main`)
+avoids blind `.fsk` probing. `PermissionError` correctly returns 401
+instead of 403 for encrypted indices.
 
 ### Bug fix: `create_storage_adapter` ignores `FLATSEEK_STORAGE_URL` when backend defaults to "local"
 
@@ -56,6 +176,66 @@ without extra env configuration.
 
 A spinner (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`) is shown while reading the
 remote index and while fetching search results.
+
+### Feature: License token mode with ChaCha20 full-section encryption + expiry
+
+License mode allows distributing `.fsk` files with cryptographic expiry enforcement.
+Each section is encrypted with a per-file `K_inner` key. The `K_inner` is only
+exposed after HMAC verification of a user token against the manifest's embedded key.
+
+Crypto flow:
+- `K_inner` (random 32 bytes) generated per pack
+- Token = `HMAC(owner_key, id|expire_ts|export_limit)`, signed with owner's private key
+- Runtime: verify token → derive `K_user = HMAC(embedded_key, "flatseek-license-v1")`
+  → decrypt `_K_inner_encrypted` with `K_user` → decrypt sections with `K_inner`
+- Expiry enforced at crypto layer — cannot be bypassed by patching the binary
+
+Token can be renewed without re-downloading the `.fsk` (new token, same file).
+
+### Feature: Enclosed format with master-key and cryptographic expiry
+
+Enclosed format encrypts the entire `.fsk` blob with a master key and embeds
+an `expire_at` timestamp in the encrypted outer layer. Decryption fails
+cryptographically when the current time exceeds `expire_at` — no separate expiry
+check that could be patched.
+
+Format: `salt(32) | outer_ct_len(4) | outer_ct | inner_ct`
+- `outer_ct = encrypt({"k": K_inner, "expire_at": ts}, K_user)`
+- `inner_ct = encrypt(fsk_plaintext, K_inner)`
+- `K_user = PBKDF2(passphrase, salt, 600k)`
+
+### Feature: Offset table encrypted in license/enclosed formats
+
+The index offset table (which maps file paths to byte offsets in the archive) is
+now encrypted inside the encrypted blob with `K_inner` — not stored as plaintext
+outside. Without `K_inner`, an attacker cannot determine which files exist or
+where they are located in the archive.
+
+### Feature: CLI banner on invalid/expired token
+
+When `flatseek search` or `export` encounters an invalid/expired token for a
+license-protected or enclosed `.fsk` file, the CLI now displays an "Index Info"
+banner showing the license expiration before exiting with an error — instead of
+just the error message alone.
+
+CLI commands affected: `search`, `export`.
+
+### Feature: `GET /_stats` returns `description` and `license_expire`
+
+The `/_stats` API endpoint now includes `description` and `license_expire`
+fields in the response, surfaced from either `stats.json` (for regular indexes)
+or the `.fsk` manifest (for license/enclosed `.fsk` files).
+
+Schema changes (`IndexStats`):
+- Added `description: str | None` — index description from build
+- Added `license_expire: str | None` — formatted expiration timestamp
+
+### Feature: `IndexBuilder` supports `license_expire` field
+
+`IndexBuilder` and the `build()` function now accept a `license_expire` parameter.
+When set, it is written to `stats.json` as `license_expire` and returned via
+`GET /_stats`. This allows the expiration info to be displayed even for
+non-encrypted indexes built with an expiration watermark.
 
 ## [0.1.8] - 2026-06-30
 

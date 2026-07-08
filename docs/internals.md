@@ -3,7 +3,7 @@
 **Purpose**: Deep technical teardown — how the engine actually works under the hood. Storage formats, algorithms, data structures, performance characteristics.
 **Companion**: [`architecture.md`](architecture.html) — project structure and module map.
 
-**Version**: 0.1.3 | **Last updated**: 2026-05-02
+**Version**: 0.1.9 | **Last updated**: 2026-07-05
 
 ---
 
@@ -22,6 +22,15 @@
   - [Parallel Indexing](#parallel-indexing)
   - [Checkpoint Strategy](#checkpoint-strategy)
   - [Output Layout](#output-layout)
+- [Distribution Encryption Models](#distribution-encryption-models)
+  - [Plain (No Encryption)](#plain-no-encryption)
+  - [Bucket Encryption (Passphrase-Only)](#bucket-encryption-passphrase-only)
+  - [License Token Mode](#license-token-mode)
+  - [Enclosed Format (Master-Key + Expiry)](#enclosed-format-master-key--expiry)
+  - [Offset Table Encryption](#offset-table-encryption)
+  - [Custom Embedded Key (Tiered Distribution)](#custom-embedded-key-tiered-distribution)
+- [Remote `.fsk` via HTTP Range](#remote-fsk-via-http-range)
+- [`stats.json` Fields](#statsjson-fields)
 - [Storage Format](#storage-format)
   - [Trigram Index Format](#trigram-index-format)
   - [Columnar Doc Store](#columnar-doc-store)
@@ -41,6 +50,7 @@
   - [Wildcard Execution](#wildcard-execution)
   - [NOT Query Execution](#not-query-execution)
   - [Result Set Construction](#result-set-construction)
+- [Sorting](#sorting)
 - [Aggregations](#aggregations)
   - [Terms Aggregation](#terms-aggregation)
   - [Stats / Avg / Min / Max / Sum](#stats--avg--min--max--sum)
@@ -299,6 +309,130 @@ CHECKPOINT_WRITE_BYTES = 8 KB # minimum buffer size before writing to disk
 
 ---
 
+## Distribution Encryption Models
+
+Flatseek supports three encryption models for distributing `.fsk` files, each with different security properties:
+
+### Plain (No Encryption)
+
+No encryption. Anyone can serve/search the `.fsk` without a passphrase.
+
+### Bucket Encryption (Passphrase-Only)
+
+Used for internal/trusted team use cases. Applies per-file ChaCha20-Poly1305 encryption to the index directory in-place. Key derived via PBKDF2-HMAC-SHA256 (600k iterations) from passphrase + salt stored in `encryption.json`.
+
+### License Token Mode
+
+For subscription/premium content distribution. Cryptographic expiry enforced at the crypto layer — cannot be bypassed by patching the binary.
+
+**Key hierarchy:**
+- `K_inner`: random 32 bytes, generated per pack — the actual data encryption key
+- `embedded_key`: base64 of owner's private key, stored in manifest
+- `K_user = HMAC(embedded_key, "flatseek-license-v1")` — derived at runtime
+- Token: `base64(id|expire_ts|export_limit|HMAC(owner_key, id|expire_ts|export_limit))`
+
+**Manifest fields:**
+```
+_embedded_key = base64(owner_private_key)
+_K_inner_encrypted = encrypt({"k": K_inner}, K_user)
+```
+
+**Decryption flow:**
+1. Verify token signature against embedded_key → fail if invalid (crypto layer)
+2. Derive `K_user = HMAC(embedded_key, "flatseek-license-v1")`
+3. Decrypt `_K_inner_encrypted` with K_user → K_inner
+4. Decrypt offset table with K_inner → file positions
+5. HTTP Range per file + decrypt individually with K_inner
+
+**Expiry enforcement:** checked inside `_decrypt_if_needed` — after K_inner is available, the decryption of the inner data checks `expire_ts` before returning. Patching the binary cannot bypass this check.
+
+### Enclosed Format (Master-Key + Expiry)
+
+Single-file distribution with cryptographic expiry. Passphrase = decryption key + expiry checker. Format:
+
+```
+salt(32) | outer_ct_len(4) | outer_ct | inner_ct
+```
+
+Where:
+- `outer_ct = encrypt({"k": K_inner, "expire_at": ts}, K_user)`
+- `inner_ct = encrypt(fsk_plaintext, K_inner)`
+- `K_user = PBKDF2(passphrase, salt, 600k)`
+
+Decryption:
+1. Derive `K_user = PBKDF2(passphrase, salt, 600k)`
+2. Decrypt outer_ct → K_inner + expire_ts
+3. If `now > expire_ts` → crypto layer fails (PermissionError)
+4. Decrypt inner_ct → fsk plaintext
+
+### Offset Table Encryption
+
+In license/enclosed formats, the index offset table (which maps file paths to byte offsets) is encrypted inside the encrypted blob with K_inner — not stored as plaintext outside. Without K_inner, an attacker cannot determine which files exist or their positions in the archive.
+
+### Custom Embedded Key (Tiered Distribution)
+
+An optional `FLATSEEK_EMBEDDED_KEY` env var overrides the default embedded key at build time. This allows tiered distribution:
+- **Default key** (built-in): opensource binary compatible
+- **Custom key**: only binaries with `FLATSEEK_EMBEDDED_KEY=custom_key` can verify tokens for that `.fsk`
+
+---
+
+## Remote `.fsk` via HTTP Range
+
+`FlatseekFileStorageAdapter` wraps a remote `.fsk` URL (HuggingFace, S3, any HTTP server) and reads sections via HTTP Range requests — no full download required.
+
+**Architecture:**
+- `RangeFile`: low-level HTTP Range reader with persistent `httpx.Client` (HTTP/2), 256 KB block size, 16 concurrent requests
+- `FlatseekFileStorageAdapter`: implements the `StorageAdapter` interface (read, write, exists, listdir) on top of `RangeFile`
+- Section descriptors (offset, size) read from `.fsk` header at open time
+
+**HTTP Range optimization:**
+- Block size: 256 KB (was 4 KB in v0.1.8)
+- Concurrent fetches: 16 parallel Range requests per file
+- HTTP/2 multiplexing: single TCP connection, request pipelining
+- Graceful fallback to HTTP/1.1 if h2 not available
+
+**HuggingFace token:** `HF_TOKEN` read from env var or `~/.cache/huggingface/token` for private repos.
+
+### `stats.json` Fields
+
+Written at `finalize()` to `{output_dir}/stats.json`:
+
+```json
+{
+  "total_docs": 1234567,
+  "total_entries": 4567890,
+  "index_size_mb": 45.2,
+  "docs_size_mb": 120.5,
+  "total_size_mb": 165.7,
+  "index_files": 128,
+  "columns": {
+    "status": "KEYWORD",
+    "amount": "FLOAT",
+    "created_at": "DATE"
+  },
+  "description": "Optional index description",
+  "url": "Optional source URL",
+  "license_expire": "2026-12-31 23:59:59 UTC"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `total_docs` | int | Total documents indexed |
+| `total_entries` | int | Total posting list entries |
+| `index_size_mb` | float | Index (`index/`) size in MB |
+| `docs_size_mb` | float | Doc store (`docs/`) size in MB |
+| `total_size_mb` | float | Sum of index + docs |
+| `index_files` | int | Number of index bucket files |
+| `columns` | dict | Field name → semantic type mapping |
+| `description` | str | Optional description (set via `--description`) |
+| `url` | str | Optional source URL (set via `--url`) |
+| `license_expire` | str | Optional expiration (set via `license_expire` param) |
+| `_partial` | bool | Marker: intermediate stats during build (removed at finalize) |
+
+---
+
 ## Storage Format
 
 ### Trigram Index Format
@@ -547,6 +681,55 @@ Doc IDs are sorted integers. The `_paginate(doc_ids, page, page_size)` method:
 3. Loads each chunk once via `_load_chunk`.
 4. Fetches individual docs via dict lookup.
 5. `_collapse_expanded_fields` reconstructs nested arrays/objects from their flat dot-path keys (`tags[0]`, `info.metadata.a.value`) for API responses.
+
+---
+
+### Sorting
+
+Results can be sorted by field values using the `sort` parameter.
+
+**API:**
+```
+GET /{index}/_search?sort=amount:desc
+POST /{index}/_search
+{
+  "q": "program:raydium",
+  "sort": [{"amount": "desc"}, {"created_at": "asc"}]
+}
+```
+
+**Sort specification format:**
+- String: `"field:asc"` or `"field:desc"`
+- Multi-field: `"field1:desc,field2:asc"`
+- Elasticsearch-style: `[{"field": "amount", "order": "desc"}]`
+- Simple dict: `[{"amount": "desc"}]`
+
+**Sort strategies by field type:**
+
+| Field Type | Strategy | Method |
+|-----------|----------|---------|
+| Numeric (INT/FLOAT) | doc_values | `_sort_by_numeric` — O(N log M) using `(value, doc_id)` pairs |
+| Keyword/TEXT | Chunk scan | `_sort_by_chunk_scan` — loads chunks to extract values |
+
+**Missing values** sort to last regardless of direction.
+
+**Multi-field sort** uses stable sort in reverse order (primary sort applied last):
+```python
+# [("status", "asc"), ("amount", "desc")]
+# Process: sort by amount desc first, then by status asc as tiebreaker
+for field, direction in reversed(sort_spec):
+    doc_ids = self._sort_by_field(doc_ids, field, direction)
+```
+
+**Code flow:**
+```
+query() → execute(ast) → doc_ids (sorted by _id)
+  → _sort_doc_ids(doc_ids, sort_spec)
+  → _sort_by_field(doc_ids, field, direction)
+    → _sort_by_numeric() if doc_values exist
+    → _sort_by_chunk_scan() if no doc_values
+  → _paginate(sorted_doc_ids, page, page_size)
+```
 
 ---
 

@@ -439,3 +439,94 @@ range", "shard pruning", "TimeShardedIndex", "sharded index",
 
 ---
 
+## [ ] High-throughput batch upsert queue for parallel crawlers
+
+**Status**: Deferred (post v0.2.0)
+
+**Why**: Current upsert is correct under concurrency (fcntl.LOCK_EX serializes doc_id allocation), but throughput is limited by per-request disk I/O. A crawler doing 100+ upserts/sec creates 100 separate finalize() calls, each blocking on disk write.
+
+**Problem with current approach**:
+
+Each upsert call does:
+```
+1. Acquire file lock
+2. Read counter
+3. Increment counter
+4. Release lock
+5. Create IndexBuilder
+6. add_row() + finalize() → disk I/O
+7. Return response
+```
+
+Step 5-6 serializes ALL upserts through disk. 100 concurrent crawlers = 100 sequential disk writes = throughput bottleneck.
+
+**Approach**:
+
+Per-worker in-memory buffer with periodic flush:
+
+```
+ThreadLocal builder per worker (avoids lock contention on builder state)
+    ↓
+Shared queue: Queue of doc batches [(id_field, field_value, doc_dict), ...]
+    ↓
+Background flusher thread: every N docs OR every T seconds, flush batch
+    ↓
+Atomic rename to make new docs searchable
+```
+
+Key design decisions:
+- **Per-worker builders** avoid mutex on builder state (IndexBuilder is not thread-safe)
+- **Batch flush** amortizes disk I/O: 100 docs/batch vs 100 individual writes
+- **Queue depth cap** — if queue fills up, callers block (backpressure)
+- **Graceful shutdown** — drain queue on server stop
+- **Crash recovery** — queue persisted to WAL so interrupted flush can resume
+
+**API addition**:
+```
+POST /{index}/_bulk_upsert
+[{"id": "email@example.com", "doc": {...}}, ...]
+→ Accepts batch, returns after queuing (async)
+GET /{index}/_bulk_upsert/status
+→ Returns queue depth, flush status
+```
+
+**Files to touch**:
+- `src/flatseek/core/upsert_queue.py` — new: worker-local builder + shared queue + flusher
+- `src/flatseek/api/routes/documents.py` — add `_bulk_upsert` endpoint
+- `src/flatseek/core/builder.py` — possibly add `flush()` method
+- `tests/test_bulk_upsert.py` — concurrent load test
+
+**Effort**: ~400 lines.
+
+**Trigger phrases**: "batch upsert", "bulk insert", "parallel operations", "high throughput upsert", "background flush", "queue flush", "concurrent upsert"
+
+---
+
+## [x] Elasticsearch-compatible bulk API
+
+**Status**: Implemented (v0.2.0).
+
+**Result**: `POST /{index}/_bulk_documents` provides an Elasticsearch-compatible
+bulk API accepting NDJSON. Compatible with the official `elasticsearch-py`
+client — can connect directly using ES client with flatseek as the backend.
+
+Supports four operation types: `index` (upsert), `create` (insert-only),
+`update` (partial merge), `delete`. Returns ES-style response with per-item
+status codes and totals.
+
+**API**:
+```
+POST /{index}/_bulk_documents
+{"index": {"_id": "1"}}
+{"email": "alice@example.com", "name": "Alice"}
+{"create": {"_id": "2"}}
+{"email": "bob@example.com", "name": "Bob"}
+```
+
+**Files changed**:
+- `src/flatseek/api/routes/documents.py` — added `_bulk_documents` route
+
+**Trigger phrases**: "bulk API", "elasticsearch bulk", "NDJSON bulk", "elasticsearch-py client"
+
+---
+

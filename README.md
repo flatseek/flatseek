@@ -105,6 +105,9 @@ flatseek serve data.fsk
 # Query
 flatseek search ./data "program:raydium AND amount:>1000000"
 
+# Query with sorting
+flatseek search ./data "*" --sort amount:desc
+
 # Query from single portable file
 flatseek search data.fsk "program:raydium AND amount:>1000000"
 
@@ -120,10 +123,14 @@ flatseek serve https://huggingface.co/datasets/owner/repo/resolve/main/data.fsk
 
 - **Full text search** — tokenized, trigram-backed wildcard (`*kube*`)
 - **Range queries** — exact counts on numeric, date, keyword fields
+- **Sorting** — sort results by any field (asc/desc), multi-field, missing values last
 - **Aggregations** — terms, stats, min/max, cardinality, date histogram
 - **Array fields** — matches any element (`tags:graphql`)
 - **Nested objects** — dot-path queries (`address.city:Jakarta`)
 - **Boolean operators** — AND, OR, NOT with grouping
+- **Delete & Update** — delete or update documents by ID or Lucene query
+- **Bulk API** — Elasticsearch-compatible NDJSON bulk endpoint (`POST /{index}/_bulk_documents`) — index, create, update, delete in one call
+- **Compaction** — reclaim disk space after bulk deletes by rewriting the index
 - **Encryption at rest** — ChaCha20-Poly1305
 - **Parallel indexing** — multi-worker builds
 - **Remote querying** — search HuggingFace datasets without downloading

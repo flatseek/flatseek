@@ -71,6 +71,7 @@ The Flatseek CLI (`flatseek`) manages the full lifecycle: build, query, serve, a
 | `delete` | Delete index directory (parallel rm -rf) |
 | `export` | Stream docs (filtered by query) to JSONL or CSV |
 | `dedup` | Remove duplicate docs from index |
+| `compact` | Reclaim disk space after bulk deletes |
 | `slice` | Extract query-matched subset as new index |
 | `verify` | Chunk-level integrity check |
 | `pack` | Pack index directory into portable `.fsk` file |
@@ -866,6 +867,40 @@ flatseek dedup ./data
 - Works on indexes built with parallel workers (including resumed builds)
 - Checkpoint is deleted on successful completion
 - Chunk rewrite is parallel; posting list rewrite is parallel; scan is single-threaded but resumable
+
+---
+
+## `flatseek compact`
+
+Reclaim disk space after bulk deletes. Rewrites the index to include only alive documents.
+
+#### What it does
+
+1. Scans all doc chunks, keeping only non-deleted documents
+2. Rewrites posting lists with remapped (sequential) doc_ids
+3. Atomically replaces the old index with the new compacted version
+4. Clears the tombstone bitmap and WAL files
+
+```
+flatseek compact ./myindex
+```
+
+```json
+// Output
+Compacting ./myindex...
+  Total docs : 105000
+  Alive      : 99477
+  Deleted    : 5523 (will be purged)
+Compacted: 99477 alive docs rewritten, 5523 deleted docs purged.
+Size: 52.3MB → 45.1MB (saved 7.2MB, 13.8%)
+```
+
+#### Notes
+
+- Requires `--id-field` was used at build time (tombstone support)
+- Compaction rewrites all index files — for large indexes, run during off-peak hours
+- `.fsk` files cannot be compacted — unpack first with `flatseek unpack`
+- API: `POST /{index}/_compact`
 
 ---
 

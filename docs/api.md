@@ -25,6 +25,7 @@ flatseek serve -d ./data     # with dashboard at /dashboard
 | `DELETE` | `/{index}/_authenticate` | Clear authenticated session |
 | `POST` | `/{index}/_encrypt` | Encrypt at rest |
 | `POST` | `/{index}/_decrypt` | Decrypt |
+| `POST` | `/{index}/_compact` | Reclaim disk space after bulk deletes |
 | `DELETE` | `/{index}` | Delete index |
 
 ## Examples
@@ -92,5 +93,20 @@ curl "http://localhost:8000/_indices?bucket=https://huggingface.co/buckets/owner
 # Search an index within a bucket
 curl "http://localhost:8000/adsb/_search?q=*&bucket=https://huggingface.co/buckets/owner/repo"
 ```
+
+### Compaction
+
+Reclaim disk space after bulk deletes. Rewrites the index to include only alive documents.
+
+```bash
+# Compact an index (CLI)
+flatseek compact myindex
+
+# Compact via API
+curl -X POST "http://localhost:8000/myindex/_compact"
+# Response: {"result":"ok","deleted_removed":523,"alive_rewritten":99477,"old_size_mb":52.3,"new_size_mb":45.1}
+```
+
+**Note:** Compaction rewrites all index files. For large indexes, run during off-peak hours. `.fsk` files cannot be compacted — unpack first.
 
 Interactive docs at `/_docs` (Swagger UI) and `/_redoc` (ReDoc).
