@@ -1167,6 +1167,7 @@ def cmd_search(args):
 
     storage = None
     enc_key = None
+    token_info = None
 
     # Handle .flatseek files (including custom extensions like .flat)
     # AND HTTP/HTTPS URLs that point to .fsk archives (no full download;
