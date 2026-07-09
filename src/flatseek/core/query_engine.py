@@ -3114,6 +3114,30 @@ class QueryEngine:
             except Exception:
                 return None
 
+        # ── Calendar interval helpers (shared by fast path and chunk scan) ─────
+        _CAL_ALIASES = {
+            "1d": "day", "7d": "day", "30d": "day", "90d": "day",
+            "1w": "week", "1M": "month", "1y": "year",
+        }
+
+        def _normalize_calendar_interval(interval, calendar_interval):
+            """Resolve interval: supports both 'interval' and 'calendar_interval' params."""
+            raw = calendar_interval if calendar_interval != "day" else interval
+            if raw in ("day", "hour", "month", "year"):
+                return raw
+            return _CAL_ALIASES.get(str(raw), "day")
+
+        def _date_term_to_bucket(term_str, interval):
+            """Map a YYYYMMDD term to a bucket key string for the given interval."""
+            if interval == "hour" and len(term_str) >= 8:
+                return term_str[:8] + "0000"
+            elif interval == "month" and len(term_str) >= 6:
+                return term_str[:6]
+            elif interval == "year" and len(term_str) >= 4:
+                return term_str[:4]
+            else:
+                return term_str[:8] if len(term_str) >= 8 else term_str
+
         # ── Iterate chunks ───────────────────────────────────────────────────
         def _iter_chunks_for_agg(eng):
             if eng._sub_engines is not None:
@@ -3149,6 +3173,13 @@ class QueryEngine:
                         all_dv_compatible = False
                         break
                 elif agg_type in ("avg", "min", "max", "sum", "stats"):
+                    dv = self._load_doc_values(field)
+                    if dv is not None:
+                        dv_able_fields[agg_type] = (field, dv)
+                    else:
+                        all_dv_compatible = False
+                        break
+                elif agg_type == "date_histogram":
                     dv = self._load_doc_values(field)
                     if dv is not None:
                         dv_able_fields[agg_type] = (field, dv)
@@ -3191,6 +3222,23 @@ class QueryEngine:
                             aggregations[field] = {"value": sum(vals) / len(vals)}
                         elif agg_type == "sum":
                             aggregations[field] = {"value": sum(p[0] for p in dv)}
+                        elif agg_type == "date_histogram":
+                            # dv: list of (term_str, count) from terms.bin
+                            # term_str is YYYYMMDD for date fields
+                            agg_cfg = agg_configs.get("date_histogram", {})
+                            interval = _normalize_calendar_interval(
+                                agg_cfg.get("interval", "day"),
+                                agg_cfg.get("calendar_interval", "day")
+                            )
+                            buckets_dict: dict[str, int] = {}
+                            for term_str, count in dv:
+                                bucket_key = _date_term_to_bucket(term_str, interval)
+                                buckets_dict[bucket_key] = buckets_dict.get(bucket_key, 0) + count
+                            buckets = [
+                                {"key_as_string": k, "key": k, "doc_count": c}
+                                for k, c in sorted(buckets_dict.items())
+                            ]
+                            aggregations[field] = {"buckets": buckets}
 
                 return {
                     "took": int((_time.perf_counter() - start) * 1000),
@@ -3335,17 +3383,13 @@ class QueryEngine:
                 aggregations[result_key] = {"value": cardinality_sketch.count()}
 
             elif agg_type == "date_histogram":
-                interval = agg_config.get("interval", "day")
+                interval = _normalize_calendar_interval(
+                    agg_config.get("interval", "day"),
+                    agg_config.get("calendar_interval", "day"),
+                )
                 processed = Counter()
                 for k, c in date_counter.items():
-                    if interval == "hour" and len(k) >= 8:
-                        key = k[:8] + "0000"
-                    elif interval == "month" and len(k) >= 6:
-                        key = k[:6]
-                    elif interval == "year" and len(k) >= 4:
-                        key = k[:4]
-                    else:
-                        key = k[:8] if len(k) >= 8 else k
+                    key = _date_term_to_bucket(k, interval)
                     processed[key] += c
                 buckets = [
                     {"key_as_string": k, "key": k, "doc_count": c}

@@ -1,5 +1,6 @@
 """Dependency injection for Flatseek API."""
 
+import fnmatch
 import os
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -36,6 +37,9 @@ class IndexManager:
         # Discovered .fsk files in data_dir: index_name → Path
         # Populated lazily on first list_indices() or get_engine() call
         self._fsk_index_map: dict[str, Path] = {}
+        # Tracks which data_dir the _fsk_index_map was built for.
+        # Reset when FLATSEEK_DATA_DIR changes between calls.
+        self._fsk_index_map_data_dir: str | None = None
         # Per-index encryption keys (set by authenticate route)
         self._enc_keys: dict[str, bytes] = {}
         # Per-index passphrases (set by authenticate route for enclosed format only)
@@ -49,11 +53,20 @@ class IndexManager:
         if self._single_file_path:
             self._init_single_file_engine()
 
+    def _ensure_fresh(self) -> None:
+        """Invalidate _fsk_index_map if FLATSEEK_DATA_DIR changed since last discovery."""
+        current = self.data_dir
+        if self._fsk_index_map_data_dir != current:
+            self._fsk_index_map = {}
+            self._fsk_index_map_data_dir = current
+
     def _discover_local_fsk(self) -> None:
         """Walk data_dir and register every .fsk file as an index.
 
         Called lazily on first list/get call when in local-dir mode.
+        Resets automatically if FLATSEEK_DATA_DIR changed since last call.
         """
+        self._ensure_fresh()
         import base64
         import json
 
@@ -79,6 +92,100 @@ class IndexManager:
                         pass
         except Exception:
             pass
+
+    def expand_index_pattern(
+        self,
+        pattern: str,
+        start: str | None = None,
+        end: str | None = None,
+    ) -> list[str]:
+        """Expand a pattern (or comma-separated patterns) to matching FSK index names.
+
+        Args:
+            pattern: Glob pattern, e.g. "logs_*", "a?", "a,b,c", "logs_*,events_*"
+            start: Optional YYYYMMDD date to prune indices before this date.
+                   Applied after pattern expansion. Index names must contain a
+                   date-like segment (e.g. logs_2025-01, events_20250115).
+            end:   Optional YYYYMMDD date to prune indices after this date.
+
+        Returns:
+            Sorted deduplicated list of matching index names (stems of .fsk files)
+        """
+        import re
+
+        self._ensure_fresh()
+        if not self._fsk_index_map:
+            self._discover_local_fsk()
+        all_names = sorted(self._fsk_index_map.keys())
+        # Handle comma-separated patterns (Elasticsearch-style): "a,b,c" → match each
+        seen: set[str] = set()
+        for part in pattern.split(","):
+            seen.update(fnmatch.filter(all_names, part.strip()))
+
+        if not start and not end:
+            return sorted(seen)
+
+        # Date-based pruning: extract date-like segment from index names
+        # Patterns: logs_2025-01, logs_202501, events_2025-01-15, shard_2025q1
+        DATE_SEG_RE = re.compile(r"(\d{4}[-_]?\d{2}[-_]?\d{0,2})")
+
+        def _index_date(name: str) -> str | None:
+            m = DATE_SEG_RE.search(name)
+            if not m:
+                return None
+            date_str = m.group(1).replace("-", "").replace("_", "")
+            # normalize to YYYYMMDD (pad to 8 chars)
+            if len(date_str) == 6:
+                date_str += "01"
+            if len(date_str) == 4:
+                date_str += "0101"
+            return date_str  # YYYYMMDD or YYYYMM or YYYY
+
+        start_norm = start.replace("-", "").replace("_", "") if start else None
+        end_norm = end.replace("-", "").replace("_", "") if end else None
+
+        filtered: list[str] = []
+        for name in sorted(seen):
+            idx_date = _index_date(name)
+            if idx_date is None:
+                # No date segment — include unless start/end are specified
+                # (indices without dates can't be pruned by date)
+                if start_norm or end_norm:
+                    continue
+                filtered.append(name)
+                continue
+            if start_norm and idx_date < start_norm:
+                continue
+            if end_norm and idx_date > end_norm:
+                continue
+            filtered.append(name)
+
+        return filtered
+
+    def get_engines_for_pattern(
+        self,
+        pattern: str,
+        bucket_url: str | None = None,
+        start: str | None = None,
+        end: str | None = None,
+    ) -> list[tuple[str, "QueryEngine"]]:
+        """Get open QueryEngine instances for all FSK indices matching pattern.
+
+        Args:
+            pattern: Glob pattern, e.g. "logs_*"
+            start: Optional YYYYMMDD date to prune indices before this date.
+            end:   Optional YYYYMMDD date to prune indices after this date.
+
+        Returns:
+            List of (index_name, engine) tuples, sorted by index_name.
+            Engines are lazily opened and cached.
+        """
+        names = self.expand_index_pattern(pattern, start=start, end=end)
+        result: list[tuple[str, "QueryEngine"]] = []
+        for name in names:
+            eng = self.get_engine(name, bucket_url=bucket_url)
+            result.append((name, eng))
+        return result
 
     def _open_fsk_engine(self, index: str) -> "QueryEngine":
         """Lazily open a QueryEngine for a .fsk file."""
@@ -417,6 +524,8 @@ class IndexManager:
             return self._single_file_engine
 
         # Lazily discover local .fsk files if in local-dir mode
+        if not bucket_url:
+            self._ensure_fresh()
         if not self._fsk_index_map and not bucket_url:
             self._discover_local_fsk()
 
@@ -790,6 +899,16 @@ def get_index_manager() -> IndexManager:
         # Once created, the manager's storage is fixed for its lifetime.
         # Per-request bucket storage is handled by _get_bucket_storage().
     return _index_manager
+
+
+def reset_index_manager() -> None:
+    """Reset the global IndexManager singleton.
+
+    Call this in tests before patching FLATSEEK_DATA_DIR so the next
+    get_index_manager() call creates a fresh manager with the new env.
+    """
+    global _index_manager
+    _index_manager = None
 
 
 async def get_query_engine(

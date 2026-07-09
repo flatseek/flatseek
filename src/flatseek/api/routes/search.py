@@ -55,6 +55,54 @@ def _parse_sort(raw):
     return None
 
 
+def _multi_index_paginate(
+    per_eng: list[tuple[Any, list[int]]],
+    page: int,
+    page_size: int,
+) -> dict[str, Any]:
+    """Paginate across (engine, doc_ids) pairs, tagging each doc with _index.
+
+    Replicates the logic of QE._multi_paginate but standalone so it can be
+    called from the API layer without needing a QE instance.
+    """
+    import os
+    # Sort engines by name for stable ordering
+    per_eng_sorted = sorted(per_eng, key=lambda x: getattr(x[0], "data_dir", str(x[0])))
+
+    total = sum(len(ids) for _, ids in per_eng_sorted)
+    start = page * page_size
+    end = start + page_size
+    results: list[dict[str, Any]] = []
+    offset = 0
+
+    for eng, ids in per_eng_sorted:
+        n = len(ids)
+        lo = max(0, start - offset)
+        hi = min(n, end - offset)
+        if lo < hi:
+            docs = eng._fetch_docs(ids[lo:hi])
+            # For FSK-based engines (FlatseekFileStorageAdapter), storage.path
+            # has the actual .fsk path; for directory-based engines, data_dir
+            # has the directory path. Use whichever is meaningful.
+            eng_path = getattr(eng, "data_dir", str(eng))
+            storage = getattr(eng, "storage", None)
+            if storage is not None:
+                storage_path = getattr(storage, "path", None)
+                if storage_path:
+                    eng_path = str(storage_path)
+            idx_name = os.path.basename(eng_path)
+            if idx_name.endswith(".fsk") or idx_name.endswith(".flatseek") or idx_name.endswith(".flat"):
+                idx_name = idx_name.rsplit(".", 1)[0]
+            for doc in docs:
+                doc["_index"] = idx_name
+            results.extend(docs)
+        offset += n
+        if offset >= end:
+            break
+
+    return {"total": total, "page": page, "page_size": page_size, "results": results}
+
+
 # ─── OpenAPI Response Schemas ───────────────────────────────────────────────────
 # Flexible schemas — no hardcoded field names so any dataset type works.
 
@@ -209,11 +257,115 @@ async def search(
     manager: IndexManager = Depends(get_index_manager),
 ):
     """Search with request body or query params."""
+
+    # ── Multi-index search: _index pattern — checked BEFORE engine resolution ──
+    # Parse params first so we can detect _index before calling get_engine
+    query = None
+    if body and isinstance(body, dict):
+        query = body.get("query") or body.get("q")
+    if query is None:
+        query = q
+    if not query:
+        query = "*"
+
+    req_size = None
+    if body and isinstance(body, dict):
+        req_size = body.get("size")
+    req_size = min(req_size if req_size is not None else size, 1000)
+
+    req_from = None
+    if body and isinstance(body, dict):
+        req_from = body.get("from") or body.get("from_")
+    req_from = req_from if req_from is not None else from_
+
+    sort_spec = None
+    if body and isinstance(body, dict):
+        raw_sort = body.get("sort")
+        if raw_sort:
+            sort_spec = _parse_sort(raw_sort)
+    if sort_spec is None and sort:
+        sort_spec = _parse_sort(sort)
+
+    index_pattern = body.get("_index") if body and isinstance(body, dict) else None
+    if index_pattern:
+        # Multi-index: no single engine to resolve. Handle in multi-index branch.
+        time_start = time.perf_counter()
+        # Date-pruning: start/end params in YYYYMMDD format
+        prune_start = body.get("start") if body and isinstance(body, dict) else None
+        prune_end = body.get("end") if body and isinstance(body, dict) else None
+        matched_indices = manager.expand_index_pattern(index_pattern, start=prune_start, end=prune_end)
+        if not matched_indices:
+            return {
+                "_index": index_pattern,
+                "hits": {"total": 0, "hits": []},
+                "took": int((time.perf_counter() - time_start) * 1000),
+            }
+
+        # Parse the query once (same AST for all engines)
+        from flatseek.core.query_parser import parse, execute
+        try:
+            ast = parse(query) if query != "*" and query != "" else None
+        except Exception:
+            raise HTTPException(400, f"Invalid query: {query}")
+
+        # Get open engines for all matching indices
+        try:
+            engs_for_pattern = manager.get_engines_for_pattern(
+                index_pattern, bucket_url=bucket, start=prune_start, end=prune_end
+            )
+        except Exception as e:
+            raise HTTPException(500, f"Failed to open indices: {e}")
+
+        import concurrent.futures
+
+        def _query_one_index(name_eng: tuple[str, Any]) -> tuple[Any, list[int]]:
+            name, eng = name_eng
+            try:
+                if query == "*" or query == "":
+                    ids = eng._resolve("", None)
+                    ids = list(ids) if ids else []
+                else:
+                    ids = sorted(execute(ast, eng))
+                ids = eng._alive_ids(ids) if hasattr(eng, "_alive_ids") else ids
+                return eng, ids
+            except Exception:
+                return eng, []
+
+        per_eng: list[tuple[Any, list[int]]] = []
+        try:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(len(engs_for_pattern), 8)
+            ) as pool:
+                futures = {pool.submit(_query_one_index, ne): ne for ne in engs_for_pattern}
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        eng, ids = future.result()
+                    except Exception:
+                        ne = futures[future]
+                        eng = ne[1]
+                        ids = []
+                    per_eng.append((eng, ids))
+        except Exception as e:
+            raise HTTPException(500, f"Multi-index search failed: {e}")
+
+        page = req_from // max(req_size, 1)
+        result = _multi_index_paginate(per_eng, page, req_size)
+        result["took"] = int((time.perf_counter() - time_start) * 1000)
+        return {
+            "_index": index_pattern,
+            "hits": {
+                "total": result["total"],
+                "hits": [
+                    {"_id": req_from + i, "_score": 1.0, "_source": doc}
+                    for i, doc in enumerate(result["results"])
+                ],
+            },
+            "took": result["took"],
+        }
+
+    # ── Single-index path (existing logic) ───────────────────────────────────
     encrypted = manager.is_encrypted(index, bucket)
     if encrypted:
-        # Password must come from request header or session (already authenticated).
-        # Using session key from _authenticate endpoint (stored in _enc_keys) allows
-        # authenticated sessions to skip the header on subsequent requests.
         stored_pass = request.headers.get("x-index-password") if request else None
         already_authed = manager._enc_keys.get(index) is not None
         if not stored_pass and not already_authed:
@@ -225,7 +377,6 @@ async def search(
     try:
         engine = manager.get_engine(index, bucket_url=bucket)
     except PermissionError as e:
-        # Encrypted FSK that needs auth — re-raise as 401
         raise HTTPException(401, str(e)) from e
     except Exception as e:
         raise HTTPException(404, f"Index not found: {e}") from e
@@ -241,7 +392,6 @@ async def search(
                 key = load_encryption_key(None, stored_pass, meta)
                 engine.set_key(key)
             elif index in manager._fsk_index_map:
-                # .fsk file: read manifest bytes directly to get _encryption_b64
                 fsk_path = manager._fsk_index_map[index]
                 import struct as _struct
                 _ENC_MAGIC = b"FLATSEEK\x01"
@@ -273,9 +423,6 @@ async def search(
                             break
                 except Exception:
                     pass
-                # Use already-stored session key if available (handles both _encryption_b64
-                # and _K_inner_encrypted/license mode where _authenticate already derived the key).
-                # Only raise 401 if we have no stored key AND no enc_meta to derive from.
                 if already_authed and not stored_pass:
                     key = manager._enc_keys[index]
                 elif enc_meta is None:
@@ -286,10 +433,9 @@ async def search(
             else:
                 index_dir = os.path.join(manager.data_dir, index)
                 if not os.path.isdir(os.path.join(index_dir, "index")):
-                    index_dir = manager.data_dir  # data_dir IS the index (unpacked .fsk)
+                    index_dir = manager.data_dir
                 key = load_encryption_key(index_dir, stored_pass)
                 engine.set_key(key)
-            # Reload stats after set_key — encrypted stats.json needs the key to decrypt
             await asyncio.to_thread(engine.reload_stats)
         except Exception as exc:
             raise HTTPException(401, "Invalid passphrase for encrypted index")
@@ -301,17 +447,7 @@ async def search(
         if request and await request.is_disconnected():
             raise HTTPException(499, "Client disconnected")
 
-        # Priority: body.query > body.q > URL query param q > "*"
-        query = body.get('query') if body else None
-        if query is None and body:
-            query = body.get('q')
-        if q and query is None:
-            query = q
-        if not query:
-            query = "*"
-
         # Use body params if provided, else query params
-        # Enforce maximum size to prevent overload
         MAX_SIZE = 1000
 
         req_size = body.get('size') if body else None
@@ -319,13 +455,7 @@ async def search(
         req_from = body.get('from', body.get('from_')) if body else None
         req_from = req_from if req_from is not None else from_
 
-        # Parse sort parameter
-        sort_spec = None
-        raw_sort = body.get("sort") if body else None
-        if raw_sort:
-            sort_spec = _parse_sort(raw_sort)
-        elif sort:
-            sort_spec = _parse_sort(sort)
+        # ── Single-index search ───────────────────────────────────────────────
 
         # Route queries to engine.query() or engine.search():
         # - engine.query() handles Lucene DSL (field:term, AND/OR/NOT, wildcards)

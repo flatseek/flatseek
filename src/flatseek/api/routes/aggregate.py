@@ -89,10 +89,111 @@ async def aggregate(
                 f"Index '{index}' is encrypted. Passphrase required via X-Index-Password header."
             )
 
+    _AGG_TIMEOUT = int(os.environ.get("FLATSEEK_TIMEOUT_AGG", 300))
+    query = body.get("query", None)
+    size = body.get("size", 10)
+    aggs = body.get("aggs", {})
+    index_pattern = body.get("_index") if body and isinstance(body, dict) else None
+
+    # ── Multi-index aggregation (check BEFORE engine resolution) ─────────────────
+    if index_pattern:
+        # Date-pruning: start/end params in YYYYMMDD format
+        prune_start = body.get("start") if body and isinstance(body, dict) else None
+        prune_end = body.get("end") if body and isinstance(body, dict) else None
+        matched = manager.expand_index_pattern(index_pattern, start=prune_start, end=prune_end)
+        if not matched:
+            return {"aggregations": {}, "total": 0, "hits": {"total": 0}}
+
+        import concurrent.futures
+        from collections import Counter
+
+        def _agg_one(name_eng):
+            name, eng = name_eng
+            try:
+                eng.reload_stats()
+                return name, eng.aggregate(q=query, aggs=aggs, size=size)
+            except Exception:
+                return name, {"aggregations": {}, "total": 0}
+
+        try:
+            engs = manager.get_engines_for_pattern(
+                index_pattern, bucket_url=bucket, start=prune_start, end=prune_end
+            )
+        except Exception as e:
+            raise HTTPException(500, f"Failed to open indices: {e}")
+
+        per_result = []
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(engs), 8)) as pool:
+                futures = {pool.submit(_agg_one, ne): ne for ne in engs}
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        name, result = future.result()
+                    except Exception:
+                        ne = futures[future]
+                        name, result = ne[0], {"aggregations": {}, "total": 0}
+                    per_result.append((name, result))
+        except Exception as e:
+            raise HTTPException(500, f"Multi-index aggregation failed: {e}")
+
+        total = sum(r.get("total", 0) for _, r in per_result)
+        merged_aggs = {}
+
+        all_agg_keys = set()
+        for _, r in per_result:
+            all_agg_keys.update(r.get("aggregations", {}).keys())
+
+        for agg_key in all_agg_keys:
+            agg_config = None
+            for _, r in per_result:
+                if agg_key in r.get("aggregations", {}):
+                    agg_config = r["aggregations"][agg_key]
+                    break
+            if agg_config is None:
+                continue
+
+            if "buckets" in agg_config:
+                bucket_counter = Counter()
+                bucket_key_map = {}
+                for _, r in per_result:
+                    for b in r.get("aggregations", {}).get(agg_key, {}).get("buckets", []):
+                        bucket_counter[b["key"]] += b["doc_count"]
+                        if b["key"] not in bucket_key_map:
+                            bucket_key_map[b["key"]] = b
+                merged_buckets = [
+                    {**bucket_key_map[k], "doc_count": c}
+                    for k, c in sorted(bucket_counter.items())
+                ]
+                merged_aggs[agg_key] = {"buckets": merged_buckets}
+            elif "count" in agg_config:
+                all_stats = [r.get("aggregations", {}).get(agg_key, {}) for _, r in per_result]
+                cnt = sum(s.get("count", 0) for s in all_stats)
+                s_sum = sum(s.get("sum", 0) for s in all_stats)
+                mn_vals = [s["min"] for s in all_stats if s.get("count", 0) > 0]
+                mx_vals = [s["max"] for s in all_stats if s.get("count", 0) > 0]
+                mn = min(mn_vals) if mn_vals else 0
+                mx = max(mx_vals) if mx_vals else 0
+                merged_aggs[agg_key] = {
+                    "count": cnt,
+                    "min": mn if cnt > 0 else 0,
+                    "max": mx if cnt > 0 else 0,
+                    "avg": s_sum / cnt if cnt > 0 else 0,
+                    "sum": s_sum,
+                }
+            elif "value" in agg_config:
+                all_vals = [r.get("aggregations", {}).get(agg_key, {}) for _, r in per_result]
+                merged_aggs[agg_key] = {
+                    "value": sum(s.get("value", 0) for s in all_vals),
+                    "count": sum(s.get("count", 0) for s in all_vals),
+                }
+
+        return {"aggregations": merged_aggs, "total": total, "hits": {"total": total}}
+
+    # ── Single-index aggregation ────────────────────────────────────────────
     try:
         engine = manager.get_engine(index, bucket_url=bucket)
     except Exception as e:
-        raise HTTPException(404, f"Index not found: {index}") from e
+        raise HTTPException(404, f"Index not found: {e}") from e
 
     if encrypted:
         try:
@@ -105,7 +206,6 @@ async def aggregate(
                 key = load_encryption_key(None, stored_pass, meta)
                 engine.set_key(key)
             elif index in manager._fsk_index_map:
-                # .fsk file: read manifest bytes directly to get _encryption_b64
                 fsk_path = manager._fsk_index_map[index]
                 import struct as _struct
                 _ENC_MAGIC = b"FLATSEEK\x01"
@@ -144,22 +244,14 @@ async def aggregate(
             else:
                 index_dir = os.path.join(manager.data_dir, index)
                 if not os.path.isdir(os.path.join(index_dir, "index")):
-                    index_dir = manager.data_dir  # data_dir IS the index (unpacked .fsk)
+                    index_dir = manager.data_dir
                 key = load_encryption_key(index_dir, stored_pass)
                 engine.set_key(key)
-            # Reload stats after set_key — encrypted stats.json needs the key to decrypt
             await asyncio.to_thread(engine.reload_stats)
         except Exception:
             raise HTTPException(401, "Invalid passphrase for encrypted index")
 
-
-    _AGG_TIMEOUT = int(os.environ.get("FLATSEEK_TIMEOUT_AGG", 300))
-    query = body.get("query", None)
-    size = body.get("size", 10)
-    aggs = body.get("aggs", {})
-
     try:
-        # reload_stats + aggregate both decrypt encrypted data — wrong key fails here
         async def _run():
             await asyncio.to_thread(engine.reload_stats)
             return await asyncio.to_thread(
@@ -170,12 +262,8 @@ async def aggregate(
     except asyncio.TimeoutError:
         raise HTTPException(504, f"Aggregation timed out after {_AGG_TIMEOUT}s. Try a narrower query or fewer aggregations.")
     except MemoryError as e:
-        raise HTTPException(
-            503,
-            f"Memory limit exceeded: {e}. Try a narrower query or fewer aggregations."
-        ) from e
+        raise HTTPException(503, f"Memory limit exceeded: {e}. Try a narrower query or fewer aggregations.")
     except Exception as e:
-        # Wrong key / corrupted encrypted data → 401 (not 500).
         try:
             from cryptography.fernet import InvalidToken as _IT
         except ImportError:
@@ -184,6 +272,7 @@ async def aggregate(
             raise HTTPException(401, "Invalid passphrase for encrypted index")
         if isinstance(e, HTTPException):
             raise e
+        raise
         raise   # re-raise other errors as 500
 
 
