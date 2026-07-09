@@ -3103,7 +3103,7 @@ def _expand_record(obj, prefix="", sep="."):
 
         # `parsed` is now a dict or list. Recurse / expand.
         if isinstance(parsed, dict):
-            result.update(_expand_record(parsed, full_key + sep, sep))
+            result.update(_expand_record(parsed, full_key + (sep or "."), sep))
         else:  # list
             result[full_key] = json.dumps(parsed, ensure_ascii=False)
             for i, item in enumerate(parsed):
