@@ -4,7 +4,7 @@
 
 # Flatseek
 
-**Full-text search over flat files and remote datasets.** No JVM. No cluster. No operational overhead.
+**Powerful disk-first full-text search without the infrastructure.**
 
 <p align="center">
   <img src="docs/assets/dashboard.png" alt="Flatlens Dashboard" width="100%" />
@@ -12,7 +12,8 @@
 
 <p align="center">
   <em>
-    Explore, filter, and aggregate CSV/JSON like a spreadsheet with search-grade power — run locally or query directly from Public/HuggingFace datasets.
+Explore, filter, and search structured data at any scale —  
+from live application data to historical archives, and AI-ready datasets.
   </em>
 </p>
 
@@ -25,7 +26,7 @@
 &nbsp;&middot;&nbsp;
 **Docs:** [flatseek.io/docs](https://flatseek.io/docs)
 &nbsp;&middot;&nbsp;
-**Dashboard:** [flatlens](https://github.com/flatseek/flatlens)
+**Dashboard:** [Flatlens](https://github.com/flatseek/flatlens)
 &nbsp;&middot;&nbsp;
 **Benchmark:** [flatbench](https://github.com/flatseek/flatbench)
 &nbsp;&middot;&nbsp;
@@ -35,173 +36,115 @@
 
 ---
 
-# Why Flatseek
-<small>
+## See it work
 
-- **Exact-by-design engine**
-  Query results are deterministic with full-count accuracy on flat files.
-- **No infra required**
-  Run locally as a single binary or deploy as a lightweight API sidecar.
-- **Millisecond search performance**
-  Built for interactive exploration over large datasets.
-
-- **Portable single-file archives (`.fsk`)**
-  Package entire indexed datasets into a single `.fsk` archive for easy sharing, backup, and transport. Move datasets across machines or environments without rebuilding indexes.
-
-- **Zero-ops distribution**
-  Store and query indexes directly from Hugging Face, S3, or Vercel Blob.
-
-- **Instant dataset access**
-  Paste a dataset URL in Flatlens and start searching immediately — no ingestion pipeline needed.
-
-- **Built-in analytics dashboard**
-  Spreadsheet-like experience with Kibana-style filtering, aggregation, and exploration — closer to Microsoft Excel for structured search workflows.
-
-- **Developer-first embedding**
-  Use as a Python library or full API without running a cluster or managing nodes.
-  </small>
-
----
-
-## Performance
-
-500K rows, article schema, SSD. Flatseek is 2× faster on search than Elasticsearch with exact counts where others silently miss.
-
-| Metric | Flatseek | Elasticsearch |
-|--------|----------|---------------|
-| Search p50 | **7.9ms** | 16.1ms |
-| Range query hits | 501,011 (exact) | 505,044 |
-| Build 500K rows | 216s | 113s |
-
-Full comparison (tantivy, typesense, whoosh, zincsearch): [docs/benchmark.md](/docs/benchmark.md) or
-[bench.flatseek.io](https://bench.flatseek.io)
-
----
-
-## Quick Start
+##### Search a 14 GB index hosted on HuggingFace through a serverless API running with only 2 GB of memory.
 
 ```bash
-# Install
-curl -fsSL flatseek.io/install.sh | sh
+# demo CLI
+flatseek search https://huggingface.co/datasets/flatseek/public-dataset/resolve/main/6.3M-books.fsk \
+  "title:dune"
 
-# Build index
-flatseek build ./data.csv -o ./data
+[reading remote index] ✓
+[searching remote] ✓
 
-# Serve API + dashboard
-flatseek serve -d ./data
+Found: 1,018 matches
 
-# Pack index into single portable file
-flatseek pack ./data -o ./data.fsk
-
-# Serve API + dashboard from single portable index file
-flatseek serve data.fsk
-
-# → API:
-# http://localhost:8000
-
-# → Dashboard:
-# http://localhost:8000/dashboard
-
-# Query
-flatseek search ./data "program:raydium AND amount:>1000000"
-
-# Query with sorting
-flatseek search ./data "*" --sort amount:desc
-
-# Query from single portable file
-flatseek search data.fsk "program:raydium AND amount:>1000000"
-
-# Export
-flatseek export ./data "program:raydium AND amount:>1000000" -f jsonl --out exported.jsonl
-flatseek export data.fsk "program:raydium AND amount:>1000000" -f jsonl --out exported.jsonl
-
-# Serve a .fsk archive directly from HTTP URL — no full download needed
-flatseek serve https://huggingface.co/datasets/owner/repo/resolve/main/data.fsk
+{'name':'Statisticity','author':['Yaron Glazer'],'genres':['Science Fiction'],'...':'...'}
 ```
----
-## Core Capabilities
+```
+# demo API
 
-- **Full text search** — tokenized, trigram-backed wildcard (`*kube*`)
-- **Range queries** — exact counts on numeric, date, keyword fields
-- **Sorting** — sort results by any field (asc/desc), multi-field, missing values last
-- **Aggregations** — terms, stats, min/max, cardinality, date histogram
-- **Array fields** — matches any element (`tags:graphql`)
-- **Nested objects** — dot-path queries (`address.city:Jakarta`)
-- **Boolean operators** — AND, OR, NOT with grouping
-- **Delete & Update** — delete or update documents by ID or Lucene query
-- **Bulk API** — Elasticsearch-compatible NDJSON bulk endpoint (`POST /{index}/_bulk_documents`) — index, create, update, delete in one call
-- **Compaction** — reclaim disk space after bulk deletes by rewriting the index
-- **Encryption at rest** — ChaCha20-Poly1305
-- **Parallel indexing** — multi-worker builds
-- **Remote querying** — search HuggingFace datasets without downloading
-- **REST API** — Elasticsearch-compatible endpoints
-- **Single-file archive (`.fsk`)** — portable, cryptographically signed index file
-- **Export to JSONL/CSV** — streaming, with query filter and resume
-- **Slice** — extract a query-matched subset as a new index
-- **Serve from HTTP URL** — open `.fsk` from HuggingFace/S3 without full download
+curl -X 'GET' \
+  'https://api.demo.flatseek.io/6.3M-books/_search?q=dune&from=0&size=20&bucket=https%3A%2F%2Fhuggingface.co%2Fdatasets%2Fflatseek%2Fpublic-dataset' \
+  -H 'accept: application/json'
+
+{"hits":{"total":1018,"hits":[{"_source":{"name":"Statisticity","author":["Yaron Glazer"],"...":"..."}}]},"took":1}
+```
+
+That query runs against 6.3M books dataset hosted on HuggingFace, and only pulls the
+byte ranges it needs to answer it. The same index also powers the
+[Flatlens - live dashboard](https://flatlens.demo.flatseek.io/?bucket=https://huggingface.co/datasets/flatseek/public-dataset&index=6.3M-books&q=dune) — try it with zero installation.
+
+---
+
+
+## The problem
+
+Distributed search engines like Elasticsearch and OpenSearch are excellent at
+large-scale production systems—but they assume always-on infrastructure.
+
+For many workloads, that means paying for 24/7 servers, storage, replicas,
+and operational overhead even when you're simply searching documents.
+
+Whether you're powering a production API, exploring a dataset, preparing
+training data, building a RAG pipeline, or publishing a searchable archive,
+the infrastructure often costs more than the search itself.
+
+Lightweight alternatives avoid the cluster, but they're usually limited to
+local files. If your data lives in S3, HuggingFace, or object storage, you still need to download it before you can search it, making remote search harder than it should be.
+
+## What Flatseek does differently
+
+Flatseek uses one query language across two index formats, so the same search
+engine works for both live production data and portable datasets.
+
+| | **Directory index** | **`.fsk` archive** |
+|---|---|---|
+| **Data** | Mutable | Immutable |
+| **Best for** | Production APIs, applications, internal analytics | AI & RAG datasets, training data, historical archives, public searchable datasets |
+| **Updates** | Inserts, updates, deletes | Rebuild the archive or renew the license |
+| **Distribution** | Multi-file index | Single portable file |
+
+Both formats expose the same query language, embedded library, CLI,
+and REST API—switching between mutable production data and immutable
+archives doesn't require changing your application.
+
+The `.fsk` format packages an entire index into a single portable file,
+making it easy to publish on object storage, CDN, or platforms with
+file-count limits while preserving the same query capabilities.
+
+---
+## Performance at a glance
+
+500K documents • Article schema • SSD • Compared against Elasticsearch
+
+| Metric | Flatseek | Elasticsearch |
+|--------|----------:|------------:|
+| Search p50 | **7.9ms** | 16.1ms |
+| Range query hits | 501,011 (exact) | 505,044 (approximate) |
+| Build 500K rows | 216s | **113s** |
+
+
+Full comparison including tantivy, Typesense, Whoosh, ZincSearch:
+[docs/benchmark.md](/docs/benchmark.md) or [bench.flatseek.io](https://bench.flatseek.io)
+
+---
+
+## Core capabilities
+| Capability | Description |
+|---|---|
+| **Full-text search** | Trigram-based search with wildcard (`*term*`), phrase, and boolean queries |
+| **Range queries** | Exact filtering on numeric, date, and keyword fields |
+| **Sorting** | Single or multi-field sorting with configurable missing values |
+| **Aggregations** | Terms, stats, min/max, cardinality, and date histograms |
+| **Nested & array fields** | Query nested objects and match values inside arrays |
+| **Mutable & immutable indexes** | One query engine for live production data and portable archives |
+| **Remote indexes** | Search HTTP-hosted indexes without downloading the entire dataset |
+| **Embedded library** | Query indexes directly from Python without running a server |
+| **REST API** | Elasticsearch-compatible Search and Bulk APIs |
+| **Parallel indexing** | Multi-worker index builds for faster ingestion |
+| **Compaction** | Reclaim disk space after large delete operations |
+| **Portable archives** | Package complete indexes into a single `.fsk` file |
+| **Distribution & licensing** | Public, password-protected, time-limited, or renewable license-based archives |
+| **Export** | Stream matching documents as JSONL or CSV |
+| **Slice** | Materialize query results as a new standalone index |
 
 See [docs/](docs/) for full details.
 
 ---
 
-## Search engine for public datasets instantly
-
-Flatseek can query indexes hosted remotely — no need to deploy or pay for expensive storage infrastructure. Build your Flatseek index locally, upload it to any free-cheap publicly accessible storage service, and instantly search and aggregate data from anywhere.
-
-Supported providers:
-
-- HuggingFace Datasets / Buckets
-- S3-compatible storage
-- Vercel Blob
-- Static HTTP hosting
-
-
-#### Samples
-
-| Dummy Dataset | Rows |
-|---|---|
-| Local Sample | [500 searchable rows](https://flatlens.demo.flatseek.io) |
-| [https://huggingface.co/datasets/flatseek/sample-articles](https://huggingface.co/datasets/flatseek/sample-articles) | [100K articles](https://flatlens.demo.flatseek.io/?bucket=https://huggingface.co/datasets/flatseek/sample-articles) |
-| [https://huggingface.co/datasets/flatseek/sample-adsb](https://huggingface.co/datasets/flatseek/sample-adsb) | [100K ADS-B records](https://flatlens.demo.flatseek.io/?bucket=https://huggingface.co/datasets/flatseek/sample-adsb) |
-| [https://huggingface.co/datasets/flatseek/sample-encrypted](https://huggingface.co/datasets/flatseek/sample-encrypted) | [100K encrypted rows](https://flatlens.demo.flatseek.io/?bucket=https://huggingface.co/datasets/flatseek/sample-encrypted) | Password: `flatseek` |
-
-<small>Encrypted datasets are supported with per-request passphrases.</small>
-
-#### Large Public Datasets (Remote single fsk dataset, lower speeds)
-
-| Dataset | Size | Rows | HuggingFace | Flatlens |
-|---|---|---|---|---|
-| 6.3M-books | 14.1 GB | 6.3M Books Dataset Goodreads | [HF link](https://huggingface.co/datasets/flatseek/public-dataset/blob/main/6.3M-books.fsk) | [Load →](https://flatlens.demo.flatseek.io/?bucket=https://huggingface.co/datasets/flatseek/public-dataset&index=6.3M-books) |
-| 1.2M-movies | 2.1 GB | 1.2M Movies Dataset TMDB | [HF link](https://huggingface.co/datasets/flatseek/public-dataset/blob/main/1.2M-movies.fsk) | [Load →](https://flatlens.demo.flatseek.io/?bucket=https://huggingface.co/datasets/flatseek/public-dataset&index=1.2M-movies) |
-| 5M-wikipedia | 1.39 GB | 5M Wikipedia articles | [HF link](https://huggingface.co/datasets/flatseek/public-dataset/blob/main/5M-wikipedia.fsk) | [Load →](https://flatlens.demo.flatseek.io/?bucket=https://huggingface.co/datasets/flatseek/public-dataset&index=5M-wikipedia) |
-| 1.2M-songs | 947 MB | 1.2M Spotify Tracks | [HF link](https://huggingface.co/datasets/flatseek/public-dataset/blob/main/1.2M-songs.fsk) | [Load →](https://flatlens.demo.flatseek.io/?bucket=https://huggingface.co/datasets/flatseek/public-dataset&index=1.2M-songs) |
-| 500k-startups | 600 MB | 500K ProductHunt launched 2013-2026 | [HF link](https://huggingface.co/datasets/flatseek/public-dataset/blob/main/500k-startups.fsk) | [Load →](https://flatlens.demo.flatseek.io/?bucket=https://huggingface.co/datasets/flatseek/public-dataset&index=500k-startups) |
-| 800k-domains | 539 MB | 800K WHOIS domain registration | [HF link](https://huggingface.co/datasets/flatseek/public-dataset/blob/main/800k-domains.fsk) | [Load →](https://flatlens.demo.flatseek.io/?bucket=https://huggingface.co/datasets/flatseek/public-dataset&index=800k-domains) |
-| 500k-actors | 84.2 MB | 500K Movie Actors | [HF link](https://huggingface.co/datasets/flatseek/public-dataset/blob/main/500k-actors.fsk) | [Load →](https://flatlens.demo.flatseek.io/?bucket=https://huggingface.co/datasets/flatseek/public-dataset&index=500k-actors) |
-| 271k-athletes | 75.6 MB | 271K Olympics Athletes 1800-2000 | [HF link](https://huggingface.co/datasets/flatseek/public-dataset/blob/main/271k-athletes.fsk) | [Load →](https://flatlens.demo.flatseek.io/?bucket=https://huggingface.co/datasets/flatseek/public-dataset&index=271k-athletes) |
-
-<small>Million search-ready rows hosted free on [flatseek/public-dataset](https://huggingface.co/datasets/flatseek/public-dataset) (19.9 GB total).
-Query directly via HTTP Range — no full download needed.</small>
-
----
-
-## Docs
-
-| Guide | Description |
-|-------|-------------|
-| [Quick Start](docs/quickstart.md) | Install, index, query — in 5 minutes |
-| [Indexing](docs/indexing.md) | Formats, column types, parallel builds, encrypt |
-| [Query Language](docs/query-language.md) | Full syntax reference |
-| [CLI Reference](docs/cli.md) | All CLI commands |
-| [REST API](docs/api.md) | API endpoints |
-| [Remote Storage](docs/storage.md) | HuggingFace, S3, Vercel Blob |
-| [Schemas](docs/schemas.md) | Supported Column Types |
-| [Architecture](docs/architecture.md) | Structural and behavioral map |
-| [Internals](docs/internals.md) | Deep technical breakdown |
-
----
-
-## Install
+## Installation
 
 ### Recommended — one-liner
 
@@ -209,7 +152,10 @@ Query directly via HTTP Range — no full download needed.</small>
 curl -fsSL flatseek.io/install.sh | sh
 ```
 
-Includes API server + Flatlens dashboard (`http://localhost:8000/dashboard`).
+Includes:
+• CLI
+• REST API
+• Flatlens dashboard (`http://localhost:8000/dashboard`)
 
 ### PyPI
 
@@ -217,7 +163,7 @@ Includes API server + Flatlens dashboard (`http://localhost:8000/dashboard`).
 pip install flatseek
 ```
 
-CLI only. For [Flatlens dashboard](https://github.com/flatseek/flatlens):
+CLI only. For the [Flatlens dashboard](https://github.com/flatseek/flatlens):
 
 ```bash
 git clone https://github.com/flatseek/flatlens
@@ -235,6 +181,130 @@ pip install -e .
 
 ---
 
+## Quick start
+
+```bash
+# Generate 100K dummy data
+flatseek generate -r 100000 -s article -f csv -o ./data.csv
+
+# Build index
+flatseek build ./data.csv -o ./data
+
+# Query via CLI
+flatseek search ./data "program:raydium AND amount:>1000000"
+
+# Serve API + dashboard
+flatseek serve -d ./data
+
+# Pack index into single portable .fsk file
+flatseek pack ./data -o ./data.fsk
+
+# Query from portable file
+flatseek search data.fsk "program:raydium AND amount:>1000000"
+
+# Serve API + dashboard from portable file
+flatseek serve data.fsk
+
+# Query a .fsk archive directly from HTTP — no full download
+flatseek search https://huggingface.co/datasets/owner/repo/resolve/main/data.fsk "program:raydium AND amount:>1000000"
+
+# Serve a .fsk archive directly from HTTP — no full download
+flatseek serve https://huggingface.co/datasets/owner/repo/resolve/main/data.fsk
+
+# Export results
+flatseek export ./data "program:raydium AND amount:>1000000" -f jsonl --out exported.jsonl
+flatseek export data.fsk "program:raydium AND amount:>1000000" -f jsonl --out exported.jsonl
+
+```
+
+→ API: [http://localhost:8000](http://localhost:8000)
+→ Dashboard: [http://localhost:8000/dashboard](http://localhost:8000/dashboard)
+
+---
+
+## Remote datasets
+
+Build an index once, upload it to any HTTP-accessible storage, and query it
+from anywhere using the same embedded library, CLI, or REST API.
+
+Flatseek reads only the byte ranges required to answer each query, so even
+large indexes can be searched remotely without downloading the entire file.
+
+**Supported providers:**
+
+- HuggingFace Datasets / Buckets
+- S3-compatible storage (Amazon S3, MinIO, Cloudflare R2)
+- Vercel Blob
+- Any static HTTP server or CDN
+
+**Try it now:** Use the live dashboard at
+[flatlens.demo.flatseek.io](https://flatlens.demo.flatseek.io) to explore
+remote `.fsk` indexes directly from your browser—no installation required.
+
+---
+
+## Example indexed datasets
+
+All datasets below are hosted on HuggingFace. The Flatseek API serving the
+dashboard is deployed on a free Vercel hobby account — and it searches a
+14 GB index in under 5 seconds by fetching only the byte ranges it needs.
+
+| Dataset | Index Size | Documents | Index File | Try in Flatlens |
+|---|---:|---:|---|---|
+| **6.3M Books** | 14.1 GB | 6.3M Goodreads books | [Download](https://huggingface.co/datasets/flatseek/public-dataset/blob/main/6.3M-books.fsk) | [Open →](https://flatlens.demo.flatseek.io/?bucket=https://huggingface.co/datasets/flatseek/public-dataset&index=6.3M-books) |
+| **1.2M Movies** | 2.1 GB | 1.2M TMDB movies | [Download](https://huggingface.co/datasets/flatseek/public-dataset/blob/main/1.2M-movies.fsk) | [Open →](https://flatlens.demo.flatseek.io/?bucket=https://huggingface.co/datasets/flatseek/public-dataset&index=1.2M-movies) |
+| **5M Wikipedia** | 1.39 GB | 5M Wikipedia articles | [Download](https://huggingface.co/datasets/flatseek/public-dataset/blob/main/5M-wikipedia.fsk) | [Open →](https://flatlens.demo.flatseek.io/?bucket=https://huggingface.co/datasets/flatseek/public-dataset&index=5M-wikipedia) |
+| **1.2M Songs** | 947 MB | 1.2M Spotify tracks | [Download](https://huggingface.co/datasets/flatseek/public-dataset/blob/main/1.2M-songs.fsk) | [Open →](https://flatlens.demo.flatseek.io/?bucket=https://huggingface.co/datasets/flatseek/public-dataset&index=1.2M-songs) |
+| **500K Startups** | 600 MB | 500K Product Hunt launches (2013–2026) | [Download](https://huggingface.co/datasets/flatseek/public-dataset/blob/main/500k-startups.fsk) | [Open →](https://flatlens.demo.flatseek.io/?bucket=https://huggingface.co/datasets/flatseek/public-dataset&index=500k-startups) |
+| **800K Domains** | 539 MB | 800K WHOIS domain registrations | [Download](https://huggingface.co/datasets/flatseek/public-dataset/blob/main/800k-domains.fsk) | [Open →](https://flatlens.demo.flatseek.io/?bucket=https://huggingface.co/datasets/flatseek/public-dataset&index=800k-domains) |
+| **500K Actors** | 84.2 MB | 500K movie actors | [Download](https://huggingface.co/datasets/flatseek/public-dataset/blob/main/500k-actors.fsk) | [Open →](https://flatlens.demo.flatseek.io/?bucket=https://huggingface.co/datasets/flatseek/public-dataset&index=500k-actors) |
+| **271K Athletes** | 75.6 MB | 271K Olympic athletes (1800–2000) | [Download](https://huggingface.co/datasets/flatseek/public-dataset/blob/main/271k-athletes.fsk) | [Open →](https://flatlens.demo.flatseek.io/?bucket=https://huggingface.co/datasets/flatseek/public-dataset&index=271k-athletes) |
+
+---
+
+## Distribution & Licensing
+
+Flatseek supports four distribution models, depending on your distribution and access-control requirements.
+
+| Model | Format | Index File | Encryption | Expiration | Access Renewal |
+|---|---|---|---|---|---|
+| **Public** | Folder | [sample-articles](https://huggingface.co/datasets/flatseek/sample-articles) | None | Never | — |
+| **Password-Protected** | Folder | [sample-encrypted](https://huggingface.co/datasets/flatseek/sample-encrypted) | Per-file ChaCha20 | Never | Change the passphrase |
+| **Time-Limited** | Single `.fsk` | [demo_enclosed_active](https://huggingface.co/datasets/flatseek/sample-distributions) | Full-file ChaCha20 | Fixed date | Must repack the archive |
+| **License-Based** | Single `.fsk` | [demo_license](https://huggingface.co/datasets/flatseek/sample-distributions) | Section-level ChaCha20 | Renewable token | Issue a new token — no repack needed |
+
+**Key difference — time-limited vs. license-based:** when a time-limited
+archive expires, you must repack it from existing non-fsk index to extend access. When a
+license-based archive expires, you issue a new HMAC token — the index
+itself stays unchanged.
+
+> The credentials below are public demo credentials for the samples above — not secrets.
+
+| Model | Dashboard link | Credentials |
+|---|---|---|
+| Public folder | [sample-articles →](https://flatlens.demo.flatseek.io/?bucket=https://huggingface.co/datasets/flatseek&index=sample-articles) | None |
+| Password-protected folder | [sample-encrypted →](https://flatlens.demo.flatseek.io/?bucket=https://huggingface.co/datasets/flatseek&index=sample-encrypted) | Passphrase: `flatseek` |
+| Time-limited `.fsk` | [demo_enclosed_active →](https://flatlens.demo.flatseek.io/?bucket=https://huggingface.co/datasets/flatseek/sample-distributions&index=demo_enclosed_active) | Passphrase: `flatlens_demo_enclosed` |
+| License-based `.fsk` | [demo_license →](https://flatlens.demo.flatseek.io/?bucket=https://huggingface.co/datasets/flatseek/sample-distributions&index=demo_license) | Token: `ZGVtby11c2VyfDE4MTQ3NDU2MDB8MHxtUkJaTkN4WUdLeWhrV2NUMGN3Wlo0MkhUc1IvelNpYXBzUGo4a2tZdVhzPQ==` |
+
+---
+
+## Full Documentation
+
+| Guide | Description |
+|-------|-------------|
+| [Quick Start](docs/quickstart.md) | Install, index, query — in 5 minutes |
+| [Indexing](docs/indexing.md) | Formats, column types, parallel builds, encryption |
+| [Query Language](docs/query-language.md) | Full syntax reference |
+| [CLI Reference](docs/cli.md) | All CLI commands |
+| [REST API](docs/api.md) | API endpoints |
+| [Remote Storage](docs/storage.md) | HuggingFace, S3, Vercel Blob |
+| [Schemas](docs/schemas.md) | Supported column types |
+| [Architecture](docs/architecture.md) | Structural and behavioral map |
+| [Internals](docs/internals.md) | Deep technical breakdown |
+
+---
+
 ## Contributing
 
 PRs welcome. Run tests:
@@ -244,9 +314,7 @@ pytest src/flatseek/test/test_search.py -v   # accuracy tests
 pytest src/flatseek/test/test_api.py         # API smoke tests
 pytest src/flatseek/test/test_cli.py         # CLI integration
 ```
-
 ---
-
 ## License
 
 Apache 2.0. See [LICENSE](LICENSE).
