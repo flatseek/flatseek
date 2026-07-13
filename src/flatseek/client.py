@@ -17,9 +17,11 @@ Usage (direct mode):
 
 import os
 import json
+import os
 import time
 import hashlib
 import math
+import fnmatch
 from typing import Any
 from collections import Counter
 
@@ -351,6 +353,14 @@ class _DirectEngine:
         doc = dict(doc)  # shallow copy so we don't mutate caller's dict
         doc["_id"] = ulid
         self._add_doc(new_doc_id, doc)
+
+        # Register natural key in tombstone mapping so index/update/delete can find this doc
+        id_field = self._id_field()
+        if id_field and id_field in doc:
+            self._engine._tombstones.set_doc_id_for_field(
+                id_field, str(doc[id_field]), new_doc_id
+            )
+
         self._reload_engine()
         return {"result": "created", "doc_id": new_doc_id, "_id": ulid}
 
@@ -375,14 +385,15 @@ class _DirectEngine:
         if existing_doc_id is None:
             return {"result": "not_found", "doc_id": id, "new_doc_id": None}
 
-        # Tombstone old doc
-        tombstones.mark_deleted([existing_doc_id])
-
-        # Fetch and merge
+        # Fetch existing doc BEFORE tombstoning — fetch uses alive_ids filter which
+        # excludes newly-tombstoned docs, so we must read first.
         existing = None
         for doc in engine._fetch_docs([existing_doc_id]):
             existing = doc
             break
+
+        # Tombstone old doc
+        tombstones.mark_deleted([existing_doc_id])
 
         merged = {k: v for k, v in (existing or {}).items() if not k.startswith("_")}
         merged = {k: v for k, v in merged.items() if k != "_id"}
@@ -455,11 +466,15 @@ class _DirectEngine:
             elif isinstance(doc_id_val, str) and doc_id_val.isdigit():
                 int_doc_ids.append(int(doc_id_val))
             else:
-                # ULID or other string — look up via id_field mapping
+                # ULID or other string — look up the natural key value first,
+                # then use that to find the tombstone mapping (the mapping is keyed
+                # by id_field name + natural key value, not by ULID).
                 if id_field:
-                    mapped = tombstones.get_doc_id_for_field(id_field, doc_id_val)
-                    if mapped is not None:
-                        int_doc_ids.append(mapped)
+                    natural_val = doc.get(id_field)
+                    if natural_val:
+                        mapped = tombstones.get_doc_id_for_field(id_field, str(natural_val))
+                        if mapped is not None:
+                            int_doc_ids.append(mapped)
 
         if int_doc_ids:
             tombstones.mark_deleted(int_doc_ids)
@@ -806,6 +821,203 @@ class Flatseek:
     def mode(self) -> str:
         """Current mode: 'api' or 'direct'."""
         return self._mode
+
+    @staticmethod
+    def search_multi(
+        root_dir: str,
+        pattern: str,
+        query: str = "*",
+        size: int = 10,
+        page: int = 0,
+        start: str | None = None,
+        end: str | None = None,
+        sort: str | None = None,
+    ) -> dict:
+        """Search across multiple index directories matching a glob pattern.
+
+        Mirrors the REST API multi-index search behaviour for local filesystem indexes.
+
+        Args:
+            root_dir: Parent directory containing index subdirectories.
+            pattern: Glob pattern, e.g. "logs_*" or "logs_*,events_*" (comma-separated).
+            query: Lucene query string (default "*").
+            size: Number of results per page (default 10, max 1000).
+            page: Zero-based page number (default 0).
+            start: Optional YYYYMMDD date to prune indices before this date.
+            end: Optional YYYYMMDD date to prune indices after this date.
+            sort: Optional sort spec "field:asc" or "field:desc" (not yet implemented).
+
+        Returns:
+            Dict with _index, hits{total,hits}, took (ms).
+            Each hit has _index, _score, _source.
+        """
+        import concurrent.futures
+        import re as _re
+        from flatseek.core.query_engine import QueryEngine
+        from flatseek.core.query_parser import parse, execute
+
+        t0 = time.perf_counter()
+
+        # ── 1. Discover and filter indices ──────────────────────────────────
+        if not os.path.isdir(root_dir):
+            return {"_index": pattern, "hits": {"total": 0, "hits": []}, "took": 0}
+
+        all_names = sorted(
+            d for d in os.listdir(root_dir)
+            if os.path.isdir(os.path.join(root_dir, d))
+        )
+
+        seen: set[str] = set()
+        for part in pattern.split(","):
+            seen.update(fnmatch.filter(all_names, part.strip()))
+
+        DATE_RE = _re.compile(r"(\d{4}[-_]?\d{2}[-_]?\d{0,2})")
+
+        def _idx_date(name: str) -> str | None:
+            m = DATE_RE.search(name)
+            if not m:
+                return None
+            ds = m.group(1).replace("-", "").replace("_", "")
+            return (ds + "01" * (8 - len(ds)))[:8]
+
+        start_n = start.replace("-", "").replace("_", "") if start else None
+        end_n = end.replace("-", "").replace("_", "") if end else None
+
+        matched: list[str] = []
+        for name in sorted(seen):
+            d = _idx_date(name)
+            if d is None:
+                if start_n or end_n:
+                    continue
+            else:
+                if start_n and d < start_n:
+                    continue
+                if end_n and d > end_n:
+                    continue
+            matched.append(name)
+
+        if not matched:
+            return {"_index": pattern, "hits": {"total": 0, "hits": []}, "took": 0}
+
+        # ── 2. Open engines and run queries in parallel ────────────────────
+        def _query_one(name: str):
+            try:
+                eng = QueryEngine(os.path.join(root_dir, name))
+                if query == "*" or query == "":
+                    ids = eng._resolve("", None)
+                    ids = list(ids) if ids else []
+                else:
+                    ast = parse(query)
+                    ids = sorted(execute(ast, eng)) if ast else []
+                ids = eng._alive_ids(ids) if hasattr(eng, "_alive_ids") else ids
+                return eng, ids, name
+            except Exception:
+                return None, [], name
+
+        per_eng: list[tuple[QueryEngine, list[int], str]] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(matched), 8)) as pool:
+            futures = {pool.submit(_query_one, n): n for n in matched}
+            for future in concurrent.futures.as_completed(futures):
+                eng, ids, name = future.result()
+                if eng is not None:
+                    per_eng.append((eng, ids, name))
+
+        per_eng.sort(key=lambda x: x[2])
+
+        # ── 3. Paginate across engines ──────────────────────────────────────
+        total = sum(len(ids) for _, ids, _ in per_eng)
+        req_size = min(size, 1000)
+        page_start = page * req_size
+        page_end = page_start + req_size
+        results: list[dict] = []
+        offset = 0
+
+        for eng, ids, name in per_eng:
+            n = len(ids)
+            lo = max(0, page_start - offset)
+            hi = min(n, page_end - offset)
+            if lo < hi:
+                docs = eng._fetch_docs(ids[lo:hi])
+                for doc in docs:
+                    doc["_index"] = name
+                results.extend(docs)
+            offset += n
+            if offset >= page_end:
+                break
+
+        return {
+            "_index": pattern,
+            "hits": {
+                "total": total,
+                "hits": [
+                    {
+                        "_id": page_start + i,
+                        "_score": 1.0,
+                        "_index": r["_index"],
+                        "_source": r,
+                    }
+                    for i, r in enumerate(results)
+                ],
+            },
+            "took": int((time.perf_counter() - t0) * 1000),
+        }
+
+    @staticmethod
+    def cross_lookup(
+        source_dir: str,
+        target_dir: str,
+        query: str = "*",
+        on: str | None = None,
+        left_fields: list[str] | None = None,
+        right_fields: list[str] | None = None,
+        top_n: int = 10,
+        page: int = 0,
+        page_size: int = 20,
+    ) -> dict:
+        """Enrich source index results by looking up a target index on a shared key.
+
+        Mirrors ``qe.cross_lookup()`` but accepts directory paths instead of
+        pre-instantiated engines.
+
+        Args:
+            source_dir: Directory path of the source (left) index.
+            target_dir: Directory path of the target (right) index.
+            query: Lucene query for the source index (default "*").
+            on: The shared field name to join on (e.g. "user_id", "signer").
+                Required.
+            left_fields: Fields to keep from the source index (default: all).
+            right_fields: Fields to keep from the target index (default: all).
+            top_n: Max results from source index to process (default 10).
+            page: Zero-based page (default 0).
+            page_size: Results per page (default 20).
+
+        Returns:
+            {
+                "total": N,
+                "page": N,
+                "page_size": N,
+                "results": [
+                    {
+                        "_left":  {filtered source doc},
+                        "_right": [matching target docs],
+                        "_match_count": N,
+                    },
+                    ...
+                ]
+            }
+        """
+        from flatseek.core.query_engine import QueryEngine
+        qe = QueryEngine(source_dir)
+        return qe.cross_lookup(
+            query=query,
+            target=target_dir,
+            link_field=on,
+            left_fields=left_fields,
+            right_fields=right_fields,
+            top_n=top_n,
+            page=page,
+            page_size=page_size,
+        )
 
 
 # ─── elasticsearch-py compatibility ──────────────────────────────────────────

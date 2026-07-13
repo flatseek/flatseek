@@ -124,30 +124,24 @@ Full comparison including tantivy, Typesense, Whoosh, ZincSearch:
 ## Core capabilities
 | Capability | Description |
 |---|---|
-| **Full-text search** | Trigram-based search with wildcard (`*term*`), phrase, and boolean queries |
-| **Range queries** | Exact filtering on numeric, date, and keyword fields |
-| **Sorting** | Single or multi-field sorting with configurable missing values |
-| **Aggregations** | Terms, stats, min/max, cardinality, and date histograms |
-| **Nested & array fields** | Query nested objects and match values inside arrays |
-| **Mutable & immutable indexes** | One query engine for live production data and portable archives |
+| **Full-text search** | Trigram-based search with wildcard, phrase, and boolean queries — [docs/search.md](docs/search.md) |
+| **Range queries** | Exact filtering on numeric, date, and keyword fields — [docs/search.md](docs/search.md) |
+| **Sorting** | Single or multi-field sorting — [docs/search.md](docs/search.md) |
+| **Aggregations** | Terms, stats, cardinality, date histograms — [docs/aggregate.md](docs/aggregate.md) |
+| **Nested & array fields** | Query nested objects and match values inside arrays — [docs/search.md](docs/search.md) |
+| **Multi-index search** | Query multiple index directories with glob patterns — [docs/multiindex.md](docs/multiindex.md) |
+| **Cross-lookup** | Join two indexes on a shared key field — [docs/cross-lookup.md](docs/cross-lookup.md) |
 | **Remote indexes** | Search HTTP-hosted indexes without downloading the entire dataset |
-| **Embedded library** | Query indexes directly from Python without running a server |
-| **REST API** | Elasticsearch-compatible Search and Bulk APIs |
+| **Embedded library** | Query directly from Python without a server — [docs/python.md](docs/python.md) |
+| **REST API** | Elasticsearch-compatible Search, Bulk, and CRUD APIs — [docs/restapi.md](docs/restapi.md) |
+| **Write operations** | Insert, upsert, update, delete, bulk — [docs/python.md](docs/python.md) |
 | **Parallel indexing** | Multi-worker index builds for faster ingestion |
 | **Compaction** | Reclaim disk space after large delete operations |
 | **Portable archives** | Package complete indexes into a single `.fsk` file |
 | **Distribution & licensing** | Public, password-protected, time-limited, or renewable license-based archives |
-| **Export** | Stream matching documents as JSONL or CSV |
+| **Export** | Stream matching documents as JSONL or CSV — [docs/export.md](docs/export.md) |
 | **Slice** | Materialize query results as a new standalone index |
-
-See each doc for details:
-
-- **Search** — [docs/search.md](docs/search.md) (CLI, API, library; directory, FSK, remote, multi-index, sort)
-- **Aggregations** — [docs/aggregate.md](docs/aggregate.md) (API & library; terms, stats, date_histogram)
-- **Export** — [docs/export.md](docs/export.md) (CLI; JSONL/CSV, single & multi-index)
-- **Multi-index** — [docs/multiindex.md](docs/multiindex.md) (directory subdirs, FSK bucket, `_index:pattern`)
-- **Serve & dashboard** — [docs/serving.md](docs/serving.md) (all index modes, storage backends)
-- [docs/](docs/) — full documentation index
+| **Serve & dashboard** | Self-hosted API server with embedded dashboard — [docs/serving.md](docs/serving.md) |
 
 ---
 

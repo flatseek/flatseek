@@ -2460,83 +2460,27 @@ class QueryEngine:
         result["query"] = query_str
         return result
 
-    def join(self, query_a, query_b, on, page=0, page_size=20):
-        """Cross-dataset join: find docs matching query_a AND query_b linked by a shared field.
-
-        Useful when two datasets share a key (phone, email) but are indexed separately
-        as different _dataset labels.
-
-        Args:
-            query_a:   Lucene query for the first dataset, e.g. "_dataset:txs AND program:raydium"
-            query_b:   Lucene query for the second dataset, e.g. "_dataset:logs AND service:api-gateway"
-            on:        canonical field name that links both datasets (e.g. "signer", "trace_id")
-            page:      0-based page
-            page_size: results per page
-
-        Returns:
-            {
-              "total": N,
-              "page": N,
-              "page_size": N,
-              "results": [{"_a": doc_a, "_b": doc_b}, ...]
-            }
-        """
-        from flatseek.core.query_parser import parse, execute
-
-        # Resolve both queries to doc_id sets
-        ast_a = parse(query_a)
-        ast_b = parse(query_b)
-        ids_a = sorted(execute(ast_a, self))
-        ids_b = sorted(execute(ast_b, self))
-
-        if not ids_a or not ids_b:
-            return {"total": 0, "page": page, "page_size": page_size, "results": []}
-
-        # Load docs for both sides, build lookup by join key
-        docs_a = self._fetch_docs(ids_a)
-        docs_b = self._fetch_docs(ids_b)
-
-        # Index side B by join key value
-        b_by_key = {}
-        for doc in docs_b:
-            key_val = doc.get(on, "")
-            if key_val:
-                b_by_key.setdefault(key_val, []).append(doc)
-
-        # Join: for each doc in A, find matching docs in B
-        pairs = []
-        for doc_a in docs_a:
-            key_val = doc_a.get(on, "")
-            if key_val and key_val in b_by_key:
-                for doc_b in b_by_key[key_val]:
-                    pairs.append({"_a": doc_a, "_b": doc_b})
-
-        total = len(pairs)
-        start = page * page_size
-        return {
-            "total": total,
-            "page": page,
-            "page_size": page_size,
-            "results": pairs[start:start + page_size],
-        }
-
     def cross_lookup(self, query, target, link_field, target_field=None,
-                     return_fields=None, top_n=10, page=0, page_size=20):
+                     return_fields=None, left_fields=None, right_fields=None,
+                     top_n=10, page=0, page_size=20):
         """Search this index, then look up matching values in a target index.
 
-        Use this to enrich results across two separate indexes.  For example:
-        search the 'solana_txs' index for raydium swaps, then fetch fee stats from
-        the 'fee_stats' index for every transaction found.
+        Use this to enrich results across two separate indexes. For example:
+        search the 'users' index for active users, then fetch transactions from
+        the 'txs' index for every matched user.
 
         Args:
             query:         Lucene query run on THIS index.
-                           e.g. "program:raydium"  or  "callsign:GARUDA* AND altitude:>30000"
-            target:        Another QueryEngine instance to look up in.
+                           e.g. "status:active" or "program:raydium"
+            target:        Directory path of the target index (string).
             link_field:    Field from this index's results used as the lookup key.
-                           e.g. "signer", "trace_id", "campaign_id"
+                           e.g. "user_id", "signer", "trace_id"
             target_field:  Field in the target index to match against.
                            Defaults to link_field when omitted.
-            return_fields: List of fields to include from target results.
+            return_fields: Deprecated alias for right_fields (for backwards compat).
+            left_fields:   List of fields to include from the left (source) index.
+                           None = all fields.
+            right_fields:  List of fields to include from the right (target) index.
                            None = all fields.
             top_n:         How many results from THIS index to process (default 10).
             page / page_size: Pagination over final joined output.
@@ -2548,8 +2492,8 @@ class QueryEngine:
                 "page_size": N,
                 "results": [
                     {
-                        "_source":      {doc from this index},
-                        "_matches":     [{doc from target, filtered to return_fields}],
+                        "_left":      {doc from this index, filtered to left_fields},
+                        "_right":     [{doc from target, filtered to right_fields}],
                         "_match_count": N,
                     },
                     ...
@@ -2557,23 +2501,30 @@ class QueryEngine:
             }
 
         Example:
-            qe_txs     = QueryEngine("data/solana_txs")
-            qe_logs    = QueryEngine("data/logs")
-
-            result = qe_txs.cross_lookup(
-                query         = "program:raydium AND signer:*7xMg*",
-                target        = qe_logs,
-                link_field    = "signer",
-                return_fields = ["trace_id", "level"],
+            qe_users = QueryEngine("data/users")
+            result = qe_users.cross_lookup(
+                query         = "status:active",
+                target        = "data/txs",
+                link_field    = "user_id",
+                left_fields   = ["email", "name"],
+                right_fields  = ["tstamp", "amount"],
                 top_n         = 20,
             )
             for row in result["results"]:
-                src = row["_source"]
-                for m in row["_matches"]:
-                    print(src.get("signer"), m.get("trace_id"), m.get("level"))
+                print(row["_left"]["email"], row["_right"])
         """
         if target_field is None:
             target_field = link_field
+
+        # Support legacy return_fields param as right_fields alias
+        if right_fields is None and return_fields is not None:
+            right_fields = return_fields
+
+        # ── Step 0: open target engine ─────────────────────────────────────
+        if isinstance(target, str):
+            target_eng = QueryEngine(target)
+        else:
+            target_eng = target  # backwards compat: already a QueryEngine
 
         # ── Step 1: search this (source) index ───────────────────────────────
         src_result = self.query(query, page_size=top_n)
@@ -2598,19 +2549,25 @@ class QueryEngine:
         for src_doc, link_val in src_with_key:
             safe_val = f'"{link_val}"' if " " in link_val else link_val
             tgt_q    = f"{target_field}:{safe_val}"
-            tgt_result = target.query(tgt_q, page_size=50)
+            tgt_result = target_eng.query(tgt_q, page_size=50)
             tgt_docs   = tgt_result.get("results", [])
 
-            if return_fields:
-                rf = set(return_fields)
+            # Apply left_fields filter
+            if left_fields:
+                lf = set(left_fields)
+                src_doc = {k: v for k, v in src_doc.items() if k in lf or k == "_id"}
+
+            # Apply right_fields filter
+            if right_fields:
+                rf = set(right_fields)
                 tgt_docs = [
                     {k: v for k, v in d.items() if k in rf or k == "_id"}
                     for d in tgt_docs
                 ]
 
             joined.append({
-                "_source":      src_doc,
-                "_matches":     tgt_docs,
+                "_left":        src_doc,
+                "_right":       tgt_docs,
                 "_match_count": len(tgt_docs),
             })
 

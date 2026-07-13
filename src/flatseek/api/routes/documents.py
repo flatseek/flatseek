@@ -634,6 +634,17 @@ async def bulk(
                         errors = True
                         continue
 
+                    # Fetch existing doc BEFORE tombstoning — _fetch_docs uses alive_ids
+                    # filter which would exclude tombstoned docs, so we must read first.
+                    # Use _fetch_docs([resolved_id]) with the integer doc_id directly,
+                    # NOT a string query _id:{resolved_id} — inserted docs store ULID
+                    # strings as _id, not integer doc_ids, so string query would miss them.
+                    existing_doc_list = list(engine._fetch_docs([resolved_id]))
+                    existing_doc = {}
+                    if existing_doc_list:
+                        existing_doc = {k: v for k, v in existing_doc_list[0].items()
+                                       if not k.startswith("_") and k != "_id"}
+
                     # Tombstone old version
                     ver = engine._tombstones.get_version(resolved_id)
                     count, conflicts = engine._tombstones.mark_deleted(
@@ -655,13 +666,6 @@ async def bulk(
                     if doc is None:
                         doc = {}
                     update_fields = doc.get("doc", doc)
-                    # Fetch existing doc for merge
-                    existing_docs = engine.query(f"_id:{resolved_id}", page=0, page_size=1)
-                    existing_doc = {}
-                    for d in existing_docs.get("results", []):
-                        if d["_id"] == resolved_id:
-                            existing_doc = {k: v for k, v in d.items() if not k.startswith("_") and k != "_id"}
-                            break
                     merged = dict(existing_doc)
                     merged.update(update_fields)
                     write_plan.append((idx, doc_id_str or "", merged, action_type, True))  # is_update=True for update action
@@ -680,6 +684,7 @@ async def bulk(
                     dedup_fields=None,
                     doc_id_end=None,
                     daemon=False,
+                    id_field=id_field,
                 )
 
                 id_to_new_doc_id: dict[int, int] = {}
@@ -692,6 +697,10 @@ async def bulk(
                     doc_id_counter += 1
 
                 builder.finalize()
+
+                # Invalidate doc cache so subsequent reads pick up the new chunk on disk
+                engine = manager.get_engine(index)
+                engine.clear_doc_cache()
 
                 # Update counter
                 with open(counter_path, "w") as cf:

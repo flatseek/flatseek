@@ -2524,14 +2524,25 @@ def _export_csv_rows(qe, out_fh, writer, query_str, cols, limit, start_after_id,
         pass
 
 
-def cmd_join(args):
+def cmd_cross_lookup(args):
     from flatseek.core.query_engine import QueryEngine
     qe = QueryEngine(args.data_dir)
     _apply_passphrase(qe, args)
 
+    left_fields = args.left_fields.split(",") if args.left_fields else None
+    right_fields = args.right_fields.split(",") if args.right_fields else None
+
     try:
-        result = qe.join(args.query_a, args.query_b, on=args.on,
-                         page=args.page, page_size=args.page_size)
+        result = qe.cross_lookup(
+            query=args.query,
+            target=args.target_dir,
+            link_field=args.link_field,
+            left_fields=left_fields,
+            right_fields=right_fields,
+            top_n=args.top_n,
+            page=args.page,
+            page_size=args.page_size,
+        )
     except SyntaxError as e:
         print(f"Query syntax error: {e}")
         sys.exit(1)
@@ -2539,24 +2550,26 @@ def cmd_join(args):
     total = result["total"]
     page = result["page"]
     page_size = result["page_size"]
-    pairs = result["results"]
+    rows = result["results"]
 
-    print(f"Query A: {args.query_a}")
-    print(f"Query B: {args.query_b}")
-    print(f"Join on: {args.on}")
-    print(f"Found:   {total:,} matched pair(s)  (page {page + 1}, showing {len(pairs)})")
+    print(f"Source:    {args.data_dir}")
+    print(f"Target:    {args.target_dir}")
+    print(f"Query:    {args.query}")
+    print(f"Join on:  {args.link_field}")
+    print(f"Found:    {total:,} matched row(s)  (page {page + 1}, showing {len(rows)})")
 
-    for i, pair in enumerate(pairs):
+    for i, row in enumerate(rows):
         n = page * page_size + i + 1
-        print(f"\n--- Pair {n} ---")
-        print("  [A]")
-        for k, v in pair["_a"].items():
+        print(f"\n--- Row {n} ---")
+        print("  [left]")
+        for k, v in row["_left"].items():
             if not k.startswith("_"):
                 print(f"    {k}: {v}")
-        print("  [B]")
-        for k, v in pair["_b"].items():
-            if not k.startswith("_"):
-                print(f"    {k}: {v}")
+        print("  [right]")
+        for doc in row["_right"]:
+            for k, v in doc.items():
+                if not k.startswith("_"):
+                    print(f"    {k}: {v}")
 
 
 def cmd_chat(args):
@@ -5916,13 +5929,21 @@ def main():
                         "https://github.com/user/repo/releases/download/v1.0/")
 
     # join
-    p = sub.add_parser("join", help="Cross-dataset join on shared field")
-    p.add_argument("data_dir", help="Index directory")
-    p.add_argument("query_a", help='Query for dataset A, e.g. "_dataset:solana_txs AND program:raydium"')
-    p.add_argument("query_b", help='Query for dataset B, e.g. "_dataset:logs AND service:api-gateway"')
-    p.add_argument("--on", required=True, help="Shared field to join on (e.g. signer, trace_id)")
+    p = sub.add_parser("cross-lookup",
+                       help="Enrich source index results by looking up a target index on a shared key")
+    p.add_argument("data_dir", help="Source index directory")
+    p.add_argument("target_dir", help="Target index directory to look up")
+    p.add_argument("query", help='Lucene query for source index, e.g. "status:active" or "*"')
+    p.add_argument("--on", required=True, dest="link_field",
+                   help="Shared field to join on (e.g. user_id, signer, trace_id)")
+    p.add_argument("--left-fields", default=None, dest="left_fields",
+                   help="Comma-separated fields to keep from source (default: all)")
+    p.add_argument("--right-fields", default=None, dest="right_fields",
+                   help="Comma-separated fields to keep from target (default: all)")
+    p.add_argument("-n", "--top-n", type=int, default=10, dest="top_n",
+                   help="Max results from source index (default: 10)")
     p.add_argument("-p", "--page", type=int, default=0)
-    p.add_argument("-n", "--page-size", type=int, default=20, dest="page_size")
+    p.add_argument("--page-size", type=int, default=20, dest="page_size")
     p.add_argument("--passphrase", default=None, metavar="PASS",
                    help="Decryption passphrase for encrypted indexes")
 
@@ -6271,7 +6292,7 @@ def main():
     elif args.command == "search":
         cmd_search(args)
     elif args.command == "join":
-        cmd_join(args)
+        cmd_cross_lookup(args)
     elif args.command == "chat":
         cmd_chat(args)
     elif args.command == "stats":

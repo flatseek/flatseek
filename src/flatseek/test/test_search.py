@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from flatseek.core.builder import IndexBuilder, _expand_record
 from flatseek.core.query_engine import QueryEngine
+from flatseek import Flatseek
 
 
 # ─── Rich fixture covering every column type ─────────────────────────────────
@@ -656,6 +657,307 @@ class TestAggregations:
         # Only active docs counted — Jakarta active = 3 (Alice, Fitri, Judotens)
         jakarta = next((b for b in buckets if b["key"] == "Jakarta"), None)
         assert jakarta and jakarta["doc_count"] == 3
+
+
+# ─── Multi-Index Search Tests ────────────────────────────────────────────────
+
+class TestMultiIndexSearch:
+    """Test Flatseek.search_multi() across multiple index directories."""
+
+    @pytest.fixture
+    def multi_index_root(self, tmp_path):
+        """Build two index directories: logs_1 and events_1 (names allow wildcard patterns)."""
+        import csv
+
+        # Build logs_1 index
+        logs_dir = tmp_path / "logs_1"
+        logs_dir.mkdir()
+        csv_path = logs_dir / "logs.csv"
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["id", "msg", "level"])
+            w.writeheader()
+            w.writerow({"id": "1", "msg": "error connecting db", "level": "error"})
+            w.writerow({"id": "2", "msg": "warn disk almost full", "level": "warning"})
+            w.writerow({"id": "3", "msg": "info server started", "level": "info"})
+        builder = IndexBuilder(str(logs_dir), column_map={})
+        builder.start_doc_id = 0
+        headers = ["id", "msg", "level"]
+        for rec in [{"id": "1", "msg": "error connecting db", "level": "error"},
+                     {"id": "2", "msg": "warn disk almost full", "level": "warning"},
+                     {"id": "3", "msg": "info server started", "level": "info"}]:
+            builder.add_row({col: str(rec[col]) for col in headers}, headers)
+        builder.finalize()
+
+        # Build events_1 index
+        events_dir = tmp_path / "events_1"
+        events_dir.mkdir()
+        csv_path2 = events_dir / "events.csv"
+        with open(csv_path2, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["id", "name", "type"])
+            w.writeheader()
+            w.writerow({"id": "10", "name": "Alice", "type": "login"})
+            w.writerow({"id": "11", "name": "Bob", "type": "logout"})
+        builder2 = IndexBuilder(str(events_dir), column_map={})
+        builder2.start_doc_id = 0
+        headers2 = ["id", "name", "type"]
+        for rec in [{"id": "10", "name": "Alice", "type": "login"},
+                     {"id": "11", "name": "Bob", "type": "logout"}]:
+            builder2.add_row({col: str(rec[col]) for col in headers2}, headers2)
+        builder2.finalize()
+
+        yield str(tmp_path)
+
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+    def test_search_multi_wildcard(self, multi_index_root):
+        """search_multi with glob pattern returns results from matching indexes."""
+        r = Flatseek.search_multi(multi_index_root, "logs_*", "*")
+        assert r["hits"]["total"] == 3
+        indices = {h["_index"] for h in r["hits"]["hits"]}
+        assert indices == {"logs_1"}
+
+    def test_search_multi_comma_pattern(self, multi_index_root):
+        """search_multi with comma-separated pattern."""
+        r = Flatseek.search_multi(multi_index_root, "logs_1,events_1", "*", size=10)
+        assert r["hits"]["total"] == 5
+
+    def test_search_multi_query_filter(self, multi_index_root):
+        """search_multi applies query to all indexes."""
+        r = Flatseek.search_multi(multi_index_root, "*", "error")
+        assert r["hits"]["total"] == 1
+        assert r["hits"]["hits"][0]["_index"] == "logs_1"
+
+    def test_search_multi_pagination(self, multi_index_root):
+        """search_multi pagination works across indexes."""
+        r = Flatseek.search_multi(multi_index_root, "*", "*", size=2, page=0)
+        assert r["hits"]["total"] == 5
+        assert len(r["hits"]["hits"]) == 2
+        r2 = Flatseek.search_multi(multi_index_root, "*", "*", size=2, page=1)
+        assert len(r2["hits"]["hits"]) == 2
+
+    def test_search_multi_no_match(self, multi_index_root):
+        """search_multi returns empty when no index matches."""
+        r = Flatseek.search_multi(multi_index_root, "nonexistent_*", "error")
+        assert r["hits"]["total"] == 0
+        assert r["hits"]["hits"] == []
+
+    def test_search_multi_all_fields(self, multi_index_root):
+        """Each hit is tagged with _index field."""
+        r = Flatseek.search_multi(multi_index_root, "*", "*", size=10)
+        indices = sorted(h["_index"] for h in r["hits"]["hits"])
+        assert indices == ["events_1", "events_1", "logs_1", "logs_1", "logs_1"]
+
+
+# ─── Cross-Lookup Tests ───────────────────────────────────────────────────────
+
+class TestCrossLookup:
+    """Test Flatseek.cross_lookup() across two index directories."""
+
+    @pytest.fixture
+    def cross_lookup_root(self, tmp_path):
+        """Build users + txs indexes sharing user_id field."""
+        import csv
+
+        # Build users index
+        users_dir = tmp_path / "users"
+        users_dir.mkdir()
+        with open(users_dir / "users.csv", "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["user_id", "name", "email"])
+            w.writeheader()
+            w.writerow({"user_id": "1", "name": "Alice", "email": "alice@example.com"})
+            w.writerow({"user_id": "2", "name": "Bob", "email": "bob@example.com"})
+            w.writerow({"user_id": "3", "name": "Carol", "email": "carol@example.com"})
+        builder = IndexBuilder(str(users_dir), column_map={})
+        builder.start_doc_id = 0
+        headers = ["user_id", "name", "email"]
+        for rec in [{"user_id": "1", "name": "Alice", "email": "alice@example.com"},
+                    {"user_id": "2", "name": "Bob", "email": "bob@example.com"},
+                    {"user_id": "3", "name": "Carol", "email": "carol@example.com"}]:
+            builder.add_row({col: str(rec[col]) for col in headers}, headers)
+        builder.finalize()
+
+        # Build txs index
+        txs_dir = tmp_path / "txs"
+        txs_dir.mkdir()
+        with open(txs_dir / "txs.csv", "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["user_id", "tstamp", "amount"])
+            w.writeheader()
+            w.writerow({"user_id": "1", "tstamp": "2025-01-01", "amount": "500"})
+            w.writerow({"user_id": "1", "tstamp": "2025-01-02", "amount": "300"})
+            w.writerow({"user_id": "2", "tstamp": "2025-01-01", "amount": "1000"})
+        builder2 = IndexBuilder(str(txs_dir), column_map={})
+        builder2.start_doc_id = 0
+        headers2 = ["user_id", "tstamp", "amount"]
+        for rec in [{"user_id": "1", "tstamp": "2025-01-01", "amount": "500"},
+                    {"user_id": "1", "tstamp": "2025-01-02", "amount": "300"},
+                    {"user_id": "2", "tstamp": "2025-01-01", "amount": "1000"}]:
+            builder2.add_row({col: str(rec[col]) for col in headers2}, headers2)
+        builder2.finalize()
+
+        yield str(tmp_path)
+
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+    def test_cross_lookup_basic(self, cross_lookup_root):
+        """cross_lookup returns matched rows with left and right docs."""
+        r = Flatseek.cross_lookup(
+            source_dir=f"{cross_lookup_root}/users",
+            target_dir=f"{cross_lookup_root}/txs",
+            query="*",
+            on="user_id",
+        )
+        assert r["total"] == 2  # Alice and Bob have matching txs; Carol does not
+        by_name = {row["_left"]["name"]: row for row in r["results"]}
+        assert "Alice" in by_name
+        assert "Bob" in by_name
+        assert by_name["Alice"]["_match_count"] == 2
+        assert by_name["Bob"]["_match_count"] == 1
+
+    def test_cross_lookup_with_field_filters(self, cross_lookup_root):
+        """cross_lookup respects left_fields and right_fields."""
+        r = Flatseek.cross_lookup(
+            source_dir=f"{cross_lookup_root}/users",
+            target_dir=f"{cross_lookup_root}/txs",
+            query="*",
+            on="user_id",
+            left_fields=["email"],
+            right_fields=["tstamp"],
+        )
+        row = r["results"][0]
+        assert "name" not in row["_left"]
+        assert "email" in row["_left"]
+        assert "amount" not in row["_right"][0]
+        assert "tstamp" in row["_right"][0]
+
+    def test_cross_lookup_query_filter(self, cross_lookup_root):
+        """cross_lookup applies query to source index."""
+        r = Flatseek.cross_lookup(
+            source_dir=f"{cross_lookup_root}/users",
+            target_dir=f"{cross_lookup_root}/txs",
+            query="name:Bob",
+            on="user_id",
+        )
+        assert r["total"] == 1
+        assert r["results"][0]["_left"]["name"] == "Bob"
+
+    def test_cross_lookup_top_n(self, cross_lookup_root):
+        """cross_lookup respects top_n limit."""
+        r = Flatseek.cross_lookup(
+            source_dir=f"{cross_lookup_root}/users",
+            target_dir=f"{cross_lookup_root}/txs",
+            query="*",
+            on="user_id",
+            top_n=1,
+        )
+        # Only 1 source doc processed
+        assert len(r["results"]) <= 1
+
+    def test_cross_lookup_pagination(self, cross_lookup_root):
+        """cross_lookup pagination works."""
+        r = Flatseek.cross_lookup(
+            source_dir=f"{cross_lookup_root}/users",
+            target_dir=f"{cross_lookup_root}/txs",
+            query="*",
+            on="user_id",
+            page_size=1,
+            page=0,
+        )
+        assert r["total"] == 2
+        assert len(r["results"]) == 1
+
+
+# ─── Sort Tests ───────────────────────────────────────────────────────────────
+
+class TestSort:
+    """Test query sort by numeric and keyword fields."""
+
+    def test_sort_numeric_asc(self, search_index):
+        """Sort by numeric field ascending."""
+        result = search_index.query("status:active", sort=[("score", "asc")])
+        scores = [r.get("score") for r in result["results"] if r.get("score") is not None]
+        assert scores == sorted(scores), f"Expected sorted asc, got {scores}"
+
+    def test_sort_numeric_desc(self, search_index):
+        """Sort by numeric field descending."""
+        result = search_index.query("status:active", sort=[("score", "desc")])
+        scores = [r.get("score") for r in result["results"] if r.get("score") is not None]
+        assert scores == sorted(scores, reverse=True), f"Expected sorted desc, got {scores}"
+
+    def test_sort_two_fields(self, search_index):
+        """Sort by primary (desc) then secondary (asc) field."""
+        result = search_index.query(
+            "status:active",
+            sort=[("score", "desc"), ("level", "asc")],
+        )
+        scores = [r.get("score") for r in result["results"] if r.get("score") is not None]
+        levels = [r.get("level") for r in result["results"] if r.get("level") is not None]
+        assert scores == sorted(scores, reverse=True), f"Primary sort failed: {scores}"
+        # Within same score, level should be asc
+        prev_score, prev_level = None, None
+        for r in result["results"]:
+            s, l = r.get("score"), r.get("level")
+            if s is not None and l is not None:
+                if prev_score is not None and s == prev_score:
+                    assert l >= prev_level, f"Secondary sort failed at score={s}: {levels}"
+                prev_score, prev_level = s, l
+
+    def test_sort_page_0_returns_correct_slice(self, search_index):
+        """Sort combined with pagination: page 0 gets first page_size docs."""
+        result = search_index.query(
+            "status:active",
+            page=0,
+            page_size=3,
+            sort=[("balance", "desc")],
+        )
+        assert len(result["results"]) == 3
+        assert result["page"] == 0
+        assert result["total"] >= 3
+
+    def test_sort_page_1_continues_from_page_0(self, search_index):
+        """Pagination with sort: page 1 continues after page 0 with same sort."""
+        r0 = search_index.query("status:active", page=0, page_size=3, sort=[("balance", "desc")])
+        r1 = search_index.query("status:active", page=1, page_size=3, sort=[("balance", "desc")])
+        ids_0 = {r["_id"] for r in r0["results"]}
+        ids_1 = {r["_id"] for r in r1["results"]}
+        assert ids_0.isdisjoint(ids_1), "Page 0 and page 1 should have no overlap"
+
+
+# ─── Pagination Tests ─────────────────────────────────────────────────────────
+
+class TestPagination:
+    """Test query pagination (page/page_size)."""
+
+    def test_page_0_returns_first_results(self, search_index):
+        """Page 0 returns the first page_size results."""
+        result = search_index.query("*", page=0, page_size=5)
+        assert len(result["results"]) == 5
+        assert result["page"] == 0
+        assert result["page_size"] == 5
+
+    def test_page_1_returns_next_results(self, search_index):
+        """Page 1 returns results after page 0 with no overlap."""
+        r0 = search_index.query("*", page=0, page_size=5)
+        r1 = search_index.query("*", page=1, page_size=5)
+        ids_0 = {r["_id"] for r in r0["results"]}
+        ids_1 = {r["_id"] for r in r1["results"]}
+        assert ids_0.isdisjoint(ids_1)
+
+    def test_page_beyond_results_is_empty(self, search_index):
+        """Page number beyond available data returns zero results."""
+        result = search_index.query("*", page=999, page_size=20)
+        assert len(result["results"]) == 0
+        assert result["page"] == 999
+
+    def test_total_reflects_all_matching_docs(self, search_index):
+        """Total count is not reduced by pagination."""
+        result = search_index.query("status:active", page=0, page_size=2)
+        assert result["total"] >= 2
+        assert result["page_size"] == 2
+
+    def test_page_size_larger_than_corpus_returns_all(self, search_index):
+        """page_size larger than total hits returns all available results."""
+        result = search_index.query("status:*", page=0, page_size=1000)
+        assert len(result["results"]) == result["total"]
 
 
 # ─── HuggingFace Bucket URL Tests ────────────────────────────────────────────

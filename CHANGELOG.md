@@ -7,6 +7,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.10] - 2026-07-13
 
+### Feature: Comprehensive update tests — library + REST API
+
+**New test file: `src/flatseek/test/test_update.py`** (17 tests)
+
+Library-level update operations tested:
+- `update()` partial merge preserves non-updated fields
+- `update()` returns `updated`/`not_found` correctly
+- `update()` with JSON/list/dict field values
+- `update()` after delete returns `not_found`
+- `index()` upsert: `created` for new docs, `updated` for existing
+- `index()` full replacement semantics
+- Multiple sequential updates
+- `update()` vs `index()` distinction (merge vs replace)
+
+**New REST API tests in `test_api.py` WriteOpsAPI (7 tests)**
+
+- `PUT /{index}/_doc/{id}` upsert (created/updated result verification)
+- `PUT /{index}/_doc?q=...` partial update-by-query merge verification
+- `POST /{index}/_bulk_documents` update partial merge with field preservation
+- `DELETE /{index}/_doc?q=...` delete-by-query
+
+**Bugfixes (3 bugs in update code paths):**
+
+1. `client.py update()` — fetched document *after* tombstones were applied,
+   so `_fetch_docs` returned empty. Fixed: moved fetch before tombstone.
+
+2. `documents.py bulk route` — same fetch-after-tombstone bug. Same fix applied.
+
+3. `documents.py bulk route` — missing `id_field` in `IndexBuilder` caused
+   `stats.json` to lose `_id_field` on subsequent writes, breaking all
+   write ops after the first reload. Fixed: pass `id_field=id_field`.
+
+4. `documents.py bulk route` — newly-written documents invisible because
+   engine's `_doc_cache` held stale chunks. Fixed: call `clear_doc_cache()`
+   after `builder.finalize()`.
+
+5. `documents.py bulk route` — fetched existing doc via
+   `query("_id:{resolved_id}")` which failed for inserted docs (ULID strings
+   as `_id`, not integer doc_ids). Fixed: use `_fetch_docs([resolved_id])`
+   with integer doc_id directly.
+
+---
+
+## [0.1.10] - 2026-07-13
+
+### Feature: Cross-lookup (join two indexes on shared key)
+
+`Flatseek.cross_lookup()` — enrich source index results with matching documents
+from a target index, joined on a shared key field. Available in all three interfaces:
+
+```python
+# Python library
+r = Flatseek.cross_lookup(
+    source_dir="./data/users",
+    target_dir="./data/txs",
+    query="status:active",
+    on="user_id",
+    left_fields=["email", "name"],
+    right_fields=["tstamp", "amount"],
+)
+
+# CLI
+flatseek cross-lookup ./data/users ./data/txs \
+  "status:active" --on user_id \
+  --left-fields "email,name" \
+  --right-fields "tstamp,amount"
+
+# REST API
+curl -X POST http://localhost:8000/users/_cross_lookup \
+  -d '{"target": "txs", "query": "status:active", "on": "user_id"}'
+```
+
+Output: `_left` (source doc), `_right` (list of matching target docs), `_match_count`.
+
 ### Feature: Multi-index search with wildcard, date_histogram fast path
 
 `MultiIndexEngine` for querying multiple `.fsk` files as one logical index.
@@ -70,6 +144,47 @@ fields like article bodies ("AI, ML, DL are related").
 
 Fix: separator-split now only applies to columns with semantic type
 `ARRAY`. TEXT and KEYWORD fields are stored as-is.
+
+### Tests: sort, pagination, pack, unpack, export, verify, slice
+
+**`test_search.py` — TestSort (5 tests)**
+- Sort by numeric field (asc/desc), multi-field sort, sort + pagination correctness
+
+**`test_search.py` — TestPagination (5 tests)**
+- Page 0/1 no-overlap, beyond-results returns empty, total reflects all matches,
+  large page_size returns all
+
+**`test_cli.py` — TestPack (2 tests)**
+- `flatseek pack` creates valid `.fsk` with FLATSEEK04 magic header
+- `flatseek pack --passphrase` encrypts the archive
+
+**`test_cli.py` — TestUnpack (2 tests)**
+- `flatseek unpack` restores a searchable index from `.fsk`
+- `flatseek unpack --passphrase` decrypts and restores encrypted archive
+
+**`test_cli.py` — TestExport (3 tests)**
+- `flatseek export` writes all docs to JSONL
+- `flatseek export -q` filters output by query
+- `flatseek export -f csv` produces CSV format
+
+**`test_cli.py` — TestVerify (1 test)**
+- `flatseek verify` reports all chunks OK and exits 0
+
+**`test_cli.py` — TestSlice (1 test)**
+- `flatseek slice` creates a new index containing only query-matched docs
+
+### Bugfix: `delete_query` used wrong field to look up tombstone
+
+`delete_query` called `doc.get("_id")` to find the natural key for tombstone
+lookup. For inserted documents `_id` is a ULID string, but the tombstone
+mapping is keyed by `id_field` name + natural key value. Fix: use
+`doc.get(id_field)` instead.
+
+### Bugfix: `test_cli.py::TestSearch` missing Namespace attributes
+
+`cmd_search` accesses `args.index`, `args.sort`, and `args.storage_backend`
+from the Namespace. The test's `argparse.Namespace` was missing these attributes.
+Fix: added `index=None`, `sort=None`, `storage_backend=None` to the test.
 
 ## [0.1.9] - 2026-07-07
 

@@ -761,15 +761,77 @@ async def validate_query(
 ):
     """Validate a query."""
     query = body.get("query", "*")
-    
+
     try:
         engine = manager.get_engine(index)
     except Exception as e:
         raise HTTPException(404, f"Index not found: {index}") from e
-    
+
     from flatseek.core.query_parser import parse
-    
+
     ast = parse(query)
     valid = ast is not None
-    
+
     return {"valid": valid, "query": query}
+
+
+# ─── Cross-lookup ───────────────────────────────────────────────────────────────
+
+class CrossLookupResponse(BaseModel):
+    total: int
+    page: int
+    page_size: int
+    results: list[dict[str, Any]]
+
+
+@router.post(
+    "/{index}/_cross_lookup",
+    response_model=CrossLookupResponse,
+    summary="Cross-lookup: enrich source index with target index",
+    description="Search the source index, then look up matching documents in a target index using a shared key field.",
+)
+async def cross_lookup(
+    index: str,
+    body: dict[str, Any],
+    manager: IndexManager = Depends(get_index_manager),
+):
+    """Cross-lookup: enrich source results with target index lookups."""
+    target_index = body.get("target")
+    if not target_index:
+        raise HTTPException(400, "target index name is required")
+
+    query = body.get("query", "*")
+    link_field = body.get("on")
+    if not link_field:
+        raise HTTPException(400, "'on' (link field) is required")
+    target_field = body.get("target_field") or link_field
+    left_fields = body.get("left_fields")
+    right_fields = body.get("right_fields")
+    top_n = min(body.get("top_n", 10), 1000)
+    page = max(body.get("page", 0), 0)
+    page_size = min(body.get("page_size", 20), 100)
+
+    # Open source engine
+    try:
+        source_eng = manager.get_engine(index)
+    except Exception as e:
+        raise HTTPException(404, f"Source index not found: {index}") from e
+
+    # Resolve target path
+    from flatseek.api.deps import StorageConfig
+    target_dir = os.path.join(manager.data_dir, target_index)
+    if not os.path.isdir(target_dir):
+        raise HTTPException(404, f"Target index not found: {target_index}")
+
+    result = source_eng.cross_lookup(
+        query=query,
+        target=target_dir,
+        link_field=link_field,
+        target_field=target_field,
+        left_fields=left_fields,
+        right_fields=right_fields,
+        top_n=top_n,
+        page=page,
+        page_size=page_size,
+    )
+    return result
