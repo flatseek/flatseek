@@ -298,7 +298,7 @@ itself stays unchanged.
 | [Indexing](docs/indexing.md) | Formats, column types, parallel builds, encryption |
 | [Query Language](docs/query-language.md) | Full syntax reference |
 | [CLI Reference](docs/cli.md) | All CLI commands |
-| [REST API](docs/api.md) | API endpoints |
+| [REST API](docs/restapi.md) | API endpoints |
 | [Remote Storage](docs/storage.md) | HuggingFace, S3, Vercel Blob |
 | [Schemas](docs/schemas.md) | Supported column types |
 | [Architecture](docs/architecture.md) | Structural and behavioral map |
