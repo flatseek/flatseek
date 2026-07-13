@@ -170,6 +170,7 @@ class _DirectEngine:
     def __init__(self, data_dir: str, index: str | None = None):
         from flatseek.core.query_engine import QueryEngine
 
+        self._root_dir = data_dir  # preserved for _reload_engine
         self._index = index
         if index:
             self._engine = QueryEngine(os.path.join(data_dir, index))
@@ -213,6 +214,384 @@ class _DirectEngine:
         """
         result = self._engine.aggregate(q=q, aggs=aggs, size=size)
         return AggsResponse(result)
+
+    # ─── ID generation ───────────────────────────────────────────────────────
+
+    def _generate_ulid(self) -> str:
+        """Generate a ULID string (26 chars, Crockford Base32).
+
+        Time-sortable, globally unique without coordination.
+        Compatible with Elasticsearch _id format.
+        """
+        import time, random
+        _ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+        ts_ms = int(time.time() * 1000)
+        rand_bits = random.getrandbits(80)
+        value = (ts_ms << 80) | rand_bits
+        chars = []
+        for i in range(26):
+            idx = (value >> (125 - i * 5)) & 31
+            chars.append(_ALPHABET[idx])
+        return "".join(chars)
+
+    # ─── Write operations (require --id-field index) ─────────────────────────
+
+    def _id_field(self) -> str | None:
+        """Return the id_field for this index, or None if not set."""
+        return self._engine.stats.get("_id_field")
+
+    def _require_id_field(self):
+        if not self._id_field():
+            raise ValueError(
+                "Index was built without --id-field. "
+                "Write operations require an id-field to be set at build time."
+            )
+
+    def _next_doc_id(self) -> int:
+        """Atomically read and increment .next_doc_id counter."""
+        import fcntl
+        index_dir = self._engine.data_dir
+        counter_path = os.path.join(index_dir, ".next_doc_id")
+        lock_path = os.path.join(index_dir, ".doc_id.lock")
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        with open(lock_path, "a") as lockf:
+            fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+            try:
+                if os.path.exists(counter_path):
+                    try:
+                        total_docs = int(open(counter_path).read().strip())
+                    except (ValueError, IOError):
+                        total_docs = 0
+                else:
+                    stats = self._engine.stats
+                    total_docs = stats.get("total_docs", 0)
+                with open(counter_path, "w") as cf:
+                    cf.write(str(total_docs + 1))
+                return total_docs
+            finally:
+                fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
+
+    def _reload_engine(self):
+        """Reload the QueryEngine to pick up on-disk changes (new segments, tombstones)."""
+        from flatseek.core.query_engine import QueryEngine
+        if self._index:
+            self._engine = QueryEngine(os.path.join(self._root_dir, self._index))
+        else:
+            self._engine = QueryEngine(self._root_dir)
+
+    def _normalize_doc(self, doc: dict) -> tuple[dict[str, str], list[str]]:
+        """Normalize doc values to strings (as IndexBuilder expects)."""
+        normalized = {}
+        for k, v in doc.items():
+            if isinstance(v, (dict, list)):
+                normalized[k] = json.dumps(v)
+            else:
+                normalized[k] = str(v)
+        return normalized, list(doc.keys())
+
+    def index(self, id: str, doc: dict) -> dict:
+        """Insert or replace a document by its natural key (id_field).
+
+        Requires the index was built with --id-field.
+        Uses optimistic locking: retries on concurrent modification.
+        The provided ``id`` becomes the document's ``_id`` field.
+
+        Returns:
+            {"result": "created"|"updated", "doc_id": id, "_id": str, "new_doc_id": int}
+        """
+        self._require_id_field()
+        id_field = self._id_field()
+
+        engine = self._engine
+        tombstones = engine._tombstones
+        if tombstones is None:
+            raise ValueError("Index does not support update operations.")
+
+        # Optimistic locking: up to 3 retries
+        is_update = False
+        existing_doc_id = None
+        for _attempt in range(3):
+            existing_doc_id = tombstones.get_doc_id_for_field(id_field, id)
+            is_update = existing_doc_id is not None
+            existing_ver = tombstones.get_version(existing_doc_id) if existing_doc_id else 0
+
+            if is_update:
+                count, conflicts = tombstones.mark_deleted(
+                    [existing_doc_id], expected_versions={existing_doc_id: existing_ver}
+                )
+                if conflicts:
+                    self._reload_engine()
+                    continue
+            break
+
+        new_doc_id = self._next_doc_id()
+        # Copy doc and inject _id field (like Elasticsearch)
+        doc = dict(doc)
+        doc["_id"] = id
+        self._add_doc(new_doc_id, doc)
+
+        # Update id mapping
+        self._reload_engine()
+        self._engine._tombstones.set_doc_id_for_field(id_field, id, new_doc_id)
+
+        return {"result": "updated" if is_update else "created",
+                "doc_id": id, "_id": id, "new_doc_id": new_doc_id}
+
+    def insert(self, doc: dict) -> dict:
+        """Insert a document (auto-generates a ULID _id).
+
+        The document receives the next sequential internal doc_id and a
+        globally unique _id (ULID string, like Elasticsearch).
+
+        Returns:
+            {"result": "created", "doc_id": int, "_id": str}
+        """
+        new_doc_id = self._next_doc_id()
+        ulid = self._generate_ulid()
+        doc = dict(doc)  # shallow copy so we don't mutate caller's dict
+        doc["_id"] = ulid
+        self._add_doc(new_doc_id, doc)
+        self._reload_engine()
+        return {"result": "created", "doc_id": new_doc_id, "_id": ulid}
+
+    def update(self, id: str, fields: dict) -> dict:
+        """Partially update a document by its natural key.
+
+        Merges ``fields`` into the existing document (existing fields preserved unless overwritten).
+        Requires --id-field at build time.
+
+        Returns:
+            {"result": "updated"|"not_found", "doc_id": id, "new_doc_id": int}
+        """
+        self._require_id_field()
+        id_field = self._id_field()
+
+        engine = self._engine
+        tombstones = engine._tombstones
+        if tombstones is None:
+            raise ValueError("Index does not support update operations.")
+
+        existing_doc_id = tombstones.get_doc_id_for_field(id_field, id)
+        if existing_doc_id is None:
+            return {"result": "not_found", "doc_id": id, "new_doc_id": None}
+
+        # Tombstone old doc
+        tombstones.mark_deleted([existing_doc_id])
+
+        # Fetch and merge
+        existing = None
+        for doc in engine._fetch_docs([existing_doc_id]):
+            existing = doc
+            break
+
+        merged = {k: v for k, v in (existing or {}).items() if not k.startswith("_")}
+        merged = {k: v for k, v in merged.items() if k != "_id"}
+        for k, v in fields.items():
+            if isinstance(v, (dict, list)):
+                merged[k] = json.dumps(v)
+            else:
+                merged[k] = str(v)
+
+        new_doc_id = self._next_doc_id()
+        self._add_doc(new_doc_id, merged)
+
+        # Update id mapping
+        self._reload_engine()
+        self._engine._tombstones.set_doc_id_for_field(id_field, id, new_doc_id)
+
+        return {"result": "updated", "doc_id": id, "new_doc_id": new_doc_id}
+
+    def delete(self, id: str) -> dict:
+        """Delete a document by its natural key value.
+
+        Requires --id-field at build time.
+
+        Returns:
+            {"result": "deleted"|"not_found", "doc_id": id}
+        """
+        self._require_id_field()
+        id_field = self._id_field()
+
+        engine = self._engine
+        tombstones = engine._tombstones
+        if tombstones is None:
+            raise ValueError("Index does not support delete operations.")
+
+        existing_doc_id = tombstones.get_doc_id_for_field(id_field, id)
+        if existing_doc_id is None:
+            return {"result": "not_found", "doc_id": id}
+
+        tombstones.mark_deleted([existing_doc_id])
+        tombstones.remove_doc_id_for_field(id_field, id)
+        return {"result": "deleted", "doc_id": id}
+
+    def delete_query(self, q: str) -> dict:
+        """Delete all documents matching a Lucene query.
+
+        Requires --id-field at build time.
+
+        Returns:
+            {"deleted": int, "doc_ids": [int]}
+        """
+        self._require_id_field()
+        id_field = self._id_field()
+
+        result = self._engine.query(q, page=0, page_size=100_000)
+        docs = result.get("results", [])
+        if not docs:
+            return {"deleted": 0, "doc_ids": []}
+
+        tombstones = self._engine._tombstones
+
+        # For each doc, figure out the tombstone doc_id:
+        # - Built docs: _id field is integer doc_id (was stored as str(total_docs) at build time)
+        # - Inserted docs: _id field is ULID string; tombstone has id_field → doc_id mapping
+        # - Built docs have id_field set; inserted docs have _id but id_field might be unset
+        int_doc_ids = []
+        for doc in docs:
+            doc_id_val = doc.get("_id")
+            if isinstance(doc_id_val, int):
+                int_doc_ids.append(doc_id_val)
+            elif isinstance(doc_id_val, str) and doc_id_val.isdigit():
+                int_doc_ids.append(int(doc_id_val))
+            else:
+                # ULID or other string — look up via id_field mapping
+                if id_field:
+                    mapped = tombstones.get_doc_id_for_field(id_field, doc_id_val)
+                    if mapped is not None:
+                        int_doc_ids.append(mapped)
+
+        if int_doc_ids:
+            tombstones.mark_deleted(int_doc_ids)
+
+        # Remove id mappings
+        for doc in docs:
+            natural_id = doc.get(id_field)
+            if natural_id:
+                tombstones.remove_doc_id_for_field(id_field, str(natural_id))
+
+        return {"deleted": len(int_doc_ids), "doc_ids": int_doc_ids}
+
+    def bulk(self, operations: list[dict]) -> dict:
+        """Execute a list of bulk operations (ES-compatible format).
+
+        Each operation is a dict with one key (the action) and a "_id" or "doc".
+        Supported actions:
+          - ``{"index": {"_id": "x"}, "doc": {...}}``  → upsert (insert or replace)
+          - ``{"create": {"_id": "x"}, "doc": {...}}``  → insert only, fails if exists
+          - ``{"update": {"_id": "x"}, "doc": {...}}``  → partial update (merge)
+          - ``{"delete": {"_id": "x"}}``                → delete by id
+
+        Returns:
+            {"indexed": int, "updated": int, "deleted": int, "errors": list}
+        """
+        self._require_id_field()
+        id_field = self._id_field()
+        indexed = updated = deleted = 0
+        errors = []
+
+        i = 0
+        while i < len(operations):
+            op = operations[i]
+            if not op:
+                i += 1
+                continue
+
+            action = None
+            meta = None
+            for key in ("index", "create", "update", "delete"):
+                if key in op:
+                    action = key
+                    meta = op[key]
+                    break
+
+            if action is None:
+                errors.append({"type": "action_error", "op": op})
+                i += 1
+                continue
+
+            if action in ("index", "create", "update"):
+                if i + 1 >= len(operations):
+                    errors.append({"type": "missing_body", "op": op})
+                    i += 1
+                    continue
+                body = operations[i + 1]
+                i += 2  # consume op + body
+            elif action == "delete":
+                body = None
+                i += 1
+            else:
+                # no-body action
+                body = None
+                i += 1
+
+            doc_id = meta.get("_id") if meta else None
+
+            try:
+                if action == "index":
+                    if not doc_id:
+                        self.insert(body or {})
+                        indexed += 1
+                    else:
+                        r = self.index(doc_id, body or {})
+                        if r["result"] == "created":
+                            indexed += 1
+                        else:
+                            updated += 1
+                elif action == "create":
+                    if not doc_id:
+                        errors.append({"type": "missing_id", "op": op})
+                        continue  # body already consumed above
+                    existing = self._engine._tombstones.get_doc_id_for_field(id_field, doc_id)
+                    if existing is not None:
+                        errors.append({"type": "conflict", "doc_id": doc_id})
+                        i += 2  # skip duplicate op + its body
+                        continue
+                    new_doc_id = self._next_doc_id()
+                    doc_with_id = dict(body or {})
+                    doc_with_id["_id"] = doc_id
+                    self._add_doc(new_doc_id, doc_with_id)
+                    self._reload_engine()
+                    self._engine._tombstones.set_doc_id_for_field(id_field, doc_id, new_doc_id)
+                    indexed += 1
+                elif action == "update":
+                    r = self.update(doc_id, body or {})
+                    if r["result"] == "not_found":
+                        errors.append({"type": "not_found", "doc_id": doc_id})
+                    else:
+                        updated += 1
+                elif action == "delete":
+                    r = self.delete(doc_id)
+                    if r["result"] == "deleted":
+                        deleted += 1
+                    else:
+                        errors.append({"type": "not_found", "doc_id": doc_id})
+            except Exception as e:
+                errors.append({"type": "error", "doc_id": doc_id, "message": str(e)})
+
+        return {"indexed": indexed, "updated": updated, "deleted": deleted, "errors": errors}
+
+    def _add_doc(self, doc_id: int, doc: dict):
+        """Low-level: add a single document via IndexBuilder and finalize."""
+        from flatseek.core.builder import IndexBuilder
+        index_dir = self._engine.data_dir
+        normalized, fields = self._normalize_doc(doc)
+        builder = IndexBuilder(
+            index_dir,
+            column_map={},
+            start_doc_id=doc_id,
+            dataset=self._index or os.path.basename(index_dir),
+            checkpoint_cb=None,
+            delimiter=",",
+            columns=None,
+            worker_id=None,
+            dedup_fields=None,
+            doc_id_end=None,
+            daemon=False,
+            id_field=self._id_field(),
+        )
+        builder.add_row(normalized, fields, file_rel=None, col_schema=None)
+        builder.finalize()
 
 
 # ─── API mode (HTTP client) ────────────────────────────────────────────────────
@@ -440,4 +819,4 @@ def Elasticsearch(hosts=None, **kwargs) -> Flatseek:
 
 __all__ = ["Flatseek", "Response", "CountResponse", "AggsResponse",
            "Elasticsearch", "__version__"]
-__version__ = "0.1.9"
+__version__ = "0.1.10"

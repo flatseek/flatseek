@@ -981,10 +981,20 @@ class IndexBuilder:
         if self._file_excludes:
             row = {k: v for k, v in row.items() if k not in self._file_excludes}
 
+        # Build field_types map: original col name → semantic type (for _expand_record).
+        # Only ARRAY columns get separator-split expansion; TEXT/KEYWORD stay as-is.
+        field_types = {}
+        if col_schema is not None:
+            for col in headers:
+                if col in col_schema:
+                    sem_type, _ = col_schema[col]
+                    field_types[col] = sem_type
+
         # Expand nested arrays/objects before indexing
         # {"tags": ["api","cdn"], "address": {"city": "NYC"}}
         #   → {"tags[0]": "api", "tags[1]": "cdn", "address.city": "NYC", ...}
-        expanded_row = _expand_record(dict(row))
+        # Only ARRAY-type columns get separator splitting (e.g. "ai,ml,nlp" → tags[0], tags[1]).
+        expanded_row = _expand_record(dict(row), field_types=field_types)
 
         # Inject reserved metadata fields
         if self.dataset:
@@ -3028,7 +3038,7 @@ def _json_val_to_str(v):
     return v
 
 
-def _expand_record(obj, prefix="", sep="."):
+def _expand_record(obj, prefix="", sep=".", field_types=None):
     """Recursively expand a dict into flat dot-path keys.
 
     {"tags": ["api","cdn"], "address": {"city": "NYC"}}
@@ -3039,13 +3049,19 @@ def _expand_record(obj, prefix="", sep="."):
     - Each element also expanded for search (tags[0], tags[1] etc.)
     - Nested arrays/dicts expanded recursively for deep field search
 
+    Only fields with semantic_type == "ARRAY" get separator-split expansion
+    (e.g. "ai,ml,nlp" → body[0], body[1], body[2]). TEXT and KEYWORD fields
+    are stored as-is without splitting.
+
     Handles both JSON arrays and Python-style single-quoted arrays.
     """
     result = {}
+    field_types = field_types or {}
     for key, val in obj.items():
         if type(key) is not str:
             key = str(key)
         full_key = f"{prefix}{key}" if prefix else key
+        sem_type = field_types.get(full_key, field_types.get(key, "OTHER"))
         # Dispatch by input type — avoids the str-roundtrip + json.loads probe
         # that previously ran on every cell (the dominant cost on text-heavy CSVs).
         t = type(val)
@@ -3070,15 +3086,15 @@ def _expand_record(obj, prefix="", sep="."):
                         except (ValueError, SyntaxError, TypeError):
                             parsed = None
                 if not isinstance(parsed, (dict, list)):
-                    # Not actually structured — try separator split
-                    pass  # fall through to separator check below
+                    # Not actually structured — only try separator split for ARRAY cols
+                    parsed = None
                 # else: parsed is dict/list from JSON, continue to recursion
             else:
                 parsed = None
 
-            # Try separator split: "a,b,c" or "x#y#z" → list
-            if parsed is None and len(val) >= 3:
-                # Common separators: comma, semicolon, pipe, hash
+            # Separator split: only for ARRAY-type columns.
+            # "ai,ml,nlp" → split; "AI, ML, DL are related fields" → not split.
+            if parsed is None and sem_type == "ARRAY" and len(val) >= 3:
                 sep = None
                 if ',' in val:
                     sep = ','
@@ -3094,7 +3110,7 @@ def _expand_record(obj, prefix="", sep="."):
                         parsed = parts
 
             if parsed is None:
-                # Not structured — store as plain string
+                # Not structured or non-ARRAY — store as plain string
                 result[full_key] = val
                 continue
         else:
@@ -3103,13 +3119,13 @@ def _expand_record(obj, prefix="", sep="."):
 
         # `parsed` is now a dict or list. Recurse / expand.
         if isinstance(parsed, dict):
-            result.update(_expand_record(parsed, full_key + (sep or "."), sep))
+            result.update(_expand_record(parsed, full_key + (sep or "."), sep, field_types))
         else:  # list
             result[full_key] = json.dumps(parsed, ensure_ascii=False)
             for i, item in enumerate(parsed):
                 arr_key = f"{full_key}[{i}]"
                 if type(item) is dict:
-                    result.update(_expand_record(item, arr_key + sep, sep))
+                    result.update(_expand_record(item, arr_key + sep, sep, field_types))
                 elif type(item) is list:
                     result[arr_key] = json.dumps(item, ensure_ascii=False)
                 else:

@@ -140,7 +140,14 @@ Full comparison including tantivy, Typesense, Whoosh, ZincSearch:
 | **Export** | Stream matching documents as JSONL or CSV |
 | **Slice** | Materialize query results as a new standalone index |
 
-See [docs/](docs/) for full details.
+See each doc for details:
+
+- **Search** — [docs/search.md](docs/search.md) (CLI, API, library; directory, FSK, remote, multi-index, sort)
+- **Aggregations** — [docs/aggregate.md](docs/aggregate.md) (API & library; terms, stats, date_histogram)
+- **Export** — [docs/export.md](docs/export.md) (CLI; JSONL/CSV, single & multi-index)
+- **Multi-index** — [docs/multiindex.md](docs/multiindex.md) (directory subdirs, FSK bucket, `_index:pattern`)
+- **Serve & dashboard** — [docs/serving.md](docs/serving.md) (all index modes, storage backends)
+- [docs/](docs/) — full documentation index
 
 ---
 
@@ -310,9 +317,7 @@ itself stays unchanged.
 PRs welcome. Run tests:
 
 ```bash
-pytest src/flatseek/test/test_search.py -v   # accuracy tests
-pytest src/flatseek/test/test_api.py         # API smoke tests
-pytest src/flatseek/test/test_cli.py         # CLI integration
+pytest tests/ -v          # all tests
 ```
 ---
 ## License

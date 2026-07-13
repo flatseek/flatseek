@@ -35,7 +35,7 @@ try:
     with open(_PYPROJECT_TOML, "rb") as _f:
         __version__ = tomllib.load(_f)["project"]["version"]
 except Exception:
-    __version__ = "0.1.9"
+    __version__ = "0.1.10"
 
 
 def _parse_columns(columns_str):
@@ -1160,6 +1160,353 @@ def _resolve_flatseek_passphrase(args, *, allow_prompt: bool = True):
     return None
 
 
+def _cmd_slice_one(args):
+    """Single-index slice: wrapper so cmd_slice can be called recursively for one FSK."""
+    cmd_slice(args)
+
+
+def _cmd_export_fsk_multi(args, index_pattern):
+    """Export from multiple .fsk files matched by --index pattern.
+
+    Streams docs sequentially from each engine to output (file or stdout),
+    in JSONL or CSV format, with progress reporting.
+    """
+    import concurrent.futures, fnmatch, json as _json, os
+    from pathlib import Path
+    from flatseek.core.query_parser import parse, execute
+    from flatseek.flatseek_file import FlatseekFileStorageAdapter
+    from flatseek.core.query_engine import QueryEngine
+
+    data_dir = args.data_dir
+    out_path = getattr(args, "output", None)
+    fmt = getattr(args, "format", "jsonl")
+    limit = getattr(args, "limit", None)
+    quiet = getattr(args, "quiet", False)
+    query_str = (getattr(args, "query", "") or "").strip()
+
+    # ── Discover .fsk files ─────────────────────────────────────────────────
+    dir_path = Path(data_dir)
+    fsk_map: dict[str, Path] = {}
+    for fsk_path in sorted(dir_path.rglob("*.fsk")):
+        rel = fsk_path.relative_to(dir_path)
+        index_name = str(rel.with_suffix("").as_posix())
+        fsk_map[index_name] = fsk_path
+
+    matched_names: list[str] = []
+    for part in index_pattern.split(","):
+        matched_names.extend(fnmatch.filter(fsk_map.keys(), part.strip()))
+    matched_names = sorted(set(matched_names))
+    if not matched_names:
+        print("No matching .fsk files found.", file=sys.stderr)
+        return
+
+    # ── Derive encryption key once ─────────────────────────────────────────
+    first_fsk = fsk_map[matched_names[0]]
+    enc_key, _ = _get_flatseek_enc_key(str(first_fsk), args)
+
+    # ── Open engines sequentially ───────────────────────────────────────────
+    engines: list[tuple[str, QueryEngine]] = []
+    for name in matched_names:
+        fsk_path = fsk_map[name]
+        try:
+            storage = FlatseekFileStorageAdapter(fsk_path, enc_key=enc_key)
+        except Exception:
+            continue
+        eng = QueryEngine(".", storage=storage)
+        if enc_key is not None:
+            eng._enc_key = enc_key
+        engines.append((name, eng))
+
+    if not engines:
+        print("No readable .fsk files.", file=sys.stderr)
+        return
+
+    # ── Parse and strip _index:pattern from AST ─────────────────────────────
+    ast = parse(query_str) if query_str else None
+    if ast is not None:
+        _idx_pat: str | None = index_pattern
+
+        def _walk_strip(node):
+            nonlocal _idx_pat
+            kind = node[0]
+            if kind == 'term':
+                field = node[1]
+                value = node[2] if len(node) >= 3 else None
+                if field == '_index' and value is not None:
+                    if _idx_pat is None:
+                        _idx_pat = value
+                    return None
+                return node
+            elif kind in ('and', 'or', 'andnot'):
+                _, l, r = node
+                nl, nr = _walk_strip(l), _walk_strip(r)
+                if nl is None: return nr
+                if nr is None: return nl
+                return (kind, nl, nr)
+            elif kind == 'not':
+                _, c = node
+                nc = _walk_strip(c)
+                return None if nc is None else (kind, nc)
+            return node
+
+        ast = _walk_strip(ast)
+        if ast is None and not query_str:
+            ast = None  # only _index term → match all
+
+    # ── Open output ─────────────────────────────────────────────────────────
+    write_to_stdout = out_path is None
+    progress_fh = None if (write_to_stdout or quiet) else sys.stderr
+    out_fh: Any = sys.stdout
+    if not write_to_stdout:
+        out_fh = open(out_path, "w", encoding="utf-8", newline="")
+
+    csv_keys: list[str] = []
+    csv_header_done = False
+    written = 0
+
+    def _write(doc, idx_name):
+        nonlocal csv_keys, csv_header_done, written
+        doc["_index"] = idx_name
+        if fmt == "jsonl":
+            out_fh.write(_json.dumps(doc, ensure_ascii=False) + "\n")
+        else:
+            if not csv_header_done:
+                csv_keys = sorted(doc.keys())
+                out_fh.write(",".join(csv_keys) + "\n")
+                csv_header_done = True
+            row = []
+            for k in csv_keys:
+                v = doc.get(k, "")
+                if isinstance(v, (list, dict)):
+                    v = _json.dumps(v)
+                v = str(v).replace('"', '""')
+                if ',' in str(v) or '"' in str(v) or '\n' in str(v):
+                    v = '"' + v + '"'
+                row.append(v)
+            out_fh.write(",".join(row) + "\n")
+        written += 1
+
+    # ── Stream from each engine sequentially ───────────────────────────────
+    for name, eng in engines:
+        if limit is not None and written >= limit:
+            break
+        try:
+            if ast is None:
+                # Match-all: stream all docs
+                for _cs, chunk in eng._iter_chunks():
+                    for did in sorted(chunk):
+                        if limit is not None and written >= limit:
+                            break
+                        doc = {"_id": did, **chunk[did]}
+                        _write(doc, name)
+                        if progress_fh and written % 5000 == 0:
+                            progress_fh.write(f"\r[EXPORT] {written:,} rows...   ")
+                            progress_fh.flush()
+            else:
+                # Query: resolve, group by chunk, stream
+                from collections import defaultdict
+                matching = execute(ast, eng)
+                if not matching:
+                    continue
+                by_chunk: dict[int, list[int]] = defaultdict(list)
+                for did in matching:
+                    by_chunk[did >> 32].append(did)
+                for cs in sorted(by_chunk):
+                    if limit is not None and written >= limit:
+                        break
+                    chunk = eng._load_chunk(cs)
+                    if not chunk:
+                        continue
+                    for did in sorted(by_chunk[cs]):
+                        if limit is not None and written >= limit:
+                            break
+                        if did in chunk:
+                            doc = {"_id": did, **chunk[did]}
+                            _write(doc, name)
+                            if progress_fh and written % 5000 == 0:
+                                progress_fh.write(f"\r[EXPORT] {written:,} rows...   ")
+                                progress_fh.flush()
+        except Exception:
+            pass
+
+    if progress_fh:
+        progress_fh.write(f"\r[EXPORT] {written:,} rows exported.   \n")
+        progress_fh.flush()
+
+    if not write_to_stdout:
+        out_fh.close()
+
+    if not quiet:
+        print(f"Exported {written:,} rows from {len(engines)} index(es).", file=sys.stderr)
+
+
+def _cmd_search_fsk_multi(args, query_str, index_pattern):
+    """Search across multiple .fsk files in a directory using _index:pattern routing.
+
+    This mirrors the API's multi-index search behaviour for FSK archives.
+    Supports fnmatch patterns (e.g. ``logs_2025-*`` or ``ads?,txs``).
+    """
+    import concurrent.futures, fnmatch
+    from pathlib import Path
+    from flatseek.core.query_parser import parse, execute
+    from flatseek.flatseek_file import FlatseekFileStorageAdapter
+    from flatseek.core.query_engine import QueryEngine
+
+    data_dir = args.data_dir
+    page = args.page
+    page_size = args.page_size
+
+    # ── Discover .fsk files ─────────────────────────────────────────────────
+    dir_path = Path(data_dir)
+    fsk_map: dict[str, Path] = {}  # index_name → .fsk path
+    for fsk_path in sorted(dir_path.rglob("*.fsk")):
+        rel = fsk_path.relative_to(dir_path)
+        index_name = str(rel.with_suffix("").as_posix())
+        fsk_map[index_name] = fsk_path
+
+    # Expand pattern (handles comma-separated and fnmatch)
+    matched_names: list[str] = []
+    for part in index_pattern.split(","):
+        matched_names.extend(fnmatch.filter(fsk_map.keys(), part.strip()))
+    matched_names = sorted(set(matched_names))
+    if not matched_names:
+        print(f"Query:  {query_str}")
+        print(f"Found:  0 match(es)  (page 1, showing 0)")
+        return
+
+    # ── Derive encryption key once (assumes same key for all FSKs in dir) ──
+    # Try the first FSK to detect encryption; reuse the same key for all.
+    first_fsk = fsk_map[matched_names[0]]
+    enc_key, token_info = _get_flatseek_enc_key(str(first_fsk), args)
+    if token_info:
+        print(f"WARNING: FSKs use license-protected format; results may be incomplete.",
+              file=sys.stderr)
+
+    # ── Open engine per matched FSK ────────────────────────────────────────
+    def _open_one(name: str) -> tuple[str, QueryEngine]:
+        fsk_path = fsk_map[name]
+        try:
+            storage = FlatseekFileStorageAdapter(fsk_path, enc_key=enc_key)
+        except Exception:
+            return name, None
+        eng = QueryEngine(".", storage=storage)
+        if enc_key is not None:
+            eng._enc_key = enc_key
+        return name, eng
+
+    engines: list[tuple[str, QueryEngine]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(matched_names), 8)) as pool:
+        futures = {pool.submit(_open_one, n): n for n in matched_names}
+        for fut in concurrent.futures.as_completed(futures):
+            name, eng = fut.result()
+            if eng is not None:
+                engines.append((name, eng))
+
+    if not engines:
+        print(f"Query:  {query_str}")
+        print(f"Found:  0 match(es)  (page 1, showing 0)")
+        return
+
+    # ── Parse sort ───────────────────────────────────────────────────────
+    sort_spec = None
+    if getattr(args, "sort", None):
+        from flatseek.api.routes.search import _parse_sort
+        sort_spec = _parse_sort(args.sort)
+
+    # ── Strip _index:pattern from query AST ───────────────────────────────
+    ast = parse(query_str)
+    _idx_pat: str | None = index_pattern  # already extracted
+
+    def _walk_strip_index(node):
+        nonlocal _idx_pat
+        kind = node[0]
+        if kind == 'term':
+            field = node[1]
+            value = node[2] if len(node) >= 3 else None
+            if field == '_index' and value is not None:
+                if _idx_pat is None:
+                    _idx_pat = value
+                return None
+            return node
+        elif kind in ('and', 'or', 'andnot'):
+            _, left, right = node
+            nl = _walk_strip_index(left)
+            nr = _walk_strip_index(right)
+            if nl is None:
+                return nr
+            if nr is None:
+                return nl
+            return (kind, nl, nr)
+        elif kind == 'not':
+            _, child = node
+            nc = _walk_strip_index(child)
+            if nc is None:
+                return None
+            return (kind, nc)
+        return node
+
+    ast = _walk_strip_index(ast)
+
+    # ── Fan out query to each engine ───────────────────────────────────────
+    def _query_one(name_eng: tuple[str, QueryEngine]) -> tuple[str, QueryEngine, list[int]]:
+        name, eng = name_eng
+        try:
+            if ast is None:
+                ids = list(eng._scan_doc_ids())
+            else:
+                ids = sorted(execute(ast, eng))
+                ids = eng._alive_ids(ids) if hasattr(eng, '_alive_ids') else ids
+        except Exception:
+            ids = []
+        return name, eng, ids
+
+    per_eng: list[tuple[str, QueryEngine, list[int]]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(engines), 8)) as pool:
+        futures = {pool.submit(_query_one, ne): ne for ne in engines}
+        for fut in concurrent.futures.as_completed(futures):
+            per_eng.append(fut.result())
+
+    # ── Merge + paginate ──────────────────────────────────────────────────
+    # Build globally sorted (index_name, doc_id) list across all engines.
+    # doc_ids are engine-local so (index_name, doc_id) is the true unique key.
+    all_keys: list[tuple[str, int]] = []
+    for idx_name, _, ids in per_eng:
+        all_keys.extend((idx_name, doc_id) for doc_id in ids)
+    all_keys.sort(key=lambda x: x[1])  # sort by doc_id within each engine; stable sort preserves engine order
+    total = len(all_keys)
+    page_keys = all_keys[page * page_size: page * page_size + page_size]
+
+    # Build engine lookup: index_name → engine
+    eng_by_idx: dict[str, QueryEngine] = {idx: eng for idx, eng, _ in per_eng}
+
+    # Fetch docs for the page
+    fetched_docs: list[dict] = []
+    for idx_name, doc_id in page_keys:
+        eng = eng_by_idx.get(idx_name)
+        if eng is not None:
+            docs = eng._fetch_docs([doc_id])
+            for d in docs:
+                d["_index"] = idx_name
+            fetched_docs.extend(docs)
+
+    # ── Apply sort ────────────────────────────────────────────────────────
+    if sort_spec and fetched_docs:
+        from flatseek.core.query_engine import _coerce_sort_key
+        for field, direction in reversed(sort_spec):
+            rev = (direction == "desc")
+            try:
+                fetched_docs.sort(key=lambda d: _coerce_sort_key(d.get(field), rev), reverse=rev)
+            except Exception:
+                pass
+
+    # ── Print results ─────────────────────────────────────────────────────
+    print(f"Query:  {query_str}")
+    print(f"Found:  {total:,} match(es)  (page {page + 1}, showing {len(fetched_docs)})")
+    for i, doc in enumerate(fetched_docs):
+        print(f"\n--- {page * page_size + i + 1} ---")
+        print(doc)
+
+
 def cmd_search(args):
     from flatseek.core.query_engine import QueryEngine
     from flatseek.core.storage import StorageConfig, create_storage_adapter
@@ -1369,6 +1716,52 @@ def cmd_search(args):
         )
         storage = create_storage_adapter(config)
 
+    # Build query string first so we can detect _index:pattern for multi-FSK routing.
+    parts = []
+    if args.query:
+        q = f"{args.column}:{args.query}" if args.column else args.query
+        parts.append(q)
+    for cond in (args.and_ or []):
+        if ":" not in cond:
+            print(f"Error: --and must be 'col:term', got: {cond!r}")
+            sys.exit(1)
+        parts.append(cond)
+    # --index flag: inject _index:pattern for multi-index routing.
+    if args.index is not None:
+        parts.append(f"_index:{args.index}")
+
+    query_str = " AND ".join(parts) if parts else ""
+    if not query_str:
+        print("Nothing to search. Provide a query.")
+        sys.exit(1)
+
+    # ── Multi-FSK search: data_dir is a directory of .fsk files ─────────────
+    # Detect when data_dir is a directory containing .fsk files AND the query
+    # contains _index:pattern (via --index flag or embedded in query string).
+    # In this case we open one engine per matching .fsk and merge results.
+    data_path = Path(args.data_dir)
+    _index_pattern = None
+    if args.index is not None:
+        _index_pattern = args.index
+    else:
+        # Extract _index:pattern from query string itself (e.g. "_index:logs_2025-*")
+        import re as _re
+        m = _re.search(r'_index:([^\s]+)', query_str)
+        if m:
+            _index_pattern = m.group(1)
+
+    is_multi_fsk = (
+        not is_url
+        and not is_flat_file
+        and getattr(args, "storage_backend", None) is None
+        and data_path.is_dir()
+        and _index_pattern is not None
+    )
+
+    if is_multi_fsk:
+        _cmd_search_fsk_multi(args, query_str, _index_pattern)
+        return
+
     try:
         qe = QueryEngine(args.data_dir, storage=storage)
     except FileNotFoundError as e:
@@ -1385,22 +1778,14 @@ def cmd_search(args):
         license_expire=token_info.get("expire_ts") if token_info else None,
     )
 
-    # Build Lucene query string from args.
-    # -c / --and are convenience shortcuts converted to Lucene syntax.
-    parts = []
-    if args.query:
-        q = f"{args.column}:{args.query}" if args.column else args.query
-        parts.append(q)
-    for cond in (args.and_ or []):
-        if ":" not in cond:
-            print(f"Error: --and must be 'col:term', got: {cond!r}")
+    # ── Parse sort ─────────────────────────────────────────────────────────
+    sort_spec = None
+    if getattr(args, "sort", None):
+        from flatseek.api.routes.search import _parse_sort
+        sort_spec = _parse_sort(args.sort)
+        if sort_spec is None:
+            print(f"Error: invalid --sort format: {args.sort!r}", file=sys.stderr)
             sys.exit(1)
-        parts.append(cond)
-
-    query_str = " AND ".join(parts) if parts else ""
-    if not query_str:
-        print("Nothing to search. Provide a query.")
-        sys.exit(1)
 
     try:
         if is_url:
@@ -1417,14 +1802,14 @@ def cmd_search(args):
             t = threading.Thread(target=_spin, daemon=True)
             t.start()
             try:
-                result = qe.query(query_str, page=args.page, page_size=args.page_size)
+                result = qe.query(query_str, page=args.page, page_size=args.page_size, sort=sort_spec)
             finally:
                 stop_spin[0] = True
                 t.join(timeout=0.5)
                 sys.stderr.write(f"\r[searching remote]  ✓       \n")
                 sys.stderr.flush()
         else:
-            result = qe.query(query_str, page=args.page, page_size=args.page_size)
+            result = qe.query(query_str, page=args.page, page_size=args.page_size, sort=sort_spec)
     except SyntaxError as e:
         print(f"Query syntax error: {e}")
         sys.exit(1)
@@ -1843,6 +2228,31 @@ def cmd_export(args):
             url=getattr(args, "storage_url", "") or "",
         )
         storage = create_storage_adapter(config)
+
+    # ── Multi-FSK export: data_dir is a directory of .fsk files ─────────────
+    # Detect and delegate to _cmd_export_fsk_multi when --index pattern is given.
+    data_path = Path(args.data_dir)
+    _index_pattern = None
+    if getattr(args, "index", None) is not None:
+        _index_pattern = args.index
+    else:
+        import re as _re
+        q_for_extract = (getattr(args, "query", "") or "").strip()
+        m = _re.search(r'_index:([^\s]+)', q_for_extract)
+        if m:
+            _index_pattern = m.group(1)
+
+    is_multi_fsk = (
+        not is_url
+        and not is_flat_file
+        and getattr(args, "storage_backend", None) is None
+        and data_path.is_dir()
+        and _index_pattern is not None
+    )
+
+    if is_multi_fsk:
+        _cmd_export_fsk_multi(args, _index_pattern)
+        return
 
     qe = QueryEngine(args.data_dir, storage=storage)
     if enc_key is not None:
@@ -3428,6 +3838,7 @@ def cmd_slice(args):
 
     # ── 1. Parse args ─────────────────────────────────────────────────────────
     data_path = Path(args.data_dir)
+    is_url = isinstance(args.data_dir, str) and args.data_dir.startswith("https://")
     is_flat_file = data_path.is_file() and (
         str(data_path).endswith((".fsk", ".flatseek", ".flat"))
     )
@@ -3437,6 +3848,55 @@ def cmd_slice(args):
     out_pass      = getattr(args, "out_passphrase", None)
     force_pt      = getattr(args, "force_plaintext", False)
     n_workers     = getattr(args, "workers", None) or min(8, os.cpu_count() or 2)
+
+    # ── Multi-FSK slice: --index pattern loops over each matched .fsk ─────────
+    index_pattern = getattr(args, "index", None)
+    if index_pattern is not None and not is_flat_file and not is_url and data_path.is_dir():
+        import fnmatch
+        fsk_map: dict[str, Path] = {}
+        for fsk_path in sorted(data_path.rglob("*.fsk")):
+            rel = fsk_path.relative_to(data_path)
+            idx_name = str(rel.with_suffix("").as_posix())
+            fsk_map[idx_name] = fsk_path
+        matched: list[str] = []
+        for part in index_pattern.split(","):
+            matched.extend(fnmatch.filter(fsk_map.keys(), part.strip()))
+        matched = sorted(set(matched))
+        if not matched:
+            print(f"No .fsk files match pattern: {index_pattern}", file=sys.stderr)
+            return
+        if len(matched) > 1 and "{index}" not in str(output_path):
+            # Safety: require {index} placeholder in output when slicing multiple
+            print(
+                f"Error: --index {index_pattern!r} matches {len(matched)} indexes.\n"
+                f"  Output path must contain '{{index}}' placeholder when slicing multiple indexes.\n"
+                f"  Example: -o sliced_{{index}}.fsk",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        # Resolve passphrase once for all
+        first_fsk = fsk_map[matched[0]]
+        enc_key_slice, _ = _get_flatseek_enc_key(str(first_fsk), args)
+        for idx_name in matched:
+            fsk_path = fsk_map[idx_name]
+            out_path_str = str(output_path).replace("{index}", idx_name)
+            # Build new args for this single index, stash enc_key on args.
+            from argparse import Namespace
+            new_args = Namespace(
+                data_dir=str(fsk_path),
+                query=args.query,
+                output=out_path_str,
+                passphrase=getattr(args, "passphrase", None),
+                out_passphrase=out_pass,
+                force_plaintext=force_pt,
+                workers=getattr(args, "workers", None),
+                index=None,  # avoid re-entering multi-FSK branch
+            )
+            # Recurse into cmd_slice for this one FSK with enc_key stashed
+            new_args._enc_key = enc_key_slice  # type: ignore[attr-defined]
+            print(f"[SLICE] {idx_name}  →  {out_path_str}")
+            _cmd_slice_one(new_args)
+        return
 
     # ── 2. Open source ────────────────────────────────────────────────────────
     enc_key = None
@@ -3473,7 +3933,11 @@ def cmd_slice(args):
             except Exception:
                 pass
 
-        enc_key, _token_info = _get_flatseek_enc_key(source, args)
+        # Use pre-stashed enc_key from multi-index slice loop; skip derivation.
+        enc_key = getattr(args, '_enc_key', None)
+        _token_info = None
+        if enc_key is None:
+            enc_key, _token_info = _get_flatseek_enc_key(source, args)
         from flatseek.flatseek_file import FlatseekFileStorageAdapter
         if is_url:
             import itertools, time as _time, threading
@@ -4375,6 +4839,159 @@ def cmd_delete_doc(args):
         sys.exit(1)
 
 
+def cmd_insert_doc(args):
+    """Insert documents into an existing index (single, bulk file, or bulk from args)."""
+    import json
+    import csv as csv_module
+    from flatseek.core.query_engine import QueryEngine
+    from flatseek.core.builder import IndexBuilder
+    from flatseek.flatseek_file import FlatseekFileStorageAdapter
+
+    index = args.index
+
+    # Detect .fsk
+    is_fsk = index.endswith((".fsk", ".flatseek", ".flat"))
+    if is_fsk:
+        print("ERROR: Cannot insert into packed .fsk. Unpack first: flatseek unpack <file.fsk>")
+        sys.exit(1)
+
+    engine = QueryEngine(index)
+
+    if engine._tombstones is None:
+        print("ERROR: Index does not support write operations. Only directory indices support this.")
+        sys.exit(1)
+
+    # Get id_field from stats
+    stats_path = os.path.join(index, "stats.json")
+    id_field = None
+    if os.path.exists(stats_path):
+        stats = json.loads(open(stats_path).read())
+        id_field = stats.get("_id_field")
+
+    # Helper: load docs from various sources
+    def _load_docs():
+        docs = []
+        # From --doc arg (JSON)
+        if args.doc:
+            docs.append(json.loads(args.doc))
+        # From --file arg (JSONL or CSV)
+        if args.file:
+            path = os.path.expanduser(args.file)
+            if not os.path.exists(path):
+                print(f"ERROR: File not found: {path}")
+                sys.exit(1)
+            if path.endswith(".jsonl") or args.format == "jsonl":
+                with open(path) as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            docs.append(json.loads(line))
+            elif path.endswith(".csv") or args.format == "csv":
+                with open(path, newline="") as f:
+                    reader = csv_module.DictReader(f)
+                    for row in reader:
+                        docs.append(dict(row))
+            else:
+                # Try JSONL first, then CSV
+                with open(path) as f:
+                    content = f.read().strip()
+                if content.startswith("["):
+                    docs.extend(json.loads(content))
+                elif content.startswith("{"):
+                    docs.append(json.loads(content))
+                else:
+                    # Fallback: treat as CSV
+                    with open(path, newline="") as f:
+                        reader = csv_module.DictReader(f)
+                        for row in reader:
+                            docs.append(dict(row))
+        return docs
+
+    # Helper: normalize a doc dict to string-valued dict
+    def _normalize(doc):
+        result = {}
+        for k, v in doc.items():
+            if isinstance(v, (dict, list)):
+                result[k] = json.dumps(v)
+            else:
+                result[k] = str(v)
+        return result
+
+    docs = _load_docs()
+    if not docs:
+        print("ERROR: No documents provided. Use --doc or --file.")
+        sys.exit(1)
+
+    # Get current total_docs
+    total_docs = 0
+    if os.path.exists(stats_path):
+        stats = json.loads(open(stats_path).read())
+        total_docs = stats.get("total_docs", 0)
+
+    if not args.dry_run:
+        # Pre-scan: tombstone existing docs and track which are upserts vs inserts
+        is_upsert = {}
+        if id_field:
+            for doc in docs:
+                natural_id = doc.get(id_field)
+                if natural_id is None:
+                    is_upsert[id(id)] = False
+                    continue
+                existing = engine._tombstones.get_doc_id_for_field(id_field, str(natural_id))
+                if existing is not None:
+                    engine._tombstones.mark_deleted([existing])
+                    is_upsert[id(doc)] = True
+                else:
+                    is_upsert[id(doc)] = False
+
+        inserted = updated = 0
+        for doc in docs:
+            normalized = _normalize(doc)
+            fields = list(normalized.keys())
+            builder = IndexBuilder(
+                index,
+                column_map={},
+                start_doc_id=total_docs,
+                dataset=id_field or "doc",
+                checkpoint_cb=None,
+                delimiter=",",
+                columns=None,
+                worker_id=None,
+                dedup_fields=None,
+                doc_id_end=None,
+                daemon=True,
+            )
+            builder.add_row(normalized, fields, file_rel=None, col_schema=None)
+            builder.finalize()
+
+            # Update id mapping
+            if id_field and str(doc.get(id_field, "")):
+                natural_id = str(doc[id_field])
+                engine._tombstones.set_doc_id_for_field(id_field, natural_id, total_docs)
+                # Reload engine so next lookup sees the new mapping
+                engine = QueryEngine(index)
+
+            total_docs += 1
+            if is_upsert.get(id(doc), False):
+                updated += 1
+            else:
+                inserted += 1
+
+        parts = []
+        if inserted > 0:
+            parts.append(f"{inserted} inserted")
+        if updated > 0:
+            parts.append(f"{updated} updated (replaced)")
+        if not parts:
+            print(f"insert-doc {index}: no documents processed")
+        else:
+            print(f"insert-doc {index}: {', '.join(parts)}")
+    else:
+        print(f"[DRY RUN] Would insert {len(docs)} documents into {index}")
+        for doc in docs:
+            print(f"  {json.dumps(doc)}")
+
+
 def cmd_update_doc(args):
     """Update documents by ID or Lucene query."""
     import json
@@ -5272,6 +5889,12 @@ def main():
                    help="Results per page (default: 20)")
     p.add_argument("--and", dest="and_", action="append", metavar="col:term",
                    help="AND condition (repeatable), e.g. --and status:active --and country:ID")
+    p.add_argument("--index", dest="index", default=None, metavar="PATTERN",
+                   help="Multi-index subdir pattern (fnmatch) to scope the search, "
+                        "e.g. --index ads*  (equivalent to adding _index:ads* to the query)")
+    p.add_argument("--sort", dest="sort", default=None, metavar="FIELD:asc|desc",
+                   help="Sort results by field, e.g. --sort timestamp:desc "
+                        "(comma-separated for multi-field, e.g. level:asc,amount:desc)")
     p.add_argument("--passphrase", default=None, metavar="PASS",
                    help="Decryption passphrase (prompted interactively if index is encrypted "
                         "and this flag is omitted)")
@@ -5351,6 +5974,9 @@ def main():
                    help="Prefix path within bucket")
     p.add_argument("--storage-url", default=None, dest="storage_url",
                    help="Base URL for URL storage backend")
+    p.add_argument("--index", dest="index", default=None, metavar="PATTERN",
+                   help="Multi-index pattern (fnmatch) to scope the export, "
+                        "e.g. --index logs_2025-*  (equivalent to adding _index:logs_2025-* to -q)")
 
     # serve
     p = sub.add_parser("serve", help="Start API server + dashboard")
@@ -5508,6 +6134,11 @@ def main():
     p.add_argument("-w", "--workers", type=int, default=None, metavar="N", dest="workers",
                    help="Parallel workers for posting-list rewrite "
                         "(default: min(8, cpu_count))")
+    p.add_argument("--index", dest="index", default=None, metavar="PATTERN",
+                   help="Multi-index pattern (fnmatch) to slice multiple .fsk files. "
+                        "Each matched index is sliced individually with the same query "
+                        "and output path (output path can use {index} placeholder, "
+                        "e.g. -o sliced_{index}.fsk)")
 
     # delete
     p = sub.add_parser("delete", help="Delete an index directory fast (parallel unlink)")
@@ -5536,6 +6167,23 @@ def main():
                    help="Update all documents matching Lucene query")
     p.add_argument("--set", dest="fields", default=None, metavar="KEY=VALUE,...",
                    help="Fields to set (partial update). Example: --set status=verified,name=Alice")
+
+    # insert-doc: insert documents into an existing index
+    p = sub.add_parser("insert-doc",
+                       help="Insert documents into an existing directory index "
+                            "(supports single doc, CSV, or JSONL)")
+    p.add_argument("index", help="Target index directory (must be a directory, not .fsk)")
+    p.add_argument("--doc", dest="doc", default=None, metavar="JSON",
+                   help="Single document as JSON object. "
+                        'Example: --doc \'{"id":"1","name":"Alice","email":"alice@example.com"}\'')
+    p.add_argument("--file", dest="file", default=None, metavar="PATH",
+                   help="Path to a file containing documents to insert. "
+                        "Supports JSONL (one JSON per line) and CSV formats. "
+                        "Use --format to override auto-detection.")
+    p.add_argument("--format", dest="format", default=None, choices=["jsonl", "csv"],
+                   help="Force input format (jsonl or csv). Default: auto-detect from extension.")
+    p.add_argument("--dry-run", action="store_true", default=False, dest="dry_run",
+                   help="Show what would be inserted without making changes")
 
     # dedup
     p = sub.add_parser("dedup",
@@ -5652,6 +6300,8 @@ def main():
         cmd_delete_doc(args)
     elif args.command == "update-doc":
         cmd_update_doc(args)
+    elif args.command == "insert-doc":
+        cmd_insert_doc(args)
     elif args.command == "dedup":
         cmd_dedup(args)
     elif args.command == "compact":

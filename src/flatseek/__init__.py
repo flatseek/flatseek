@@ -21,7 +21,7 @@ Usage (direct mode):
     print(result.aggs["by_campaign"]["buckets"])
 """
 
-__version__ = "0.1.9"
+__version__ = "0.1.10"
 
 from flatseek.client import (
     Flatseek,

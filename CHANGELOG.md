@@ -5,6 +5,72 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.10] - 2026-07-13
+
+### Feature: Multi-index search with wildcard, date_histogram fast path
+
+`MultiIndexEngine` for querying multiple `.fsk` files as one logical index.
+`QueryEngine._query_multi` now supports `_index:pattern` routing:
+
+```bash
+# Query only indexes matching "ads*"
+fs.search("error AND _index:ads*")
+```
+
+- Wildcard pattern routing to sub-indexes via `_index:ads*` / `_index:ads?`
+- `date_histogram` aggregation now has a fast path for time-series data
+- `calendar_interval` aliases: `calendar_interval=month` → `interval=30d`
+
+**API:**
+- `GET /{index}/_search` — `date_histogram` with fast path
+- `GET /_search` — multi-index with `_index:pattern`
+
+**CLI:**
+- `flatseek search "error" --index "logs_2024*"`
+
+### Feature: insert/upsert/update/delete/bulk — library and CLI
+
+**Python library** (`from flatseek import Flatseek`):
+
+```python
+from flatseek import Flatseek
+fs = Flatseek("./index_dir")
+
+fs.insert({"name": "Alice"})                         # auto-generates ULID _id
+fs.index("user@example.com", {"name": "Bob"})       # upsert by natural key
+fs.update("user@example.com", {"status": "active"}) # partial update
+fs.delete("user@example.com")                       # soft-delete by key
+fs.delete_query("status:inactive")                  # soft-delete by Lucene query
+fs.bulk([
+    {"index": {"_id": "x"}}, {"name": "Alice"},
+    {"create": {"_id": "y"}}, {"name": "Bob"},
+    {"update": {"_id": "x"}}, {"doc": {"status": "active"}},
+    {"delete": {"_id": "y"}},
+])
+```
+
+**`_id` field:** Documents now have a `_id` field (like Elasticsearch):
+- `insert()` generates a ULID string (26 chars, time-sortable, globally unique)
+- `index(id, doc)` uses the provided `id` as `_id`
+- `_id` is stored as a document field, queryable and searchable
+
+**CLI:**
+
+```bash
+flatseek insert-doc ./index --doc '{"id":"1","name":"Alice"}'
+flatseek insert-doc ./index --file docs.jsonl
+flatseek insert-doc ./index --file data.csv --format csv
+```
+
+### Bugfix: `_expand_record` separator-split only for ARRAY columns
+
+Previously, all string fields containing commas (or `;|#`) were
+automatically split into `field[0]`, `field[1]`, etc. This broke prose
+fields like article bodies ("AI, ML, DL are related").
+
+Fix: separator-split now only applies to columns with semantic type
+`ARRAY`. TEXT and KEYWORD fields are stored as-is.
+
 ## [0.1.9] - 2026-07-07
 
 ### Feature: Elasticsearch-compatible bulk API
