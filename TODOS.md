@@ -29,19 +29,16 @@ separate indices. No CLI flag needed — `flatseek serve ./fsk_bucket/` where
 `fsk_bucket/` contains `a.fsk`, `b.fsk`, `c.fsk` → three indices named
 `a`, `b`, `c`. Each is queried independently.
 
-Remaining gap: no wildcard/pattern search across multiple FSKs at once
-(see multi-index search item below).
-
 ---
 
 ## [x] Multi-index search — `_index` wildcard pattern
 
-**Status**: Implemented (v0.10).
+**Status**: Implemented (v0.1.10).
 
 **What was implemented**:
 
 1. **`_index` wildcard pattern** in search and aggregate bodies (`search.py`,
-   `aggregate.py`): accepts glob patterns (`logs_*`, `a?, `a*,b*`) and fans
+   `aggregate.py`): accepts glob patterns (`logs_*`, `a?`, `a*,b*`) and fans
    out to all matching `.fsk` shards in parallel (ThreadPoolExecutor, max 8
    workers). Results are merged, paginated, and tagged with `_index`.
 
@@ -63,6 +60,41 @@ Remaining gap: no wildcard/pattern search across multiple FSKs at once
 6. **`tests/test_multi_index_search.py`**: 17 passing tests covering
    pattern expansion, multi-index search/filter/pagination, and aggregate
    terms/date_histogram across shards.
+
+---
+
+## [x] Cross-lookup — join two indexes on a shared key field
+
+**Status**: Implemented (v0.1.10).
+
+`Flatseek.cross_lookup()` enriches source index results with matching documents
+from a target index, joined on a shared key field. Available in all three
+interfaces: Python library, CLI (`cross-lookup`), and REST API.
+
+---
+
+## [x] Write operations — insert/upsert/update/delete/bulk in library + CLI
+
+**Status**: Implemented (v0.1.10).
+
+`Flatseek` client now supports: `insert()`, `index()` (upsert),
+`update()`, `delete()`, `delete_query()`, and `bulk()` in the library.
+CLI: `insert-doc`, `update-doc`, `delete-doc`. REST API: `PUT /{index}/_doc/{id}`,
+`DELETE /{index}/_doc`, `POST /{index}/_bulk_documents`.
+
+---
+
+## [x] Elasticsearch-compatible bulk API
+
+**Status**: Implemented (v0.1.9).
+
+`POST /{index}/_bulk_documents` provides an Elasticsearch-compatible
+bulk API accepting NDJSON. Compatible with the official `elasticsearch-py`
+client.
+
+Supports four operation types: `index` (upsert), `create` (insert-only),
+`update` (partial merge), `delete`. Returns ES-style response with per-item
+status codes and totals.
 
 ---
 
@@ -108,51 +140,6 @@ CSV (no inference needed).
 - `docs/cli.md` — build from Parquet usage
 
 **Effort**: ~200 lines.
-
----
-
-## [ ] Cross-index relational join (multi-step)
-
-**Status**: Deferred (v0.10+)
-
-**Why**: Analyst has separate FSKs with shared keys (e.g. `user.fsk` has
-`id,name`, `email.fsk` has `id,user_id,email`, `umur.fsk` has
-`id,user_id,age`) and needs to join them at query time.
-
-**Use case**:
-```
-user.fsk: {id, nama}
-email.fsk: {id, user_id, email}
-umur.fsk: {id, user_id, age}
-
-Query: SELECT * FROM user,email,umur WHERE user.id=email.user_id=umur.user_id AND nama LIKE '%keyword%'
-```
-
-**Approach** (existing `cross_lookup` can be chained):
-
-```python
-# Step 1: base query on user.fsk
-user_ids = qe_user.search("nama:*keyword*")  # returns doc_ids
-
-# Step 2: cross_lookup to email.fsk on user_id
-email_results = qe_email.cross_lookup_on_ids(user_ids, link_field="user_id", return_field="email")
-
-# Step 3: cross_lookup to umur.fsk on user_id
-umur_results = qe_umur.cross_lookup_on_ids(user_ids, link_field="user_id", return_field="age")
-
-# Merge: zip by user_id
-```
-
-This is lower priority than multi-index search because:
-- Denormalization at build time is more efficient (0 join cost at query)
-- For ad-hoc analysis, existing `cross_lookup` can be called from Python
-- CLI join for N-way is complex (result schema ambiguous)
-
-**Files to touch** (if implemented):
-- `src/flatseek/core/query_engine.py` — `join_n()` method
-- CLI extension for multi-step join
-
-**Effort**: ~200 lines (if needed).
 
 ---
 
@@ -208,34 +195,3 @@ GET /{index}/_bulk_upsert/status
 - `tests/test_bulk_upsert.py` — concurrent load test
 
 **Effort**: ~400 lines.
-
----
-
-## [x] Elasticsearch-compatible bulk API
-
-**Status**: Implemented (v0.2.0).
-
-**Result**: `POST /{index}/_bulk_documents` provides an Elasticsearch-compatible
-bulk API accepting NDJSON. Compatible with the official `elasticsearch-py`
-client.
-
-Supports four operation types: `index` (upsert), `create` (insert-only),
-`update` (partial merge), `delete`. Returns ES-style response with per-item
-status codes and totals.
-
-**Files changed**:
-- `src/flatseek/api/routes/documents.py` — added `_bulk_documents` route
-
-**Trigger phrases**: "bulk API", "elasticsearch bulk", "NDJSON bulk"
-
----
-
-## v0.10 Release Plan
-
-Priority order for v0.10:
-
-1. **Multi-index search** (`_index` wildcard) — highest analyst impact
-2. **Parquet build** — enables parquet bucket → FSK pipeline
-
-Future: time-pruning optimization (`start`/`end` shard pruning) — on top of multi-index search.
-
