@@ -387,7 +387,7 @@ An optional `FLATSEEK_EMBEDDED_KEY` env var overrides the default embedded key a
 - Section descriptors (offset, size) read from `.fsk` header at open time
 
 **HTTP Range optimization:**
-- Block size: 256 KB (was 4 KB in v0.1.8)
+- Block size: 256 KB
 - Concurrent fetches: 16 parallel Range requests per file
 - HTTP/2 multiplexing: single TCP connection, request pipelining
 - Graceful fallback to HTTP/1.1 if h2 not available
