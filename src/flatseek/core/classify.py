@@ -296,6 +296,30 @@ def _sample_file(path, sample_rows=300, delimiter=",", columns=None):
                 break
         return (headers or []), rows
 
+    elif ext == ".parquet":
+        try:
+            import pyarrow.parquet as _pa
+        except ImportError:
+            return [], []
+        try:
+            pf = _pa.ParquetFile(path)
+            schema = pf.schema_arrow
+            headers = [f.name for f in schema]
+            rows = []
+            for batch in pf.iter_batches(batch_size=sample_rows, columns=headers):
+                df = batch.to_pandas()
+                # Convert to strings like CSV path does (detect_type expects strings)
+                for rec in df.to_dict("records"):
+                    str_rec = {k: (str(v) if v is not None else "") for k, v in rec.items()}
+                    rows.append(str_rec)
+                    if len(rows) >= sample_rows:
+                        break
+                if len(rows) >= sample_rows:
+                    break
+            return headers, rows
+        except Exception:
+            return [], []
+
     return [], []
 
 

@@ -347,6 +347,14 @@ def _count_rows(path):
         with open(path, "rb") as f:
             count = sum(buf.count(b"\n") for buf in iter(lambda: f.read(1 << 20), b""))
         return max(0, count - 1)  # subtract header line for CSV
+    if ext == ".parquet":
+        # Parquet stores row count in metadata — read it without scanning the file.
+        try:
+            import pyarrow.parquet as _pa
+            pf = _pa.ParquetFile(path)
+            return pf.metadata.num_rows
+        except Exception:
+            return None
     return None  # JSON array: unknown upfront
 
 
@@ -2440,6 +2448,61 @@ class IndexBuilder:
                 except Exception as err:
                     print(f"Error: {err}")
 
+        elif ext == ".parquet":
+            # Parquet — use PyArrow for chunked reading.
+            # Each .parquet file is treated as one logical chunk (per-file, not per-row-group).
+            try:
+                import pyarrow.parquet as _pa
+            except ImportError:
+                print("    Skipped (pyarrow not installed — pip install pyarrow)")
+                return 0
+
+            try:
+                pf = _pa.ParquetFile(path)
+            except Exception as err:
+                print(f"    Skipped (could not open Parquet file: {err})")
+                return 0
+
+            # Peek headers from schema
+            schema = pf.schema_arrow
+            headers = [field.name for field in schema]
+
+            # Exclude SKIP-marked columns
+            if self._file_excludes:
+                headers = [h for h in headers if h not in self._file_excludes]
+
+            col_schema = self._build_col_schema(headers, file_rel)
+
+            # Row count from metadata
+            total_rows = pf.metadata.num_rows
+            _total_box[0] = total_rows
+
+            size_mb = os.path.getsize(path) / 1024 ** 2
+            print(f"\n  {file_rel}  ({size_mb:.1f} MB, {total_rows:,} rows)")
+
+            skipped = 0
+            BATCH_SIZE = 10_000
+            for batch in pf.iter_batches(batch_size=BATCH_SIZE, columns=headers):
+                # Convert batch to pandas then to dict records.
+                # Values from Parquet are native Python types (int, bool, float).
+                # Convert to strings to match CSV path (normalize_value expects strings).
+                df = batch.to_pandas()
+                for row_dict in df.to_dict("records"):
+                    # Stringify all values (like csv.DictReader does)
+                    str_row = {
+                        k: (str(v) if v is not None else "")
+                        for k, v in row_dict.items()
+                    }
+                    if skipped < skip_rows:
+                        skipped += 1
+                        continue
+                    if self._file_excludes:
+                        str_row = {k: v for k, v in str_row.items()
+                                   if k not in self._file_excludes}
+                    self.add_row(str_row, headers, file_rel, col_schema)
+                    count += 1
+                    _tick()
+
         else:
             print("    Skipped (unsupported format)")
             return 0
@@ -2971,13 +3034,13 @@ def _norm(s):
 
 
 def find_data_files(directory):
-    """Find CSV and JSON data files, skipping output/work directories.
+    """Find CSV, JSON, and Parquet data files, skipping output/work directories.
 
     Recognises plain and compressed variants (.gz, .bz2).
     """
     skip = {"data", "data2", "testdata", "tmp", ".git", "__pycache__", ".venv", "env"}
     exts = {
-        ".csv", ".json", ".jsonl", ".ndjson",
+        ".csv", ".json", ".jsonl", ".ndjson", ".parquet",
         ".csv.gz",   ".csv.bz2",
         ".json.gz",  ".json.bz2",
         ".jsonl.gz", ".jsonl.bz2",
