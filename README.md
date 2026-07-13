@@ -134,10 +134,11 @@ Full comparison including tantivy, Typesense, Whoosh, ZincSearch:
 | **Remote indexes** | Search HTTP-hosted indexes without downloading the entire dataset — [docs/storage.md](docs/storage.md) |
 | **Embedded library** | Query directly from Python without a server — [docs/python.md](docs/python.md) |
 | **REST API** | Elasticsearch-compatible Search, Bulk, and CRUD APIs — [docs/restapi.md](docs/restapi.md) |
-| **Write operations** | Insert, upsert, update, delete, bulk — [docs/python.md](docs/python.md) |
+| **Write operations** | Insert, upsert, update, delete, bulk — [docs/upsert.md](docs/upsert.md) |
 | **Parallel indexing** | Multi-worker index builds for faster ingestion — [docs/build.md](docs/build.md) |
 | **Compaction** | Reclaim disk space after large delete operations — [docs/cmd.md](docs/cmd.md) |
 | **Portable archives** | Package complete indexes into a single `.fsk` file — [docs/cmd.md](docs/cmd.md) |
+| **CLI commands** | Full reference for all subcommands (build, search, pack, unpack, export, slice, ...) — [docs/cmd.md](docs/cmd.md) |
 | **Distribution & licensing** | Public, password-protected, time-limited, or renewable license-based archives — [docs/distribution.md](docs/distribution.md) |
 | **Export** | Stream matching documents as JSONL or CSV — [docs/export.md](docs/export.md) |
 | **Slice** | Materialize query results as a new standalone index — [docs/build.md](docs/build.md) |
@@ -298,12 +299,14 @@ itself stays unchanged.
 | [Indexing](docs/indexing.md) | Formats, column types, parallel builds, encryption |
 | [Query Language](docs/query-language.md) | Full syntax reference |
 | [CLI Reference](docs/cli.md) | All CLI commands |
+| [Command Reference](docs/cmd.md) | Detailed reference for every CLI subcommand |
 | [REST API](docs/restapi.md) | API endpoints |
 | [Search](docs/search.md) | Full-text, wildcard, range, boolean, nested/array queries |
 | [Aggregations](docs/aggregate.md) | Terms, stats, date histogram, cardinality |
 | [Multi-Index](docs/multiindex.md) | Wildcard search across multiple index directories |
 | [Cross-Lookup](docs/cross-lookup.md) | Join two indexes on a shared key field |
 | [Python Library](docs/python.md) | Query, insert, upsert, update, delete, bulk from Python |
+| [Upsert & Write Ops](docs/upsert.md) | Insert, upsert, update, delete, bulk operations |
 | [Export](docs/export.md) | Stream matching documents as JSONL or CSV |
 | [Serve & Dashboard](docs/serving.md) | Self-hosted API server with embedded dashboard |
 | [Remote Storage](docs/storage.md) | HuggingFace, S3, Vercel Blob backends |
