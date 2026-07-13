@@ -131,16 +131,16 @@ Full comparison including tantivy, Typesense, Whoosh, ZincSearch:
 | **Nested & array fields** | Query nested objects and match values inside arrays — [docs/search.md](docs/search.md) |
 | **Multi-index search** | Query multiple index directories with glob patterns — [docs/multiindex.md](docs/multiindex.md) |
 | **Cross-lookup** | Join two indexes on a shared key field — [docs/cross-lookup.md](docs/cross-lookup.md) |
-| **Remote indexes** | Search HTTP-hosted indexes without downloading the entire dataset |
+| **Remote indexes** | Search HTTP-hosted indexes without downloading the entire dataset — [docs/storage.md](docs/storage.md) |
 | **Embedded library** | Query directly from Python without a server — [docs/python.md](docs/python.md) |
 | **REST API** | Elasticsearch-compatible Search, Bulk, and CRUD APIs — [docs/restapi.md](docs/restapi.md) |
 | **Write operations** | Insert, upsert, update, delete, bulk — [docs/python.md](docs/python.md) |
-| **Parallel indexing** | Multi-worker index builds for faster ingestion |
-| **Compaction** | Reclaim disk space after large delete operations |
-| **Portable archives** | Package complete indexes into a single `.fsk` file |
-| **Distribution & licensing** | Public, password-protected, time-limited, or renewable license-based archives |
+| **Parallel indexing** | Multi-worker index builds for faster ingestion — [docs/build.md](docs/build.md) |
+| **Compaction** | Reclaim disk space after large delete operations — [docs/cmd.md](docs/cmd.md) |
+| **Portable archives** | Package complete indexes into a single `.fsk` file — [docs/cmd.md](docs/cmd.md) |
+| **Distribution & licensing** | Public, password-protected, time-limited, or renewable license-based archives — [docs/distribution.md](docs/distribution.md) |
 | **Export** | Stream matching documents as JSONL or CSV — [docs/export.md](docs/export.md) |
-| **Slice** | Materialize query results as a new standalone index |
+| **Slice** | Materialize query results as a new standalone index — [docs/build.md](docs/build.md) |
 | **Serve & dashboard** | Self-hosted API server with embedded dashboard — [docs/serving.md](docs/serving.md) |
 
 ---
@@ -299,10 +299,19 @@ itself stays unchanged.
 | [Query Language](docs/query-language.md) | Full syntax reference |
 | [CLI Reference](docs/cli.md) | All CLI commands |
 | [REST API](docs/restapi.md) | API endpoints |
-| [Remote Storage](docs/storage.md) | HuggingFace, S3, Vercel Blob |
+| [Search](docs/search.md) | Full-text, wildcard, range, boolean, nested/array queries |
+| [Aggregations](docs/aggregate.md) | Terms, stats, date histogram, cardinality |
+| [Multi-Index](docs/multiindex.md) | Wildcard search across multiple index directories |
+| [Cross-Lookup](docs/cross-lookup.md) | Join two indexes on a shared key field |
+| [Python Library](docs/python.md) | Query, insert, upsert, update, delete, bulk from Python |
+| [Export](docs/export.md) | Stream matching documents as JSONL or CSV |
+| [Serve & Dashboard](docs/serving.md) | Self-hosted API server with embedded dashboard |
+| [Remote Storage](docs/storage.md) | HuggingFace, S3, Vercel Blob backends |
+| [Distribution](docs/distribution.md) | Public, password-protected, time-limited, or license-based archives |
 | [Schemas](docs/schemas.md) | Supported column types |
 | [Architecture](docs/architecture.md) | Structural and behavioral map |
 | [Internals](docs/internals.md) | Deep technical breakdown |
+| [Tests](docs/tests.md) | Test coverage matrix and gap analysis |
 
 ---
 
