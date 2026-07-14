@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.10] - 2026-07-13
 
+### Feature: Parquet build — build index directly from Parquet files
+
+`scanner.py` detects `.parquet` files and `builder.py` reads them via PyArrow.
+Each `.parquet` file is treated as one chunk (per-file, not per-row-group).
+
+**Scanner** (`core/scanner.py`):
+- `.parquet` added to `_DATA_EXTS`
+- Schema detected via `pyarrow.parquet.ParquetFile.metadata` without loading the full file
+- Sampled for type detection (same pipeline as CSV/JSON)
+
+**Builder** (`core/builder.py`):
+- Parquet reading branch in `_open_source()` / `process_file()`
+- Type mapping: Parquet `INT` → FlatSeek `INT`, `FLOAT` → `FLOAT`,
+  `BOOLEAN` → `BOOL`, `STRING` with inference → `KEYWORD`/`TEXT`/`EMAIL`/`PHONE`
+- Nested data handled via existing `_expand_record()` (dotted notation)
+
+**CLI**: Auto-detected — no new flag needed. `flatseek build ./parquet_bucket/ -o myindex.fsk`
+
+**Dependency**: `pyarrow` as optional dependency (same pattern as `zstandard`).
+
+---
+
+### Feature: Batch upsert queue for high-throughput parallel crawlers
+
+`UpsertQueue` class in `core/upsert_queue.py` enables high-throughput upsert
+for parallel crawler workloads.
+
+**Architecture**:
+- Thread-local `IndexBuilder` per worker (avoids lock contention on builder state)
+- Shared queue of doc batches
+- Background flusher thread: flushes every `flush_interval` seconds OR when
+  `batch_size` docs accumulate, whichever comes first
+- Atomic rename to make new docs searchable
+
+**Parameters** (`flush_interval`, `batch_size`):
+- `flush_interval`: seconds between background flushes (default 5.0)
+- `batch_size`: max docs per flush batch (default 1000)
+
+**REST endpoint**: `POST /{index}/_bulk_upsert` accepts a batch of upsert
+documents, returns after queuing (async). `GET /{index}/_bulk_upsert/status`
+returns queue depth and flush status.
+
+---
+
 ### Feature: Comprehensive update tests — library + REST API
 
 **New test file: `src/flatseek/test/test_update.py`** (17 tests)
