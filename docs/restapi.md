@@ -369,6 +369,41 @@ Partial update: only the fields in `set` are merged into matching documents.
 
 ## Bulk Operations
 
+### `POST /{index}/_bulk_upsert` — Batch upsert queue
+
+Queue multiple upserts to be flushed in the background by the server:
+
+```bash
+curl -X POST http://localhost:8000/my_index/_bulk_upsert \
+  -H "Content-Type: application/json" \
+  -d '{
+    "docs": [
+      {"id": "tx_001", "doc": {"id": "tx_001", "amount": 500, "status": "pending"}},
+      {"id": "tx_002", "doc": {"id": "tx_002", "amount": 600, "status": "confirmed"}}
+    ]
+  }'
+```
+
+**Request body:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `docs` | array | List of upsert objects |
+| `docs[].id` | string | Document ID |
+| `docs[].doc` | object | Document body |
+
+**Response:**
+
+```json
+{
+  "queued": 2,
+  "queue_size": 1024,
+  "flush_interval": 5.0
+}
+```
+
+---
+
 ### `POST /{index}/_bulk_documents` — ES-compatible bulk (NDJSON)
 
 Accepts NDJSON (newline-delimited JSON) — one JSON object per line.
