@@ -134,8 +134,8 @@ def test_single_thread_batch_upsert(built_index):
         for i in range(5, 10):
             queue.put(f"new{i}@example.com", {"email": f"new{i}@example.com", "status": "active"})
 
-        # Give the flusher time to process
-        time.sleep(0.5)
+        # Wait for flusher thread to finish builder.finalize()
+        time.sleep(3.0)
 
         status = queue.status()
         assert status["pending_docs"] == 0
@@ -247,8 +247,8 @@ def test_manual_flush(built_index):
         # Manual flush
         queue.flush()
 
-        # Give flusher time to process
-        time.sleep(0.5)
+        # Wait for flusher thread to finish builder.finalize()
+        time.sleep(3.0)
 
         status = queue.status()
         assert status["pending_docs"] == 0
@@ -300,7 +300,7 @@ def test_queue_status_reporting(built_index):
 
         # Flush
         queue.flush()
-        time.sleep(0.5)
+        time.sleep(3.0)
 
         status = queue.status()
         assert status["pending_docs"] == 0
