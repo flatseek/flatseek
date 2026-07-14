@@ -1,6 +1,6 @@
 # Flatseek Test Coverage Matrix
 
-> Generated: 2026-07-13 | Updated: 2026-07-14 | Tests added: sort, pagination, pack, unpack, export, verify, slice, delete_query fix
+> Generated: 2026-07-14 | Updated: 2026-07-14 | Tests added: sort, pagination, pack, unpack, export, verify, slice, delete_query fix, parquet_build, bulk_upsert
 
 Kolom **TEST** = nama file test (e.g. `test_cli.py`) jika ada test, `—` jika belum ada.
 
@@ -13,6 +13,7 @@ Kolom **TEST** = nama file test (e.g. `test_cli.py`) jika ada test, `—` jika b
 | Build index from CSV | test_cli.py | — | — |
 | Build index (parallel) | — | — | — |
 | Build index from JSONL | — | — | — |
+| Build index from Parquet | test_parquet_build.py | test_parquet_build.py | — |
 | Classify CSV columns | test_cli.py | — | — |
 | Generate build plan | test_cli.py | — | — |
 | Generate dummy data | — | — | — |
@@ -99,6 +100,7 @@ Kolom **TEST** = nama file test (e.g. `test_cli.py`) jika ada test, `—` jika b
 | Delete by Lucene query | — | test_write_ops.py | test_api.py |
 | Get by numeric doc_id | — | — | — |
 | Bulk — ES NDJSON | — | test_write_ops.py | test_api.py |
+| Bulk upsert queue | test_bulk_upsert.py | test_bulk_upsert.py | — |
 | Bulk — JSON array | — | — | test_api.py |
 | Count | test_cli.py | test_search.py | test_api.py |
 | Export to JSONL | — | — | — |
@@ -156,6 +158,8 @@ Kolom **TEST** = nama file test (e.g. `test_cli.py`) jika ada test, `—` jika b
 | [`test_api.py`](src/flatseek/test/test_api.py) | 1 | root(16), health(27), indices(39), index CRUD(53), mapping(126), search(138), aggregate(158), count(178), bulk(190), flush(241), logs(253), stats(266), rename(278), encrypt(290), auth(318), validate(347), delete_by_query(359) |
 | [`test_search.py`](src/flatseek/test/test_search.py) | 1 | expansion(298), keyword(318), text(336), wildcard(352), array(367), object/nested(387), numeric(455), range(474), date(490), boolean(503), operators(515), match-all(557), empty(565), programmatic(578), aggregations(596), HuggingFace URL(663) |
 | [`fixtures.py`](src/flatseek/test/fixtures.py) | 1 | `generate_sample_events_csv`, `IndexContext`, `cleanup_index` |
+| [`test_parquet_build.py`](src/flatseek/test/test_parquet_build.py) | 1 | basic build+search, multiple files, mixed Parquet+CSV, numeric types, boolean, nested JSON, chunked reading, scanner integration (8 tests) |
+| [`test_bulk_upsert.py`](src/flatseek/test/test_bulk_upsert.py) | 1 | concurrent load test for UpsertQueue |
 
 ---
 
