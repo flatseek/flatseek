@@ -98,9 +98,9 @@ status codes and totals.
 
 ---
 
-## [ ] Parquet build — build index directly from Parquet files
+## [x] Parquet build — build index directly from Parquet files
 
-**Status**: Deferred (v0.10+)
+**Status**: Implemented (v0.1.10).
 
 **Why**: Data analysts receive data in Parquet chunks from Spark/dbt/DuckDB
 pipelines. Currently FlatSeek only builds from CSV/JSON/JSONL. Parquet is
@@ -143,9 +143,9 @@ CSV (no inference needed).
 
 ---
 
-## [ ] High-throughput batch upsert queue for parallel crawlers
+## [x] High-throughput batch upsert queue for parallel crawlers
 
-**Status**: Deferred (post v0.2.0)
+**Status**: Implemented (v0.1.10).
 
 **Why**: Current upsert is correct under concurrency but throughput is
 limited by per-request disk I/O. A crawler doing 100+ upserts/sec creates
