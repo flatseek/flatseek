@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from flatseek.api.deps import get_index_manager, IndexManager
 from flatseek.core.builder import IndexBuilder
+from flatseek.core.upsert_queue import get_upsert_queue, close_upsert_queue
 
 
 router = APIRouter(tags=["documents"])
@@ -744,6 +745,143 @@ async def bulk(
         total_deleted=total_deleted,
         total_conflicts=total_conflicts,
     )
+
+
+# ─── POST /{index}/_bulk_upsert ────────────────────────────────────────────
+
+
+class BulkUpsertRequest(BaseModel):
+    """Request body for bulk upsert — list of {id, doc} pairs."""
+
+    id_field: str | None = Field(default=None, description="Name of the ID field (default: from index stats)")
+    docs: list[dict[str, Any]] = Field(..., description="List of documents to upsert")
+
+
+class BulkUpsertResponse(BaseModel):
+    """Response for bulk upsert — queued status."""
+
+    result: str = "queued"
+    queued: int
+    message: str
+
+
+class BulkUpsertStatusResponse(BaseModel):
+    """Status response for bulk upsert queue."""
+
+    queue_depth: int
+    pending_docs: int
+    flushing: bool
+    total_docs_flushed: int
+    total_flushes: int
+    last_flush_age_s: float | None
+
+
+@router.post("/{index}/_bulk_upsert", response_model=BulkUpsertResponse)
+async def bulk_upsert(
+    index: str,
+    request: BulkUpsertRequest,
+    manager: IndexManager = Depends(get_index_manager),
+):
+    """High-throughput batch upsert for parallel crawlers.
+
+    POST /myindex/_bulk_upsert
+    {"id_field": "email", "docs": [{"id": "alice@example.com", "doc": {"email": "alice@example.com", "status": "active"}}, ...]}
+
+    Accepts a batch of documents and queues them for async flush.
+    Returns immediately after queuing (non-blocking).
+
+    Each doc in the list must have an "id" field (the natural key value)
+    and a "doc" field containing the document body.
+
+    Use GET /{index}/_bulk_upsert/status to check queue depth and flush progress.
+    Use POST /{index}/_bulk_upsert/flush to synchronously flush pending docs.
+    """
+    _check_not_fsk(manager, index)
+
+    id_field = request.id_field or _get_id_field(manager, index)
+    if not id_field:
+        raise HTTPException(400, "Index was not built with --id-field. Cannot use bulk upsert by ID.")
+
+    engine = manager.get_engine(index)
+    if engine._tombstones is None:
+        raise HTTPException(400, "Index does not support bulk upsert operations.")
+
+    queue = get_upsert_queue(
+        data_dir=manager.data_dir,
+        index_name=index,
+        id_field=id_field,
+    )
+
+    queued = 0
+    for item in request.docs:
+        doc_id = item.get("id")
+        doc = item.get("doc", {})
+        if doc_id is None and id_field in doc:
+            doc_id = doc[id_field]
+        queue.put(doc_id, doc)
+        queued += 1
+
+    return BulkUpsertResponse(
+        result="queued",
+        queued=queued,
+        message=f"{queued} documents queued for async flush",
+    )
+
+
+@router.post("/{index}/_bulk_upsert/flush")
+async def bulk_upsert_flush(
+    index: str,
+    manager: IndexManager = Depends(get_index_manager),
+):
+    """Synchronously flush all pending documents in the bulk upsert queue.
+
+    POST /myindex/_bulk_upsert/flush
+    → {"flushed": N, "message": "..."}
+    """
+    _check_not_fsk(manager, index)
+
+    id_field = _get_id_field(manager, index)
+    if not id_field:
+        raise HTTPException(400, "Index was built without --id-field.")
+
+    queue = get_upsert_queue(
+        data_dir=manager.data_dir,
+        index_name=index,
+        id_field=id_field,
+    )
+
+    status = queue.status()
+    pending = status["pending_docs"]
+
+    if pending > 0:
+        queue.flush()
+
+    return {"flushed": pending, "message": f"{pending} documents flushed"}
+
+
+@router.get("/{index}/_bulk_upsert/status", response_model=BulkUpsertStatusResponse)
+async def bulk_upsert_status(
+    index: str,
+    manager: IndexManager = Depends(get_index_manager),
+):
+    """Get bulk upsert queue status.
+
+    GET /myindex/_bulk_upsert/status
+    → {"queue_depth": N, "pending_docs": M, "flushing": bool, ...}
+    """
+    _check_not_fsk(manager, index)
+
+    id_field = _get_id_field(manager, index)
+    if not id_field:
+        raise HTTPException(400, "Index was built without --id-field.")
+
+    queue = get_upsert_queue(
+        data_dir=manager.data_dir,
+        index_name=index,
+        id_field=id_field,
+    )
+
+    return BulkUpsertStatusResponse(**queue.status())
 
 
 # ─── POST /{index}/_compact ───────────────────────────────────────────────
