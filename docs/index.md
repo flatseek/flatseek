@@ -26,3 +26,4 @@
 | [Distribution](docs/distribution.md) | Public, password-protected, time-limited, or license-based archives |
 | [Benchmark](docs/benchmark.md) | Performance comparison vs Elasticsearch, Tantivy, Typesense, Whoosh, ZincSearch |
 | [Tests](docs/tests.md) | Test coverage matrix and gap analysis |
+| [Implementation Matrix](docs/done.md) | Feature checklist across CLI, library, and REST API (auto-generated) |

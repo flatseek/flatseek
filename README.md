@@ -314,6 +314,7 @@ itself stays unchanged.
 | [Architecture](docs/architecture.md) | Structural and behavioral map |
 | [Internals](docs/internals.md) | Deep technical breakdown |
 | [Tests](docs/tests.md) | Test coverage matrix and gap analysis |
+| [Implementation Matrix](docs/done.md) | Feature checklist across CLI, library, and REST API (auto-generated) |
 
 ---
 
