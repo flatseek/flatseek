@@ -40,6 +40,14 @@ flatseek build ./data.csv --single-file -o ./data.fsk
 
 Creates a portable `.fsk` archive — one file containing the complete index.
 
+### Build from Parquet
+
+```bash
+flatseek build ./parquet_bucket/ -o myindex.fsk
+```
+
+Parquet files are auto-detected by the scanner. Uses PyArrow for schema detection and chunked reading — streaming, OOM-safe.
+
 ### Parallel build
 
 ```bash
