@@ -137,7 +137,7 @@ def detect_type(samples):
 SKIP_DIRS = {"data", "testdata", "tmp", ".git", "__pycache__"}
 
 _DATA_EXTS = (
-    ".csv", ".json", ".jsonl", ".ndjson",
+    ".csv", ".json", ".jsonl", ".ndjson", ".parquet",
     ".csv.gz", ".csv.bz2",
     ".json.gz", ".json.bz2",
     ".jsonl.gz", ".jsonl.bz2",
@@ -180,6 +180,55 @@ def scan_file(path, sample_rows=200):
         "headers": headers,
         "columns": columns,
         "row_estimate": sum(1 for _ in open(path, "r", encoding="utf-8", errors="replace")) - 1,
+    }
+
+
+def scan_parquet_file(path, sample_rows=200):
+    """Read Parquet schema + sample rows to detect column types.
+
+    Uses PyArrow's ParquetFile for chunked reading without loading the full
+    file into memory. Parquet is self-describing so schema is read directly
+    from the file metadata.
+    """
+    try:
+        import pyarrow.parquet as _pa
+    except ImportError:
+        return None
+
+    try:
+        pf = _pa.ParquetFile(path)
+    except Exception:
+        return None
+
+    schema = pf.schema_arrow
+    headers = [field.name for field in schema]
+
+    # Sample rows to get values for type detection
+    samples: dict = {col: [] for col in headers}
+    row_count = 0
+    for batch in pf.iter_batches(batch_size=sample_rows, columns=headers):
+        tbl = batch.to_pydict()
+        for col in headers:
+            vals = tbl.get(col, [])
+            samples[col].extend(str(v) if v is not None else "" for v in vals[:sample_rows])
+        row_count += batch.num_rows
+        if row_count >= sample_rows:
+            break
+
+    columns = {}
+    for col in headers:
+        col_samples = samples.get(col, [])
+        columns[col] = {
+            "type": detect_type(col_samples),
+            "sample_count": len(col_samples),
+            "non_null": sum(1 for s in col_samples if s.strip()),
+        }
+
+    return {
+        "file": os.path.abspath(path),
+        "headers": headers,
+        "columns": columns,
+        "row_estimate": pf.metadata.num_rows,
     }
 
 
