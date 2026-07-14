@@ -105,6 +105,27 @@ Soft-delete (tombstoned, removable via `compact`).
 
 ---
 
+## batch-upsert — Bulk upsert queue (HTTP API only)
+
+There is no dedicated CLI command for batch upsert. The queue is accessible via the REST API:
+
+```bash
+# Queue a batch of documents (non-blocking)
+curl -X POST http://localhost:8000/myindex/_bulk_upsert \
+  -H "Content-Type: application/json" \
+  -d '{"id_field": "email", "docs": [{"id": "alice@example.com", "doc": {"email": "alice@example.com", "status": "active"}}]}'
+
+# Synchronously flush all pending docs
+curl -X POST http://localhost:8000/myindex/_bulk_upsert/flush
+
+# Check queue status
+curl -X GET http://localhost:8000/myindex/_bulk_upsert/status
+```
+
+Requires `--id-field` at build time. Use `flush` before searching to ensure queued docs are visible.
+
+---
+
 ## delete — Delete full index
 
 ```bash
