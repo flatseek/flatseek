@@ -41,6 +41,7 @@ dev = [
 ]
 parquet = [
     "pyarrow",
+    "pandas",
 ]
 chat = [
     "openai",
