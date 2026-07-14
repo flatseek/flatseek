@@ -126,6 +126,10 @@ _id,program,amount,timestamp
 1,jupiter,750000,2025-01-15T11:00:00Z
 ```
 
+### Parquet export
+
+Parquet export is **not yet implemented**. Track progress in the [ roadmap ].
+
 ---
 
 ## Architecture
