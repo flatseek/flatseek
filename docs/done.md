@@ -1,6 +1,6 @@
 # Flatseek Implementation Matrix
 
-> Version: 0.1.10 | Generated: 2026-07-13
+> Version: 0.1.10 | Generated: 2026-07-14
 
 ---
 
@@ -11,6 +11,7 @@
 | Build index from CSV | ✅ `cli.py:678` | ✅ `builder.py:672` | — |
 | Build index (parallel) | ✅ `build --plan` | ✅ `builder.py:672` | — |
 | Build index from JSONL | ✅ `cli.py:678` | ✅ `builder.py:672` | — |
+| Build index from Parquet | ✅ `scanner.py` (detects .parquet) | ✅ `builder.py` (PyArrow) | — |
 | Classify CSV columns | ✅ `cli.py:321` | `detect_semantic_types()` | — |
 | Generate build plan | ✅ `cli.py:768` | N/A | — |
 | Generate dummy data | ✅ `cli.py:5478` | N/A | — |
@@ -95,6 +96,7 @@
 | Delete by Lucene query | ✅ `cli.py:4776` | ✅ `client.py:428` | ✅ `documents.py:127` |
 | Get by numeric doc_id | — | — | ✅ `search.py:544` |
 | Bulk — ES NDJSON | ✅ `cli.py:4842` | ✅ `client.py:475` | ✅ `documents.py:416` |
+| Bulk upsert queue | ✅ `UpsertQueue` via `batch_upsert` | ✅ `UpsertQueue` (`core/upsert_queue.py`) | ✅ `POST /{index}/_bulk_upsert` |
 | Bulk — JSON array | — | — | ✅ `index.py:496` |
 | Count | `stats` | ✅ `client.py:195` | ✅ `search.py:689` |
 | Export to JSONL | ✅ `cli.py:2133` | — | — |
@@ -173,7 +175,7 @@
 
 | Version | Key Additions |
 |---|---|
-| 0.1.10 | Write ops (insert/upsert/update/delete/bulk) in library + CLI, `_id` field (ULID), separator-split fix, cross-lookup (join 2 indexes), multi-index wildcard search (`_index:pattern`), sort + pagination, comprehensive test suite |
+| 0.1.10 | Write ops (insert/upsert/update/delete/bulk) in library + CLI, `_id` field (ULID), separator-split fix, cross-lookup (join 2 indexes), multi-index wildcard search (`_index:pattern`), sort + pagination, bulk upsert queue, Parquet build, comprehensive test suite |
 | 0.1.9 | Multi-index search, time-pruning, date_histogram fast path, calendar_interval aliases |
 | 0.1.8 | `.fsk` over HTTP Range (no full download) |
 | 0.1.7 | Document-level delete/update, sort, license/enclosed encryption, bulk improvements |
