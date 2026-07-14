@@ -5502,6 +5502,20 @@ def cmd_serve(args):
     if getattr(args, "reset_dashboard", False):
         _os.environ["FLATSEEK_RESET_DASHBOARD"] = "1"
 
+    # Check port availability before starting server
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind((host, port))
+    except OSError as e:
+        if e.errno == 98:  # Address already in use
+            print(f"Error: Port {port} is already in use.", file=sys.stderr)
+        else:
+            print(f"Error: Could not bind to {host}:{port} — {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        s.close()
+
     uvicorn.run(
         "flatseek.api.main:app",
         host=host,

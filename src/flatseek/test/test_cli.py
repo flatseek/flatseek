@@ -376,10 +376,12 @@ class TestPlan:
 # ─── serve / api ─────────────────────────────────────────────────────────
 
 class TestServeApi:
-    def test_serve_command_accepts_port(self, tmp_path, monkeypatch):
-        """Serve starts without error given a valid port and data dir."""
+    def test_serve_command_accepts_valid_port(self, tmp_path, monkeypatch):
+        """Serve starts without error given a valid unused port."""
         from flatseek.cli import cmd_serve
         import socket
+        import uvicorn
+        import webbrowser
 
         # Find an unused port
         s = socket.socket()
@@ -393,10 +395,162 @@ class TestServeApi:
             host="127.0.0.1",
             no_reload=True,
             flatlens_dir=None,
+            data_option=None,
+            storage_backend=None,
+            storage_url=None,
+            storage_bucket=None,
+            storage_region=None,
+            storage_endpoint=None,
+            storage_base_path=None,
+            passphrase=None,
+            reset_dashboard=False,
         )
-        # We'll just verify it accepts the args without error
-        # (can't actually start server in test without blocking)
-        assert ns.port == free_port
+        # Mock uvicorn.run and webbrowser.open at the module level where they're used
+        started = []
+        original_run = uvicorn.run
+        def mock_run(app, host, port, reload):
+            started.append((host, port))
+            # Don't call original_run — we just track the call
+        monkeypatch.setattr(uvicorn, "run", mock_run)
+        monkeypatch.setattr(webbrowser, "open", lambda url: None)
+        # Mock _find_flatlens to return None (no flatlens installed)
+        monkeypatch.setattr("flatseek.cli._find_flatlens", lambda: None)
+        # Mock stdin as non-TTY so it skips input() prompt
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+        cmd_serve(ns)
+        assert started == [("127.0.0.1", free_port)]
+
+    def test_serve_exits_when_port_in_use(self, tmp_path, monkeypatch, capsys):
+        """Serve exits cleanly with a clear error when port is already in use."""
+        from flatseek.cli import cmd_serve
+        import socket
+        import webbrowser
+
+        # Start a real server on a port and keep it open
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        s.listen(1)
+        in_use_port = s.getsockname()[1]
+
+        ns = argparse.Namespace(
+            data_dir=str(tmp_path),
+            port=in_use_port,
+            host="127.0.0.1",
+            no_reload=True,
+            flatlens_dir=None,
+            data_option=None,
+            storage_backend=None,
+            storage_url=None,
+            storage_bucket=None,
+            storage_region=None,
+            storage_endpoint=None,
+            storage_base_path=None,
+            passphrase=None,
+            reset_dashboard=False,
+        )
+        # Mock webbrowser.open to avoid opening a browser
+        monkeypatch.setattr(webbrowser, "open", lambda url: None)
+
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_serve(ns)
+        assert exc_info.value.code == 1
+
+        s.close()
+
+    def test_serve_flatlens_install_prompt_decline(self, tmp_path, monkeypatch, capsys):
+        """Serve skips flatlens install when user declines (inputs 'n')."""
+        from flatseek.cli import cmd_serve
+        import socket
+        import uvicorn
+        import webbrowser
+
+        # Find an unused port
+        s = socket.socket()
+        s.bind(("", 0))
+        free_port = s.getsockname()[1]
+        s.close()
+
+        ns = argparse.Namespace(
+            data_dir=str(tmp_path),
+            port=free_port,
+            host="127.0.0.1",
+            no_reload=True,
+            flatlens_dir=None,
+            data_option=None,
+            storage_backend=None,
+            storage_url=None,
+            storage_bucket=None,
+            storage_region=None,
+            storage_endpoint=None,
+            storage_base_path=None,
+            passphrase=None,
+            reset_dashboard=False,
+        )
+        # Mock uvicorn.run to not actually start the server
+        def mock_run(app, host, port, reload):
+            pass
+        monkeypatch.setattr(uvicorn, "run", mock_run)
+        # Mock webbrowser.open to avoid opening a browser
+        monkeypatch.setattr(webbrowser, "open", lambda url: None)
+        # Mock _find_flatlens to return None (flatlens not installed)
+        monkeypatch.setattr("flatseek.cli._find_flatlens", lambda: None)
+        # Mock stdin as TTY so it tries to read input
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        # Mock input() to return 'n' (decline install)
+        monkeypatch.setattr("builtins.input", lambda prompt: "n")
+
+        cmd_serve(ns)
+
+        captured = capsys.readouterr()
+        assert "Dashboard will not be available" in captured.out
+
+    def test_serve_flatlens_dir_sets_env_var(self, tmp_path, monkeypatch):
+        """Serve sets FLATSEEK_FLATLENS_DIR env var when --flatlens-dir is provided."""
+        from flatseek.cli import cmd_serve
+        import socket
+        import uvicorn
+        import webbrowser
+        import os
+
+        # Find an unused port
+        s = socket.socket()
+        s.bind(("", 0))
+        free_port = s.getsockname()[1]
+        s.close()
+
+        flatlens_path = str(tmp_path / "my_flatlens")
+        os.makedirs(flatlens_path, exist_ok=True)
+        # Create a minimal index.html so _find_flatlens considers it valid
+        with open(os.path.join(flatlens_path, "index.html"), "w") as f:
+            f.write("<html></html>")
+
+        ns = argparse.Namespace(
+            data_dir=str(tmp_path),
+            port=free_port,
+            host="127.0.0.1",
+            no_reload=True,
+            flatlens_dir=flatlens_path,
+            data_option=None,
+            storage_backend=None,
+            storage_url=None,
+            storage_bucket=None,
+            storage_region=None,
+            storage_endpoint=None,
+            storage_base_path=None,
+            passphrase=None,
+            reset_dashboard=False,
+        )
+        # Mock uvicorn.run to not actually start the server
+        def mock_run(app, host, port, reload):
+            pass
+        monkeypatch.setattr(uvicorn, "run", mock_run)
+        # Mock webbrowser.open to avoid opening a browser
+        monkeypatch.setattr(webbrowser, "open", lambda url: None)
+
+        cmd_serve(ns)
+
+        assert os.environ.get("FLATSEEK_FLATLENS_DIR") == os.path.abspath(flatlens_path)
 
 
 # ─── dedup ──────────────────────────────────────────────────────────────
