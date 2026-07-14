@@ -39,6 +39,9 @@ dev = [
     "pytest-asyncio",
     "httpx[http2]",
 ]
+parquet = [
+    "pyarrow",
+]
 chat = [
     "openai",
 ]
