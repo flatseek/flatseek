@@ -224,6 +224,57 @@ Returns an `AggsResponse` wrapper with `.total` and `.aggs` properties.
 
 **Requires `--id-field` at build time** so Flatseek knows the canonical ID field.
 
+### UpsertQueue / Batch Upsert
+
+For high-throughput ingestion, use `UpsertQueue` to batch documents and flush them in the background:
+
+```python
+from flatseek.core.upsert_queue import UpsertQueue
+
+queue = UpsertQueue(
+    data_dir="./data",
+    index_name="txs",
+    id_field="id",
+    batch_size=1000,
+    flush_interval=5.0,   # seconds
+)
+
+# Queue documents (from any thread)
+queue.put("tx_001", {"id": "tx_001", "amount": 500})
+queue.put("tx_002", {"id": "tx_002", "amount": 600})
+
+# Start background flusher and wait for drain
+queue.start()
+# ... more puts from other threads ...
+queue.close()   # waits for flush to complete
+
+# Or use the helper:
+# from flatseek.core.upsert_queue import close_upsert_queue
+# close_upsert_queue("./data", "txs")
+```
+
+**How it works:**
+- Each thread gets its own thread-local `Flatseek` writer (avoids lock contention)
+- Documents are added to a shared `queue.Queue`
+- A background flusher thread drains the queue in batches of `batch_size`
+- Flush triggers when the queue reaches `batch_size` or after `flush_interval` seconds of inactivity
+- `close()` waits for the queue to drain before returning
+
+---
+
+## Build from Parquet
+
+Parquet files are auto-detected by the scanner — no special API needed:
+
+```python
+from flatseek.core.builder import build
+
+# All .parquet files under ./parquet_bucket/ are detected and processed
+build("./parquet_bucket/", output_path="./myindex")
+```
+
+Uses PyArrow for schema detection and chunked reading (streaming, OOM-safe).
+
 ```python
 fs = Flatseek("./data", index="txs")   # must be built with --id-field
 ```
