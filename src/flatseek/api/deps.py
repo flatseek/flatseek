@@ -74,6 +74,11 @@ class IndexManager:
         if not dir_path.is_dir():
             return
 
+        # Fast path: if data_dir is itself an index directory (has stats.json
+        # or index/ subdir), it contains no .fsk files — skip the rglob.
+        if (dir_path / "stats.json").is_file() or (dir_path / "index").is_dir():
+            return
+
         for fsk_path in sorted(dir_path.rglob("*.fsk")):
             rel = fsk_path.relative_to(dir_path)
             index_name = str(rel.with_suffix("").as_posix())
