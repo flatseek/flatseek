@@ -2604,6 +2604,7 @@ class QueryEngine:
         dv_path = os.path.join(self.data_dir, "dv", field)
         from flatseek.core.storage import LocalStorageAdapter
         if isinstance(self.storage, LocalStorageAdapter):
+            lookup_base = dv_path
             if not self.storage.exists(dv_path) and not os.path.isdir(dv_path):
                 self._dv_cache[field] = None
                 return None
