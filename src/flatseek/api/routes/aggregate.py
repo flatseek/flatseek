@@ -90,7 +90,25 @@ async def aggregate(
             )
 
     _AGG_TIMEOUT = int(os.environ.get("FLATSEEK_TIMEOUT_AGG", 300))
-    query = body.get("query", None)
+    q_val = body.get("query", None)
+    # Handle ES-style dict queries (e.g. {"match_all": {}}) vs Lucene string
+    if isinstance(q_val, str):
+        query = q_val
+    elif isinstance(q_val, dict):
+        if "match_all" in q_val:
+            query = None  # None = all docs in aggregate
+        elif "term" in q_val:
+            for field, val in q_val["term"].items():
+                query = f"{field}:{val}"
+                break
+        elif "match" in q_val:
+            for field, val in q_val["match"].items():
+                query = f"{field}:{val}"
+                break
+        else:
+            query = None
+    else:
+        query = q_val
     size = body.get("size", 10)
     aggs = body.get("aggs", {})
     index_pattern = body.get("_index") if body and isinstance(body, dict) else None

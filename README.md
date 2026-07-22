@@ -26,11 +26,9 @@ from live application data to historical archives, and AI-ready datasets.
 &nbsp;&middot;&nbsp;
 **Docs:** [flatseek.io/docs](https://flatseek.io/docs)
 &nbsp;&middot;&nbsp;
-**Dashboard:** [Flatlens](https://github.com/flatseek/flatlens)
-&nbsp;&middot;&nbsp;
-**Benchmark:** [flatbench](https://github.com/flatseek/flatbench)
-&nbsp;&middot;&nbsp;
-**Hosted Datasets:** [HuggingFace](https://huggingface.co/flatseek)
+**Sample Datasets:** [HuggingFace](https://huggingface.co/flatseek)
+
+**Ecosystem:** [Flatlens](https://github.com/flatseek/flatlens) (Dashboard) · [Flatvec](https://github.com/flatseek/flatvec) (Vector Search) · [Flatask](https://github.com/flatseek/flatask) (RAG Runtime) · [Flattune](https://github.com/flatseek/flattune) (LLM Fine-Tuning)
 
 </div>
 
@@ -65,6 +63,23 @@ curl -X 'GET' \
 That query runs against 6.3M books dataset hosted on HuggingFace, and only pulls the
 byte ranges it needs to answer it. The same index also powers the
 [Flatlens - live dashboard](https://flatlens.demo.flatseek.io/?bucket=https://huggingface.co/datasets/flatseek/public-dataset&index=6.3M-books&q=dune) — try it with zero installation.
+
+
+#### Chat with Your Data
+
+Need natural language instead of search syntax? Flatask is the AI companion for Flatseek. It turns any Flatseek index into a chat-ready knowledge base.
+
+```bash
+flatask chat https://huggingface.co/datasets/flatseek/public-dataset/resolve/main/6.3M-books.fsk
+
+You> Recommend books similar to Dune.
+Assistant> Foundation, Hyperion, Children of Time...
+
+You> How many books were published after 2010?
+Assistant> 482,391
+```
+
+Flatask translates natural language into optimized Flatseek queries, retrieves only the relevant records, then lets any LLM generate accurate, grounded answers. Learn more: **[github.com/flatseek/flatask](https://github.com/flatseek/flatask)**
 
 ---
 

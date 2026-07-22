@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flatseek"
-version = "0.1.10"
-description = "Scalable engine to ingest, process, and query large datasets—transactions, logs, events, and analytics—directly from flat files."
+version = "0.1.11"
+description = "Powerful disk-first full-text search for production data, portable datasets, RAG and AI applications."
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.10"
@@ -25,9 +25,17 @@ authors = [
 
 [project.urls]
 Homepage = "https://flatseek.io"
+Documentation = "https://flatseek.io/docs"
 Repository = "https://github.com/flatseek/flatseek"
 Issues = "https://github.com/flatseek/flatseek/issues"
-Documentation = "https://flatseek.io/docs"
+
+Flatlens = "https://github.com/flatseek/flatlens"
+Flatvec = "https://github.com/flatseek/flatvec"
+Flatask = "https://github.com/flatseek/flatask"
+Flattune = "https://github.com/flatseek/flattune"
+
+Benchmarks = "https://github.com/flatseek/flatbench"
+
 
 [project.scripts]
 flatseek = "flatseek.cli:main"

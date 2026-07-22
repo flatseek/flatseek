@@ -2,14 +2,14 @@
 
 > Generated: 2026-07-14 | Updated: 2026-07-14 | Tests added: sort, pagination, pack, unpack, export, verify, slice, delete_query fix, parquet_build, bulk_upsert
 
-Kolom **TEST** = nama file test (e.g. `test_cli.py`) jika ada test, `—` jika belum ada.
+**TEST** column = test file name if test exists, `—` if not yet covered.
 
 ---
 
 ## Index Management
 
 | Feature | CLI | Library | REST API |
-|---|---|---|---|
+|---------|-----|---------|----------|
 | Build index from CSV | test_cli.py | — | — |
 | Build index (parallel) | — | — | — |
 | Build index from JSONL | — | — | — |
@@ -24,8 +24,8 @@ Kolom **TEST** = nama file test (e.g. `test_cli.py`) jika ada test, `—` jika b
 | Index mapping | — | — | test_api.py |
 | WAL merge | — | — | — |
 | WAL info | — | — | — |
-| Pack to `.flatseek` | test_cli.py | — | — |
-| Unpack `.flatseek` | test_cli.py | — | — |
+| Pack to `.fsk` | test_cli.py | — | — |
+| Unpack `.fsk` | test_cli.py | — | — |
 | Compress index | test_cli.py | — | — |
 | Compact (reclaim space) | — | — | — |
 | Verify integrity | test_cli.py | — | — |
@@ -37,7 +37,7 @@ Kolom **TEST** = nama file test (e.g. `test_cli.py`) jika ada test, `—` jika b
 ## Encryption & Security
 
 | Feature | CLI | Library | REST API |
-|---|---|---|---|
+|---------|-----|---------|----------|
 | Encrypt index | test_cli.py | — | test_api.py |
 | Decrypt index | test_cli.py | — | — |
 | Authenticate (passphrase) | — | — | test_api.py |
@@ -51,7 +51,7 @@ Kolom **TEST** = nama file test (e.g. `test_cli.py`) jika ada test, `—` jika b
 ## Search
 
 | Feature | CLI | Library | REST API |
-|---|---|---|---|
+|---------|-----|---------|----------|
 | Full-text search | test_cli.py | — | test_search.py |
 | Search (GET) | — | — | test_api.py |
 | Multi-index search | — | ✅ `cases/crawl.py` (functional) | — |
@@ -77,7 +77,7 @@ Kolom **TEST** = nama file test (e.g. `test_cli.py`) jika ada test, `—` jika b
 ## Aggregation
 
 | Feature | CLI | Library | REST API |
-|---|---|---|---|
+|---------|-----|---------|----------|
 | Terms aggregation | — | test_search.py | — |
 | Stats aggregation | — | test_search.py | — |
 | Date histogram | — | test_search.py | — |
@@ -91,7 +91,7 @@ Kolom **TEST** = nama file test (e.g. `test_cli.py`) jika ada test, `—` jika b
 ## Document Operations
 
 | Feature | CLI | Library | REST API |
-|---|---|---|---|
+|---------|-----|---------|----------|
 | Upsert by natural key | — | test_update.py | test_api.py |
 | Insert (no ID) | — | test_write_ops.py | — |
 | Partial update by ID | — | test_update.py | test_api.py |
@@ -113,7 +113,7 @@ Kolom **TEST** = nama file test (e.g. `test_cli.py`) jika ada test, `—` jika b
 ## Storage Backends
 
 | Feature | CLI | Library | REST API |
-|---|---|---|---|
+|---------|-----|---------|----------|
 | Local filesystem | — | — | — |
 | Amazon S3 | — | — | — |
 | Vercel Blob | — | — | — |
@@ -126,7 +126,7 @@ Kolom **TEST** = nama file test (e.g. `test_cli.py`) jika ada test, `—` jika b
 ## API Server
 
 | Feature | CLI | Library | REST API |
-|---|---|---|---|
+|---------|-----|---------|----------|
 | Start API + Dashboard | test_cli.py | — | — |
 | Start API only | — | — | — |
 | Dashboard only | — | — | — |
@@ -142,7 +142,7 @@ Kolom **TEST** = nama file test (e.g. `test_cli.py`) jika ada test, `—` jika b
 ## Utilities
 
 | Feature | CLI | Library | REST API |
-|---|---|---|---|
+|---------|-----|---------|----------|
 | Natural language chat | — | — | — |
 | Count docs | test_cli.py | test_search.py | test_api.py |
 | Classify text | — | — | — |
@@ -152,14 +152,14 @@ Kolom **TEST** = nama file test (e.g. `test_cli.py`) jika ada test, `—` jika b
 
 ## Test Files
 
-| File | Line | Coverage |
-|---|---|---|
-| [`test_cli.py`](src/flatseek/test/test_cli.py) | 1 | classify(56), build(96), search(148), stats(184), compress(195), encrypt/decrypt(210), delete(230), plan(246), serve/api(265), dedup(291), join(307) |
-| [`test_api.py`](src/flatseek/test/test_api.py) | 1 | root(16), health(27), indices(39), index CRUD(53), mapping(126), search(138), aggregate(158), count(178), bulk(190), flush(241), logs(253), stats(266), rename(278), encrypt(290), auth(318), validate(347), delete_by_query(359) |
-| [`test_search.py`](src/flatseek/test/test_search.py) | 1 | expansion(298), keyword(318), text(336), wildcard(352), array(367), object/nested(387), numeric(455), range(474), date(490), boolean(503), operators(515), match-all(557), empty(565), programmatic(578), aggregations(596), HuggingFace URL(663) |
-| [`fixtures.py`](src/flatseek/test/fixtures.py) | 1 | `generate_sample_events_csv`, `IndexContext`, `cleanup_index` |
-| [`test_parquet_build.py`](src/flatseek/test/test_parquet_build.py) | 1 | basic build+search, multiple files, mixed Parquet+CSV, numeric types, boolean, nested JSON, chunked reading, scanner integration (8 tests) |
-| [`test_bulk_upsert.py`](src/flatseek/test/test_bulk_upsert.py) | 1 | concurrent load test for UpsertQueue |
+| File | Location | Coverage |
+|------|----------|----------|
+| [`test_cli.py`](src/flatseek/test/test_cli.py) | line 1 | classify(56), build(96), search(148), stats(184), compress(195), encrypt/decrypt(210), delete(230), plan(246), serve/api(265), dedup(291), join(307) |
+| [`test_api.py`](src/flatseek/test/test_api.py) | line 1 | root(16), health(27), indices(39), index CRUD(53), mapping(126), search(138), aggregate(158), count(178), bulk(190), flush(241), logs(253), stats(266), rename(278), encrypt(290), auth(318), validate(347), delete_by_query(359) |
+| [`test_search.py`](src/flatseek/test/test_search.py) | line 1 | expansion(298), keyword(318), text(336), wildcard(352), array(367), object/nested(387), numeric(455), range(474), date(490), boolean(503), operators(515), match-all(557), empty(565), programmatic(578), aggregations(596), HuggingFace URL(663) |
+| [`fixtures.py`](src/flatseek/test/fixtures.py) | line 1 | `generate_sample_events_csv`, `IndexContext`, `cleanup_index` |
+| [`test_parquet_build.py`](src/flatseek/test/test_parquet_build.py) | line 1 | basic build+search, multiple files, mixed Parquet+CSV, numeric types, boolean, nested JSON, chunked reading, scanner integration (8 tests) |
+| [`test_bulk_upsert.py`](src/flatseek/test/test_bulk_upsert.py) | line 1 | concurrent load test for UpsertQueue |
 
 ---
 
@@ -168,7 +168,7 @@ Kolom **TEST** = nama file test (e.g. `test_cli.py`) jika ada test, `—` jika b
 ### test_cli.py — `src/flatseek/test/test_cli.py`
 
 | Class | Line | Tests |
-|---|---|---|
+|-------|------|-------|
 | `TestClassify` | 56 | `test_classify_detects_columns`, `test_classify_with_custom_separator` |
 | `TestBuild` | 96 | `test_build_creates_index_directory`, `test_build_with_dedup` |
 | `TestSearch` | 148 | `test_search_index_exists`, `test_search_with_term` |
@@ -191,7 +191,7 @@ Kolom **TEST** = nama file test (e.g. `test_cli.py`) jika ada test, `—` jika b
 ### test_api.py — `src/flatseek/test/test_api.py`
 
 | Class | Line | Tests |
-|---|---|---|
+|-------|------|-------|
 | `TestRoot` | 16 | `test_root_returns_name_and_version` |
 | `TestClusterHealth` | 27 | `test_cluster_health_returns_indices_count` |
 | `TestIndicesList` | 39 | `test_indices_returns_empty_when_no_data` |
@@ -216,7 +216,7 @@ Kolom **TEST** = nama file test (e.g. `test_cli.py`) jika ada test, `—` jika b
 ### test_search.py — `src/flatseek/test/test_search.py`
 
 | Class | Line | Tests |
-|---|---|---|
+|-------|------|-------|
 | `TestExpansion` | 298 | `test_array_expanded_to_indexed_keys`, `test_object_expanded_to_dot_paths` |
 | `TestKeywordExact` | 318 | `test_keyword_match` (parametrized) |
 | `TestTextField` | 336 | `test_text_partial_match` (parametrized) |
@@ -239,7 +239,7 @@ Kolom **TEST** = nama file test (e.g. `test_cli.py`) jika ada test, `—` jika b
 
 ---
 
-## Gap Analysis — Features Without Tests
+## Features Without Tests
 
 ### High Priority (widely used features)
 - (All widely-used features now have tests — sort, pagination, pack, unpack, write ops)
@@ -252,7 +252,6 @@ Kolom **TEST** = nama file test (e.g. `test_cli.py`) jika ada test, `—` jika b
 - `flatseek flush` — CLI flush
 
 ### Low Priority
-- `flatseek verify`
 - `flatseek verify`
 - Natural language chat (`flatseek chat`)
 - `classify_text()` / `scanner.scan()`

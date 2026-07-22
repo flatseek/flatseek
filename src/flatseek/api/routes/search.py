@@ -262,7 +262,28 @@ async def search(
     # Parse params first so we can detect _index before calling get_engine
     query = None
     if body and isinstance(body, dict):
-        query = body.get("query") or body.get("q")
+        q_val = body.get("query")
+        # Handle ES-style dict queries (e.g. {"match_all": {}}) vs Lucene string
+        if isinstance(q_val, str):
+            query = q_val
+        elif isinstance(q_val, dict):
+            # Extract Lucene query from ES-style dict
+            if "match_all" in q_val:
+                query = "*"
+            elif "term" in q_val:
+                # {"term": {"field": "value"}} → "field:value"
+                for field, val in q_val["term"].items():
+                    query = f"{field}:{val}"
+                    break
+            elif "match" in q_val:
+                # {"match": {"field": "value"}} → "field:value"
+                for field, val in q_val["match"].items():
+                    query = f"{field}:{val}"
+                    break
+            else:
+                query = None
+        if query is None:
+            query = body.get("q")
     if query is None:
         query = q
     if not query:
