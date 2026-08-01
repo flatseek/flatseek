@@ -34,6 +34,7 @@ from live application data to historical archives, and AI-ready datasets.
 [Flatseek](https://github.com/flatseek/flatseek) (Keyword Search) •
 [Flatvec](https://github.com/flatseek/flatvec) (Vector Search) •
 [Flatask](https://github.com/flatseek/flatask) (RAG Runtime) •
+[Flatrun](https://github.com/flatseek/flatrun) (LLM Inference Runtime) •
 [Flatweight](https://github.com/flatseek/flatweight) (AI Model Storage) •
 [Flattune](https://github.com/flatseek/flattune) (LLM Fine-Tuning) •
 [Flatlens](https://github.com/flatseek/flatlens) (Data Visualization)
